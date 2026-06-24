@@ -18,8 +18,48 @@ const FMT: &[u8] = b"fmt ";
 
 /// Byte offset of the 32-bit RIFF chunk size field, measured from the start of the file.
 pub(crate) const RIFF_SIZE_OFFSET: u64 = 4;
-/// Byte offset of the 32-bit data chunk size field, for a minimal 16-byte `fmt ` chunk.
-pub(crate) const DATA_SIZE_OFFSET: u64 = 40;
+
+/// Whether a header is written as `WAVE_FORMAT_EXTENSIBLE`.
+///
+/// Two cases force the extensible form:
+///
+/// * 24-bit-in-4-byte data is ambiguous as plain PCM (the block alignment
+///   implies a 4-byte/32-bit sample, but only 24 bits are meaningful), so we
+///   write it the strict-spec way: the 32-bit container size in `wBitsPerSample`
+///   and the real 24 bits in `wValidBitsPerSample`.
+/// * More than two channels: the spec recommends extensible (with a channel
+///   mask) once the layout is no longer plain mono/stereo.
+///
+/// Anything else is unambiguous as plain PCM or float and uses the minimal
+/// 16-byte `fmt ` chunk.
+pub(crate) fn writes_as_extensible(channels: usize, format: SampleFormat) -> bool {
+    matches!(format, SampleFormat::I24_4) || channels > 2
+}
+
+/// The size in bytes of the `fmt ` chunk body written for a header.
+pub(crate) fn fmt_body_size(channels: usize, format: SampleFormat) -> u32 {
+    if writes_as_extensible(channels, format) {
+        FmtChunk::EXTENSIBLE_SIZE
+    } else {
+        FmtChunk::CORE_SIZE
+    }
+}
+
+/// Byte offset of the 32-bit data chunk size field for a header.
+///
+/// The header is RIFF id + size + WAVE (12 bytes), the `fmt ` chunk id + size
+/// (8 bytes) and body, then the data chunk id (4 bytes); the size field follows.
+pub(crate) fn data_size_offset(channels: usize, format: SampleFormat) -> u64 {
+    12 + 8 + fmt_body_size(channels, format) as u64 + 4
+}
+
+/// Value to write into the RIFF chunk size field for a finished file.
+///
+/// It covers everything after the size field: the WAVE id, the whole `fmt `
+/// chunk and the whole data chunk.
+pub(crate) fn riff_size(channels: usize, format: SampleFormat, data_bytes: u64) -> u64 {
+    4 + (8 + fmt_body_size(channels, format) as u64) + (8 + data_bytes)
+}
 
 /// Windows GUID, used to give the sample format in the extended
 /// `WAVEFORMATEXTENSIBLE` wav header.
@@ -39,6 +79,15 @@ impl Guid {
             data3: read_u16(data, 6),
             data4: data[8..16].try_into().unwrap_or([0; 8]),
         }
+    }
+
+    fn to_bytes(&self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.data1.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.data2.to_le_bytes());
+        bytes[6..8].copy_from_slice(&self.data3.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.data4);
+        bytes
     }
 }
 
@@ -103,12 +152,21 @@ fn write_chunk_header(dest: &mut impl Write, fourcc: &[u8], size: u32) -> std::i
     dest.write_all(&size.to_le_bytes())
 }
 
-/// The fields of a canonical 16-byte `fmt ` chunk body.
+/// The `WAVEFORMATEXTENSIBLE` extension: the 24 bytes that follow the 16-byte
+/// core (cbSize is implied to be 22).
+struct FmtExtension {
+    valid_bits_per_sample: u16,
+    channel_mask: u32,
+    sub_format: [u8; 16],
+}
+
+/// The fields of a `fmt ` chunk body, with an optional extensible extension.
 ///
 /// This gives the byte layout a single named definition, shared by the header
-/// parser and writer instead of repeating raw offsets and byte sequences.
-/// Extended `WAVEFORMATEXTENSIBLE` fields (anything past byte 16) are handled
-/// separately in [`look_up_extended_format`].
+/// parser and writer instead of repeating raw offsets and byte sequences. The
+/// parser populates only the 16-byte core (the extension fields are read
+/// directly in [`look_up_extended_format`]); the writer fills in the extension
+/// for formats that need an extensible header.
 struct FmtChunk {
     format_code: u16,
     channels: u16,
@@ -116,11 +174,14 @@ struct FmtChunk {
     byte_rate: u32,
     block_align: u16,
     bits_per_sample: u16,
+    extension: Option<FmtExtension>,
 }
 
 impl FmtChunk {
-    /// Size of the canonical `fmt ` chunk body in bytes.
-    const SIZE: u32 = 16;
+    /// Size of the 16-byte core `fmt ` chunk body.
+    const CORE_SIZE: u32 = 16;
+    /// Size of the 40-byte `WAVEFORMATEXTENSIBLE` `fmt ` chunk body.
+    const EXTENSIBLE_SIZE: u32 = 40;
 
     /// Build the chunk describing a given format.
     ///
@@ -158,18 +219,46 @@ impl FmtChunk {
             .ok_or_else(|| {
                 WavError::InvalidSpec("bytes per second does not fit in 32 bits".to_string())
             })?;
-        Ok(FmtChunk {
-            format_code: sample_format.format_code(),
-            channels: channels_u16,
-            sample_rate: sample_rate_u32,
-            byte_rate,
-            block_align,
-            // The bit depth is at most 64, so this never truncates.
-            bits_per_sample: sample_format.bits_per_sample() as u16,
-        })
+        // The bit depth and container width are both at most 64, so these casts
+        // never truncate.
+        if writes_as_extensible(channels, sample_format) {
+            // Strict-spec extensible: wBitsPerSample carries the container size
+            // (bytes per sample * 8), and the real depth goes in validBits. The
+            // subformat GUID mirrors the plain format code (PCM vs IEEE float).
+            // The channel mask is left at 0 ("no assignment") since the spec
+            // carries no speaker layout to map.
+            let sub_format = match sample_format.format_code() {
+                3 => SUBTYPE_FLOAT,
+                _ => SUBTYPE_PCM,
+            };
+            Ok(FmtChunk {
+                format_code: 0xFFFE,
+                channels: channels_u16,
+                sample_rate: sample_rate_u32,
+                byte_rate,
+                block_align,
+                bits_per_sample: (bytes_per_sample * 8) as u16,
+                extension: Some(FmtExtension {
+                    valid_bits_per_sample: sample_format.bits_per_sample() as u16,
+                    channel_mask: 0,
+                    sub_format: sub_format.to_bytes(),
+                }),
+            })
+        } else {
+            Ok(FmtChunk {
+                format_code: sample_format.format_code(),
+                channels: channels_u16,
+                sample_rate: sample_rate_u32,
+                byte_rate,
+                block_align,
+                bits_per_sample: sample_format.bits_per_sample() as u16,
+                extension: None,
+            })
+        }
     }
 
-    /// Parse the first 16 bytes of a `fmt ` chunk body.
+    /// Parse the first 16 bytes of a `fmt ` chunk body (the core; any extensible
+    /// fields are read separately in [`look_up_extended_format`]).
     fn parse(data: &[u8]) -> Self {
         FmtChunk {
             format_code: read_u16(data, 0),
@@ -178,19 +267,34 @@ impl FmtChunk {
             byte_rate: read_u32(data, 8),
             block_align: read_u16(data, 12),
             bits_per_sample: read_u16(data, 14),
+            extension: None,
         }
     }
 
-    /// Serialize the canonical 16-byte body.
-    fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
-        bytes[0..2].copy_from_slice(&self.format_code.to_le_bytes());
-        bytes[2..4].copy_from_slice(&self.channels.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.sample_rate.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.byte_rate.to_le_bytes());
-        bytes[12..14].copy_from_slice(&self.block_align.to_le_bytes());
-        bytes[14..16].copy_from_slice(&self.bits_per_sample.to_le_bytes());
-        bytes
+    /// The size in bytes of this chunk's body when written.
+    fn body_size(&self) -> u32 {
+        if self.extension.is_some() {
+            Self::EXTENSIBLE_SIZE
+        } else {
+            Self::CORE_SIZE
+        }
+    }
+
+    /// Write the `fmt ` chunk body (16 bytes, or 40 with the extension).
+    fn write_body(&self, dest: &mut impl Write) -> std::io::Result<()> {
+        dest.write_all(&self.format_code.to_le_bytes())?;
+        dest.write_all(&self.channels.to_le_bytes())?;
+        dest.write_all(&self.sample_rate.to_le_bytes())?;
+        dest.write_all(&self.byte_rate.to_le_bytes())?;
+        dest.write_all(&self.block_align.to_le_bytes())?;
+        dest.write_all(&self.bits_per_sample.to_le_bytes())?;
+        if let Some(ext) = &self.extension {
+            dest.write_all(&22u16.to_le_bytes())?; // cbSize
+            dest.write_all(&ext.valid_bits_per_sample.to_le_bytes())?;
+            dest.write_all(&ext.channel_mask.to_le_bytes())?;
+            dest.write_all(&ext.sub_format)?;
+        }
+        Ok(())
     }
 
     /// The number of bytes per single-channel sample, derived from the block
@@ -243,7 +347,10 @@ fn look_up_extended_format(
     ) {
         (SUBTYPE_PCM, 16, 2, 16) => Ok(SampleFormat::I16),
         (SUBTYPE_PCM, 24, 3, 24) => Ok(SampleFormat::I24_3),
+        // 24-in-4-byte: the lenient form (wBitsPerSample = 24) and the
+        // strict-spec form (wBitsPerSample = container size 32, validBits = 24).
         (SUBTYPE_PCM, 24, 4, 24) => Ok(SampleFormat::I24_4),
+        (SUBTYPE_PCM, 32, 4, 24) => Ok(SampleFormat::I24_4),
         (SUBTYPE_PCM, 32, 4, 32) => Ok(SampleFormat::I32),
         (SUBTYPE_FLOAT, 32, 4, 32) => Ok(SampleFormat::F32),
         (SUBTYPE_FLOAT, 64, 8, 64) => Ok(SampleFormat::F64),
@@ -328,7 +435,9 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     ))
 }
 
-/// Write a minimal canonical wav header with a 16-byte `fmt ` chunk.
+/// Write a wav header: RIFF + WAVE, a `fmt ` chunk (16-byte core, or a 40-byte
+/// `WAVEFORMATEXTENSIBLE` chunk for formats that need it), then the data chunk
+/// header.
 ///
 /// The RIFF size and data size fields are written from the supplied values. Pass
 /// [`u32::MAX`] for streaming output where the final length is not yet known, or
@@ -352,8 +461,8 @@ pub fn write_wav_header(
     dest.write_all(WAVE)?;
 
     // fmt chunk.
-    write_chunk_header(dest, FMT, FmtChunk::SIZE)?;
-    dest.write_all(&fmt.to_bytes())?;
+    write_chunk_header(dest, FMT, fmt.body_size())?;
+    fmt.write_body(dest)?;
 
     // data chunk header. The audio data starts immediately after.
     write_chunk_header(dest, DATA, data_size)?;

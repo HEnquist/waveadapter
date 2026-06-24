@@ -149,6 +149,114 @@ fn header_roundtrip_offsets() {
 }
 
 #[test]
+fn writes_i24_4_as_strict_extensible() {
+    let channels = 2;
+    let frames = 8;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 96000,
+        sample_format: SampleFormat::I24_4,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+    // The fmt chunk is a 40-byte WAVE_FORMAT_EXTENSIBLE, strict-spec form.
+    assert_eq!(&bytes[12..16], b"fmt ");
+    assert_eq!(rd32(16), 40, "fmt chunk is the 40-byte extensible form");
+    assert_eq!(rd16(20), 0xFFFE, "format tag is WAVE_FORMAT_EXTENSIBLE");
+    assert_eq!(rd16(22), channels as u16, "channels");
+    assert_eq!(rd16(32), 8, "block alignment is channels * 4 bytes");
+    assert_eq!(rd16(34), 32, "wBitsPerSample carries the 32-bit container");
+    assert_eq!(rd16(36), 22, "cbSize");
+    assert_eq!(rd16(38), 24, "wValidBitsPerSample carries the real 24 bits");
+    assert_eq!(
+        &bytes[60..64],
+        b"data",
+        "data chunk follows the 40-byte fmt"
+    );
+
+    // And it reads back as I24_4 with the audio intact and data starting at 68.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), SampleFormat::I24_4);
+    assert_eq!(reader.channels(), channels);
+    assert_eq!(reader.params().data_offset, 68);
+
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    let tolerance = 1.0 / 8_388_607.0 * 2.0;
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert!(
+                (a - b).abs() <= tolerance,
+                "frame {frame} ch {ch}: {a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn writes_multichannel_as_extensible() {
+    // I16 is normally a plain 16-byte fmt chunk, but more than two channels
+    // forces the WAVE_FORMAT_EXTENSIBLE form per the spec recommendation.
+    let channels = 4;
+    let frames = 8;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+    assert_eq!(&bytes[12..16], b"fmt ");
+    assert_eq!(rd32(16), 40, "fmt chunk is the 40-byte extensible form");
+    assert_eq!(rd16(20), 0xFFFE, "format tag is WAVE_FORMAT_EXTENSIBLE");
+    assert_eq!(rd16(22), channels as u16, "channels");
+    assert_eq!(rd16(32), 8, "block alignment is channels * 2 bytes");
+    assert_eq!(rd16(34), 16, "wBitsPerSample carries the 16-bit container");
+    assert_eq!(rd16(38), 16, "wValidBitsPerSample matches the container");
+    assert_eq!(bytes[44], 1, "subformat GUID is KSDATAFORMAT_SUBTYPE_PCM");
+    assert_eq!(&bytes[60..64], b"data", "data chunk follows the 40-byte fmt");
+
+    // And it reads back as plain I16 with the audio intact.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), SampleFormat::I16);
+    assert_eq!(reader.channels(), channels);
+
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    let tolerance = 1.0 / 32_767.0 * 2.0;
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert!(
+                (a - b).abs() <= tolerance,
+                "frame {frame} ch {ch}: {a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
 fn invalid_header_is_rejected() {
     let mut cursor = Cursor::new(vec![0u8; 100]);
     assert!(read_wav_header(&mut cursor).is_err());

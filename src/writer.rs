@@ -10,7 +10,7 @@ use num_traits::float::FloatCore;
 use crate::dispatch::with_sample_type;
 use crate::error::Result;
 use crate::format::WavSpec;
-use crate::header::{DATA_SIZE_OFFSET, RIFF_SIZE_OFFSET, write_wav_header};
+use crate::header::{self, RIFF_SIZE_OFFSET, write_wav_header};
 
 /// A writer for wav files.
 ///
@@ -143,11 +143,15 @@ impl<W: Write + Seek> WavWriter<W> {
     pub fn finalize(mut self) -> Result<W> {
         self.inner.flush()?;
         if self.seekable {
+            let format = self.spec.sample_format;
+            let channels = self.spec.channels;
             let data_size = u32::try_from(self.data_bytes).unwrap_or(u32::MAX);
-            let riff_size = u32::try_from(36 + self.data_bytes).unwrap_or(u32::MAX);
+            let riff_size = u32::try_from(header::riff_size(channels, format, self.data_bytes))
+                .unwrap_or(u32::MAX);
             self.inner.seek(SeekFrom::Start(RIFF_SIZE_OFFSET))?;
             self.inner.write_all(&riff_size.to_le_bytes())?;
-            self.inner.seek(SeekFrom::Start(DATA_SIZE_OFFSET))?;
+            self.inner
+                .seek(SeekFrom::Start(header::data_size_offset(channels, format)))?;
             self.inner.write_all(&data_size.to_le_bytes())?;
             self.inner.seek(SeekFrom::End(0))?;
         }

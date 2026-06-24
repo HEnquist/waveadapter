@@ -22,11 +22,22 @@ audioadapter byte-wrapper sample types.
 | `F32`          | IEEE float | 32   | 4     |
 | `F64`          | IEEE float | 64   | 8     |
 
-Both plain `WAVEFORMAT` and extended `WAVEFORMATEXTENSIBLE` headers are parsed.
+Both plain `WAVEFORMAT`/`WAVEFORMATEX` and extended `WAVEFORMATEXTENSIBLE` headers are parsed.
+
+When writing, the minimal 16-byte `fmt ` chunk is used by default, and the 40-byte
+`WAVEFORMATEXTENSIBLE` form is used in two cases:
+
+- **`I24_4`** (24 valid bits in a 4-byte container) is ambiguous as plain PCM, because the block
+  alignment implies a 32-bit sample. It is written as a strict-spec `WAVEFORMATEXTENSIBLE` header,
+  with the 32-bit container size in `wBitsPerSample` and 24 in `wValidBitsPerSample`. On read, both
+  that strict form and the lenient form (`wBitsPerSample` = 24) are accepted.
+- **More than two channels**, following the spec recommendation to use the extensible form once the
+  layout is past plain mono/stereo. `dwChannelMask` is written as `0` (unspecified), since the
+  channels follow the conventional positional order and the mask is widely ignored in practice.
 
 ## Reading
 
-```rust
+```rust no_run
 use std::fs::File;
 use waveadapter::WavReader;
 
@@ -50,7 +61,7 @@ Two modes are available:
 - **Streaming** (`WavWriter::new_streaming`): the size fields are set to `u32::MAX` up front and
   never updated, for pipes and other non-seekable outputs. Finish with `into_inner`.
 
-```rust
+```rust no_run
 use std::fs::File;
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::{SampleFormat, WavSpec, WavWriter};
@@ -63,6 +74,20 @@ let clipped = writer.write_float_buffer(&data)?;
 writer.finalize()?;
 # Ok::<(), waveadapter::WavError>(())
 ```
+
+## Examples
+
+The `examples/` directory shows both the float and raw paths for reading and writing. Run any of
+them with `cargo run --example <name> -- <file.wav>`.
+
+- **`read_float`** — read a file into an `f32` buffer (converting from whatever the on-disk format
+  is) and report a peak level per channel.
+- **`read_raw`** — read the untouched interleaved sample bytes and decode the first frame by hand
+  with the matching audioadapter-sample byte type.
+- **`write_float`** — write a file from an `f32` buffer, letting the writer convert and clip into
+  the target format.
+- **`write_raw`** — write a file from raw interleaved sample bytes in streaming mode (size fields
+  set to `u32::MAX`, no seeking required).
 
 ## License
 
