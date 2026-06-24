@@ -44,9 +44,9 @@ impl<R: Read + Seek> WavReader<R> {
         })
     }
 
-    /// The parsed header parameters.
-    pub fn params(&self) -> WavParams {
-        self.params
+    /// The parsed header parameters, including any non-audio chunks.
+    pub fn params(&self) -> &WavParams {
+        &self.params
     }
 
     /// The sample format of the audio data.

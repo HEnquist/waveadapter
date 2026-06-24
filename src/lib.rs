@@ -9,6 +9,6 @@ mod writer;
 
 pub use error::{Result, WavError};
 pub use format::{SampleFormat, WavSpec};
-pub use header::WavParams;
+pub use header::{Chunk, WavParams};
 pub use reader::WavReader;
 pub use writer::WavWriter;

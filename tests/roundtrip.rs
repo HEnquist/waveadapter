@@ -5,7 +5,7 @@ use std::io::Cursor;
 use audioadapter::{Adapter, AdapterMut};
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::header::read_wav_header;
-use waveadapter::{SampleFormat, WavReader, WavSpec, WavWriter};
+use waveadapter::{Chunk, SampleFormat, WavReader, WavSpec, WavWriter};
 
 fn make_buffer(channels: usize, frames: usize) -> InterleavedOwned<f32> {
     let mut buf = InterleavedOwned::<f32>::new(0.0, channels, frames);
@@ -234,7 +234,11 @@ fn writes_multichannel_as_extensible() {
     assert_eq!(rd16(34), 16, "wBitsPerSample carries the 16-bit container");
     assert_eq!(rd16(38), 16, "wValidBitsPerSample matches the container");
     assert_eq!(bytes[44], 1, "subformat GUID is KSDATAFORMAT_SUBTYPE_PCM");
-    assert_eq!(&bytes[60..64], b"data", "data chunk follows the 40-byte fmt");
+    assert_eq!(
+        &bytes[60..64],
+        b"data",
+        "data chunk follows the 40-byte fmt"
+    );
 
     // And it reads back as plain I16 with the audio intact.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
@@ -254,6 +258,118 @@ fn writes_multichannel_as_extensible() {
             );
         }
     }
+}
+
+#[test]
+fn float_write_emits_fact_chunk() {
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::F32,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    let data = make_buffer(2, 10);
+    writer.write_float_buffer(&data).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+    // RIFF/WAVE (12) + fmt chunk (8 + 16). The fact chunk follows the fmt chunk.
+    assert_eq!(
+        &bytes[36..40],
+        b"fact",
+        "fact chunk follows the 16-byte fmt"
+    );
+    assert_eq!(rd32(40), 4, "fact body is 4 bytes");
+    assert_eq!(rd32(44), 10, "fact carries the sample-frame count");
+    assert_eq!(&bytes[48..52], b"data", "data chunk follows the fact chunk");
+
+    // It reads back cleanly, with the fact chunk surfaced as a raw chunk.
+    let cursor = Cursor::new(bytes);
+    let reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.sample_format(), SampleFormat::F32);
+    assert_eq!(reader.frames(), 10);
+    assert!(reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+}
+
+#[test]
+fn pcm_write_has_no_fact_chunk() {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&make_buffer(1, 4)).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+    // 16-byte fmt chunk is followed directly by the data chunk, no fact.
+    assert_eq!(&bytes[36..40], b"data");
+}
+
+#[test]
+fn leading_and_trailing_chunks_roundtrip() {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+    };
+    // An odd-length leading chunk exercises the pad byte, a trailing chunk after
+    // odd-length data exercises the data pad byte.
+    let leading = vec![Chunk {
+        id: *b"bext",
+        data: vec![1, 2, 3],
+    }];
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_with_chunks(&mut cursor, spec, &leading).unwrap();
+    // An odd number of data bytes forces a pad byte before the trailing chunk.
+    writer.write_raw_interleaved(&[0u8; 5]).unwrap();
+    writer.write_chunk(*b"LIST", b"INFOIART").unwrap();
+    writer.finalize().unwrap();
+    cursor.set_position(0);
+
+    let params = read_wav_header(&mut cursor).unwrap();
+    assert_eq!(params.channels, 1);
+    let ids: Vec<[u8; 4]> = params.chunks.iter().map(|c| c.id).collect();
+    assert!(ids.contains(b"bext"), "leading chunk present: {ids:?}");
+    assert!(ids.contains(b"LIST"), "trailing chunk present: {ids:?}");
+    let bext = params.chunks.iter().find(|c| &c.id == b"bext").unwrap();
+    assert_eq!(bext.data, vec![1, 2, 3]);
+    let list = params.chunks.iter().find(|c| &c.id == b"LIST").unwrap();
+    assert_eq!(list.data, b"INFOIART");
+}
+
+#[test]
+fn reserved_chunk_id_is_rejected() {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+    };
+    let bad = vec![Chunk {
+        id: *b"data",
+        data: vec![0],
+    }];
+    let result = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &bad);
+    assert!(matches!(result, Err(waveadapter::WavError::InvalidSpec(_))));
+}
+
+#[test]
+fn audio_after_trailing_chunk_is_rejected() {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+    };
+    let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[0u8; 4]).unwrap();
+    writer.write_chunk(*b"LIST", b"x").unwrap();
+    let result = writer.write_raw_interleaved(&[0u8; 4]);
+    assert!(matches!(result, Err(waveadapter::WavError::InvalidSpec(_))));
 }
 
 #[test]

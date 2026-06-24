@@ -44,13 +44,20 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `header.rs`). Byte sizes come from each sample type's `BYTES_PER_SAMPLE` via this macro, so they
   stay in sync automatically.
 
-- **`header.rs`** parses and writes the RIFF/WAVE container. The parser walks chunks looking for
-  `fmt ` and `data`, tolerating junk/extra chunks and out-of-order chunks, and supports both plain
-  `WAVEFORMAT` (16/18-byte fmt) and `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype).
-  `FmtChunk` is the single byte-layout definition shared by parser and writer. Writing emits the
-  minimal canonical 16-byte `fmt ` chunk by default, switching to the 40-byte
-  `WAVEFORMATEXTENSIBLE` form when the format requires it (`I24_4`) or there are more than two
-  channels (see `writes_as_extensible`).
+- **`header.rs`** parses and writes the RIFF/WAVE container. The parser walks *all* chunks to the
+  end of the file, picking out the first `fmt ` and `data` (tolerating junk/extra chunks and
+  out-of-order chunks) and capturing every other chunk verbatim into `WavParams::chunks` as raw
+  `Chunk { id, data }` blobs. This crate gives meaning only to `fmt ` and `data`; everything else
+  (`LIST`/`INFO`, `bext`, `cue `, `fact`, `iXML`, ...) is passed through untouched so a higher-level
+  metadata library can sit on top. It supports both plain `WAVEFORMAT` (16/18-byte fmt) and
+  `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype). `FmtChunk` is the single
+  byte-layout definition shared by parser and writer. Writing emits the minimal canonical 16-byte
+  `fmt ` chunk by default, switching to the 40-byte `WAVEFORMATEXTENSIBLE` form when the format
+  requires it (`I24_4`) or there are more than two channels (see `writes_as_extensible`). For float
+  formats it also emits a `fact` chunk (sample-frame count) after `fmt `, as the spec expects for
+  non-PCM data. The granular `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/
+  `write_data_header` helpers let the writer compose a header with `fact` and caller-supplied
+  chunks; `write_wav_header` is the plain RIFF+fmt+data convenience built on them.
 
 - **`reader.rs` / `writer.rs`** provide two paths each:
   - *Float path* (`read_into_float` / `read_all_to_float` / `write_float_buffer`): converts on the
@@ -59,8 +66,17 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   - *Raw path* (`read_raw_interleaved` / `write_raw_interleaved`): moves untouched interleaved bytes
     so the caller can wrap them with audioadapter's byte/number adapters directly.
 
+  Metadata chunks pass through as opaque blobs: read them from `WavReader::params().chunks`, and
+  write them as *leading* chunks (before `data`, via `WavWriter::new_with_chunks` /
+  `new_streaming_with_chunks`) or *trailing* chunks (after the audio, via `WavWriter::write_chunk`).
+  The writer manages even-byte padding, the RIFF/data size accounting, and rejects the reserved ids
+  it controls (`RIFF`, `fmt `, `data`, `fact`). Audio cannot be written once a trailing chunk has
+  been emitted.
+
 - **Streaming vs seekable writing** (`writer.rs`): `WavWriter::new` writes placeholder size fields
-  and patches them in `finalize` (needs `Seek`). `WavWriter::new_streaming` writes `u32::MAX` sizes
+  (and a placeholder `fact` count for float) and patches them in `finalize` (needs `Seek`), using
+  the byte offsets recorded in `Layout` while the header was written (so the patch positions stay
+  correct regardless of `fact`/leading chunks). `WavWriter::new_streaming` writes `u32::MAX` sizes
   up front and never updates them (for pipes); finish with `into_inner`. The reader treats a
   `u32::MAX` declared length as "unknown" and stops cleanly at EOF on a frame boundary.
 

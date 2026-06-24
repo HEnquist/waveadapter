@@ -36,31 +36,6 @@ pub(crate) fn writes_as_extensible(channels: usize, format: SampleFormat) -> boo
     matches!(format, SampleFormat::I24_4) || channels > 2
 }
 
-/// The size in bytes of the `fmt ` chunk body written for a header.
-pub(crate) fn fmt_body_size(channels: usize, format: SampleFormat) -> u32 {
-    if writes_as_extensible(channels, format) {
-        FmtChunk::EXTENSIBLE_SIZE
-    } else {
-        FmtChunk::CORE_SIZE
-    }
-}
-
-/// Byte offset of the 32-bit data chunk size field for a header.
-///
-/// The header is RIFF id + size + WAVE (12 bytes), the `fmt ` chunk id + size
-/// (8 bytes) and body, then the data chunk id (4 bytes); the size field follows.
-pub(crate) fn data_size_offset(channels: usize, format: SampleFormat) -> u64 {
-    12 + 8 + fmt_body_size(channels, format) as u64 + 4
-}
-
-/// Value to write into the RIFF chunk size field for a finished file.
-///
-/// It covers everything after the size field: the WAVE id, the whole `fmt `
-/// chunk and the whole data chunk.
-pub(crate) fn riff_size(channels: usize, format: SampleFormat, data_bytes: u64) -> u64 {
-    4 + (8 + fmt_body_size(channels, format) as u64) + (8 + data_bytes)
-}
-
 /// Windows GUID, used to give the sample format in the extended
 /// `WAVEFORMATEXTENSIBLE` wav header.
 #[derive(Debug, PartialEq, Eq)]
@@ -107,8 +82,26 @@ const SUBTYPE_PCM: Guid = Guid {
     data4: [128, 0, 0, 170, 0, 56, 155, 113],
 };
 
+/// A raw, uninterpreted wav chunk.
+///
+/// This crate parses only the `fmt ` and `data` chunks; every other chunk
+/// (`LIST`/`INFO`, `bext`, `cue `, `fact`, `iXML`, `id3 `, ...) is exposed
+/// verbatim so a higher-level library can give it meaning. The `data` chunk is
+/// not included here (it is the audio, described by
+/// [`WavParams::data_offset`]/[`data_length`](WavParams::data_length)); the
+/// `fmt ` chunk is not included either, since it is already parsed into the
+/// typed fields of [`WavParams`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    /// The four-character chunk id, for example `*b"LIST"`.
+    pub id: [u8; 4],
+    /// The raw chunk body, excluding the 8-byte id/size header and any trailing
+    /// pad byte.
+    pub data: Vec<u8>,
+}
+
 /// The parameters extracted from a wav header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WavParams {
     /// The binary sample format of the audio data.
     pub sample_format: SampleFormat,
@@ -123,6 +116,9 @@ pub struct WavParams {
     /// Files written in streaming mode declare this as [`u32::MAX`] because the
     /// final length is not known up front, so do not rely on it to be accurate.
     pub data_length: usize,
+    /// Every non-audio chunk found in the file, in the order encountered, with
+    /// its body bytes read out. See [`Chunk`].
+    pub chunks: Vec<Chunk>,
 }
 
 fn read_u32(buffer: &[u8], start_index: usize) -> u32 {
@@ -389,37 +385,63 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     let mut channels = 0;
     let mut data_offset = 0;
     let mut data_length = 0;
+    let mut chunks: Vec<Chunk> = Vec::new();
 
-    // Analyze each chunk to find the format and the data.
-    while (!found_fmt || !found_data) && next_chunk_location < filesize {
+    // Walk every chunk to the end of the file, so that metadata chunks placed
+    // after the data chunk are captured too. A chunk is padded to an even length
+    // with a trailing byte that is not counted in its declared size.
+    while next_chunk_location + 8 <= filesize {
         file.seek(SeekFrom::Start(next_chunk_location))?;
         file.read_exact(&mut buffer)?;
         let chunk_length = read_u32(&buffer, 4);
         let is_data = compare_4cc(&buffer, DATA);
         let is_fmt = compare_4cc(&buffer, FMT);
-        if is_fmt && (chunk_length == 16 || chunk_length == 18 || chunk_length == 40) {
-            found_fmt = true;
-            let mut data = vec![0; chunk_length as usize];
-            file.read_exact(&mut data)?;
-            let fmt = FmtChunk::parse(&data);
-            channels = fmt.channels;
-            sample_rate = fmt.sample_rate;
-            let bytes_per_sample = fmt
-                .bytes_per_sample()
-                .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
-            sample_format = look_up_format(
-                &data,
-                fmt.format_code,
-                fmt.bits_per_sample,
-                bytes_per_sample,
-                chunk_length,
-            )?;
+        if is_fmt {
+            // Honor the first valid fmt chunk; ignore any later or malformed one.
+            if !found_fmt && (chunk_length == 16 || chunk_length == 18 || chunk_length == 40) {
+                found_fmt = true;
+                let mut data = vec![0; chunk_length as usize];
+                file.read_exact(&mut data)?;
+                let fmt = FmtChunk::parse(&data);
+                channels = fmt.channels;
+                sample_rate = fmt.sample_rate;
+                let bytes_per_sample = fmt
+                    .bytes_per_sample()
+                    .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
+                sample_format = look_up_format(
+                    &data,
+                    fmt.format_code,
+                    fmt.bits_per_sample,
+                    bytes_per_sample,
+                    chunk_length,
+                )?;
+            }
         } else if is_data {
-            found_data = true;
-            data_offset = next_chunk_location + 8;
-            data_length = chunk_length;
+            // Honor the first data chunk; ignore any later one.
+            if !found_data {
+                found_data = true;
+                data_offset = next_chunk_location + 8;
+                data_length = chunk_length;
+                // A streaming placeholder length means the data runs to the end
+                // of the file, so there is nothing to scan past it.
+                if chunk_length == u32::MAX {
+                    break;
+                }
+            }
+        } else {
+            // Any other chunk is captured verbatim, tolerating a bogus length
+            // that would overrun the file by stopping the scan instead of erroring.
+            let body_end = next_chunk_location + 8 + chunk_length as u64;
+            if body_end > filesize {
+                break;
+            }
+            let mut body = vec![0; chunk_length as usize];
+            file.read_exact(&mut body)?;
+            let mut id = [0u8; 4];
+            id.copy_from_slice(&buffer[0..4]);
+            chunks.push(Chunk { id, data: body });
         }
-        next_chunk_location += 8 + chunk_length as u64;
+        next_chunk_location += 8 + chunk_length as u64 + (chunk_length as u64 & 1);
     }
     if found_data && found_fmt {
         return Ok(WavParams {
@@ -428,6 +450,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             channels: channels as usize,
             data_length: data_length as usize,
             data_offset: data_offset as usize,
+            chunks,
         });
     }
     Err(WavError::InvalidHeader(
@@ -435,9 +458,63 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     ))
 }
 
-/// Write a wav header: RIFF + WAVE, a `fmt ` chunk (16-byte core, or a 40-byte
-/// `WAVEFORMATEXTENSIBLE` chunk for formats that need it), then the data chunk
-/// header.
+/// Write the RIFF chunk header and the WAVE form type (12 bytes).
+///
+/// Pass [`u32::MAX`] for `riff_size` in streaming output where the final length
+/// is not yet known.
+pub(crate) fn write_riff_wave(dest: &mut impl Write, riff_size: u32) -> std::io::Result<()> {
+    write_chunk_header(dest, RIFF, riff_size)?;
+    dest.write_all(WAVE)
+}
+
+/// Write the `fmt ` chunk (id, size and body) and return its body size in bytes.
+///
+/// Returns [`WavError::InvalidSpec`] if the channel count or sample rate cannot
+/// be represented in the header fields.
+pub(crate) fn write_fmt_chunk(
+    dest: &mut impl Write,
+    channels: usize,
+    sample_format: SampleFormat,
+    sample_rate: usize,
+) -> Result<u32> {
+    let fmt = FmtChunk::for_format(channels, sample_format, sample_rate)?;
+    let body_size = fmt.body_size();
+    write_chunk_header(dest, FMT, body_size)?;
+    fmt.write_body(dest)?;
+    Ok(body_size)
+}
+
+/// Write the `data` chunk header (id and size, 8 bytes). The audio data is
+/// written immediately after.
+///
+/// Pass [`u32::MAX`] for `data_size` when the final length is not yet known.
+pub(crate) fn write_data_header(dest: &mut impl Write, data_size: u32) -> std::io::Result<()> {
+    write_chunk_header(dest, DATA, data_size)
+}
+
+/// Write an arbitrary named chunk: the 4-byte id, the 32-bit little-endian size,
+/// the body, and a pad byte if the body length is odd. Returns the total number
+/// of bytes written, including the header and any pad byte.
+///
+/// The caller must ensure `body.len()` fits in a `u32`.
+pub(crate) fn write_named_chunk(
+    dest: &mut impl Write,
+    id: &[u8; 4],
+    body: &[u8],
+) -> std::io::Result<u64> {
+    write_chunk_header(dest, id, body.len() as u32)?;
+    dest.write_all(body)?;
+    let mut written = 8 + body.len() as u64;
+    if body.len() % 2 == 1 {
+        dest.write_all(&[0])?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Write a plain wav header: RIFF + WAVE, a `fmt ` chunk (16-byte core, or a
+/// 40-byte `WAVEFORMATEXTENSIBLE` chunk for formats that need it), then the data
+/// chunk header. No `fact` or metadata chunks are written.
 ///
 /// The RIFF size and data size fields are written from the supplied values. Pass
 /// [`u32::MAX`] for streaming output where the final length is not yet known, or
@@ -454,18 +531,8 @@ pub fn write_wav_header(
     riff_size: u32,
     data_size: u32,
 ) -> Result<()> {
-    let fmt = FmtChunk::for_format(channels, sample_format, sample_rate)?;
-
-    // RIFF chunk header, then the WAVE form type.
-    write_chunk_header(dest, RIFF, riff_size)?;
-    dest.write_all(WAVE)?;
-
-    // fmt chunk.
-    write_chunk_header(dest, FMT, fmt.body_size())?;
-    fmt.write_body(dest)?;
-
-    // data chunk header. The audio data starts immediately after.
-    write_chunk_header(dest, DATA, data_size)?;
-
+    write_riff_wave(dest, riff_size)?;
+    write_fmt_chunk(dest, channels, sample_format, sample_rate)?;
+    write_data_header(dest, data_size)?;
     Ok(())
 }
