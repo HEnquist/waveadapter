@@ -1,0 +1,18 @@
+[package]
+name = "waveadapter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["HEnquist <henrik.enquist@gmail.com>"]
+description = "Reading and writing wav files into audioadapter buffers"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/HEnquist/waveadapter"
+keywords = ["audio", "wav", "pcm", "sample", "buffer"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+readme = "README.md"
+
+[dependencies]
+num-traits = { version = "0.2.15", default-features = false }
+audioadapter = "4.0.0"
+audioadapter-sample = "4.0.0"
+audioadapter-buffers = "4.0.0"

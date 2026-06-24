@@ -1,0 +1,76 @@
+//! Sample formats supported in wav files.
+
+use crate::dispatch::with_sample_type;
+
+/// The binary sample format of the audio data in a wav file.
+///
+/// Wav data is always little-endian, and 24-bit-in-4-byte data is always left
+/// justified, so those qualifiers are left out of the names. Each variant
+/// corresponds to one of the byte-wrapper sample types from
+/// [`audioadapter_sample::sample`], which is what the reader and writer use to
+/// convert between raw bytes and numbers.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFormat {
+    /// Signed integer, 16 bits in 2 bytes.
+    I16,
+    /// Signed integer, 24 bits in 3 bytes (packed).
+    I24_3,
+    /// Signed integer, 24 bits in 4 bytes (padded with a zero low byte).
+    I24_4,
+    /// Signed integer, 32 bits in 4 bytes.
+    I32,
+    /// Single precision floating point, 32 bits in 4 bytes.
+    F32,
+    /// Double precision floating point, 64 bits in 8 bytes.
+    F64,
+}
+
+impl SampleFormat {
+    /// The number of significant bits per sample, as stored in the wav `fmt ` chunk.
+    pub fn bits_per_sample(&self) -> usize {
+        match self {
+            SampleFormat::I16 => 16,
+            SampleFormat::I24_3 => 24,
+            SampleFormat::I24_4 => 24,
+            SampleFormat::I32 => 32,
+            SampleFormat::F32 => 32,
+            SampleFormat::F64 => 64,
+        }
+    }
+
+    /// The number of bytes occupied by one sample on disk.
+    ///
+    /// Sourced from the `BYTES_PER_SAMPLE` constant of the corresponding
+    /// audioadapter byte-wrapper sample type, so it stays in sync with it.
+    pub fn bytes_per_sample(&self) -> usize {
+        with_sample_type!(*self, S, { S::BYTES_PER_SAMPLE })
+    }
+
+    /// The wav format code: `1` for integer PCM, `3` for IEEE float.
+    pub fn format_code(&self) -> u16 {
+        match self {
+            SampleFormat::F32 | SampleFormat::F64 => 3,
+            _ => 1,
+        }
+    }
+}
+
+/// The properties needed to start writing a wav file: channel count, sample
+/// rate and sample format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WavSpec {
+    /// The number of channels.
+    pub channels: usize,
+    /// The sample rate in Hz.
+    pub sample_rate: usize,
+    /// The binary sample format to store the audio data as.
+    pub sample_format: SampleFormat,
+}
+
+impl WavSpec {
+    /// The number of bytes occupied by one frame (one sample for each channel).
+    pub fn frame_bytes(&self) -> usize {
+        self.channels * self.sample_format.bytes_per_sample()
+    }
+}
