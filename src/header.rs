@@ -36,7 +36,7 @@ pub(crate) const DS64_BODY_SIZE: u32 = 28;
 
 /// Whether a header is written as `WAVE_FORMAT_EXTENSIBLE`.
 ///
-/// Two cases force the extensible form:
+/// Three cases force the extensible form:
 ///
 /// * 24-bit-in-4-byte data is ambiguous as plain PCM (the block alignment
 ///   implies a 4-byte/32-bit sample, but only 24 bits are meaningful), so we
@@ -44,11 +44,18 @@ pub(crate) const DS64_BODY_SIZE: u32 = 28;
 ///   and the real 24 bits in `wValidBitsPerSample`.
 /// * More than two channels: the spec recommends extensible (with a channel
 ///   mask) once the layout is no longer plain mono/stereo.
+/// * A non-zero channel mask: it can only be stored in the extensible form.
 ///
 /// Anything else is unambiguous as plain PCM or float and uses the minimal
 /// 16-byte `fmt ` chunk.
-pub(crate) fn writes_as_extensible(channels: usize, format: SampleFormat) -> bool {
-    matches!(format, SampleFormat::I24_4) || channels > 2
+pub(crate) fn writes_as_extensible(
+    channels: usize,
+    format: SampleFormat,
+    channel_mask: Option<u32>,
+) -> bool {
+    matches!(format, SampleFormat::I24_4)
+        || channels > 2
+        || matches!(channel_mask, Some(mask) if mask != 0)
 }
 
 /// Windows GUID, used to give the sample format in the extended
@@ -138,6 +145,12 @@ pub struct WavParams {
     pub sample_rate: usize,
     /// The number of channels.
     pub channels: usize,
+    /// The speaker-position channel mask (`dwChannelMask`) read from a
+    /// `WAVEFORMATEXTENSIBLE` header, or `None` if the file uses a plain
+    /// `WAVEFORMAT`/`WAVEFORMATEX` header that carries no mask. A value of
+    /// `Some(0)` means the extensible header was present but left the layout
+    /// unspecified. This crate stores the mask but does not interpret it.
+    pub channel_mask: Option<u32>,
     /// Byte offset from the start of the file to the first audio sample.
     pub data_offset: usize,
     /// The length of the audio data in bytes, as declared in the header.
@@ -296,11 +309,23 @@ impl FmtChunk {
         channels: usize,
         sample_format: SampleFormat,
         sample_rate: usize,
+        channel_mask: Option<u32>,
     ) -> Result<Self> {
         if channels == 0 {
             return Err(WavError::InvalidSpec(
                 "channel count must be at least 1".to_string(),
             ));
+        }
+        // The mask is stored, not interpreted: the only rule we enforce is that a
+        // non-zero mask assigns exactly one speaker position per channel.
+        if let Some(mask) = channel_mask
+            && mask != 0
+            && mask.count_ones() as usize != channels
+        {
+            return Err(WavError::InvalidSpec(format!(
+                "channel mask {mask:#x} has {} bits set but there are {channels} channels",
+                mask.count_ones()
+            )));
         }
         let bytes_per_sample = sample_format.bytes_per_sample();
         let channels_u16 = u16::try_from(channels).map_err(|_| {
@@ -326,12 +351,12 @@ impl FmtChunk {
             })?;
         // The bit depth and container width are both at most 64, so these casts
         // never truncate.
-        if writes_as_extensible(channels, sample_format) {
+        if writes_as_extensible(channels, sample_format, channel_mask) {
             // Strict-spec extensible: wBitsPerSample carries the container size
             // (bytes per sample * 8), and the real depth goes in validBits. The
             // subformat GUID mirrors the plain format code (PCM vs IEEE float).
-            // The channel mask is left at 0 ("no assignment") since the spec
-            // carries no speaker layout to map.
+            // The channel mask is the caller's value, or 0 ("no assignment") when
+            // none was given.
             let sub_format = match sample_format.format_code() {
                 3 => SUBTYPE_FLOAT,
                 _ => SUBTYPE_PCM,
@@ -345,7 +370,7 @@ impl FmtChunk {
                 bits_per_sample: (bytes_per_sample * 8) as u16,
                 extension: Some(FmtExtension {
                     valid_bits_per_sample: sample_format.bits_per_sample() as u16,
-                    channel_mask: 0,
+                    channel_mask: channel_mask.unwrap_or(0),
                     sub_format: sub_format.to_bytes(),
                 }),
             })
@@ -544,6 +569,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     let mut block_align = 0u16;
     let mut sample_rate = 0;
     let mut channels = 0;
+    let mut channel_mask = None;
     let mut data_offset = 0;
     let mut data_length: u64 = 0;
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -589,6 +615,11 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 format_code = fmt.format_code;
                 bits_per_sample = fmt.bits_per_sample;
                 block_align = fmt.block_align;
+                // The channel mask lives only in the 40-byte extensible form, at
+                // offset 20 (after cbSize and wValidBitsPerSample).
+                if chunk_length == 40 {
+                    channel_mask = Some(read_u32(&data, 20));
+                }
                 let bytes_per_sample = fmt
                     .bytes_per_sample()
                     .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
@@ -648,6 +679,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             block_align,
             sample_rate: sample_rate as usize,
             channels: channels as usize,
+            channel_mask,
             data_length: usize::try_from(data_length).map_err(|_| {
                 WavError::InvalidHeader("data length does not fit in memory".to_string())
             })?,
@@ -702,8 +734,9 @@ pub(crate) fn write_fmt_chunk(
     channels: usize,
     sample_format: SampleFormat,
     sample_rate: usize,
+    channel_mask: Option<u32>,
 ) -> Result<u32> {
-    let fmt = FmtChunk::for_format(channels, sample_format, sample_rate)?;
+    let fmt = FmtChunk::for_format(channels, sample_format, sample_rate, channel_mask)?;
     let body_size = fmt.body_size();
     write_chunk_header(dest, FMT, body_size)?;
     fmt.write_body(dest)?;
@@ -771,7 +804,7 @@ pub fn write_wav_header(
     data_size: u32,
 ) -> Result<()> {
     write_riff_wave(dest, riff_size)?;
-    write_fmt_chunk(dest, channels, sample_format, sample_rate)?;
+    write_fmt_chunk(dest, channels, sample_format, sample_rate, None)?;
     write_data_header(dest, data_size)?;
     Ok(())
 }

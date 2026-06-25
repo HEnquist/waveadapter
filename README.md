@@ -32,8 +32,13 @@ When writing, the minimal 16-byte `fmt ` chunk is used by default, and the 40-by
   with the 32-bit container size in `wBitsPerSample` and 24 in `wValidBitsPerSample`. On read, both
   that strict form and the lenient form (`wBitsPerSample` = 24) are accepted.
 - **More than two channels**, following the spec recommendation to use the extensible form once the
-  layout is past plain mono/stereo. `dwChannelMask` is written as `0` (unspecified), since the
-  channels follow the conventional positional order and the mask is widely ignored in practice.
+  layout is past plain mono/stereo.
+- **A non-zero channel mask** in the `WavSpec`, since the mask can only live in the extensible form.
+
+`dwChannelMask` defaults to `0` (unspecified). Set `WavSpec::channel_mask` to write a speaker
+layout; a non-zero mask must have exactly one bit set per channel. The crate stores the mask but
+does not interpret it, and exposes it on read as `WavParams::channel_mask` (`None` for a plain
+header that carries no mask).
 
 ## Reading
 
@@ -71,7 +76,7 @@ use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::{SampleFormat, WavSpec, WavWriter};
 
 let data = InterleavedOwned::<f32>::new(0.0, 2, 128);
-let spec = WavSpec { channels: 2, sample_rate: 44100, sample_format: SampleFormat::I32 };
+let spec = WavSpec::new(2, 44100, SampleFormat::I32);
 
 let mut writer = WavWriter::new(File::create("output.wav")?, spec)?;
 let clipped = writer.write_float_buffer(&data)?;

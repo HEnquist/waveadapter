@@ -28,6 +28,7 @@ fn roundtrip(format: SampleFormat, tolerance: f32) {
         channels,
         sample_rate: 48000,
         sample_format: format,
+        channel_mask: None,
     };
 
     let mut cursor = Cursor::new(Vec::new());
@@ -79,6 +80,7 @@ fn streaming_writer_produces_readable_file() {
         channels,
         sample_rate: 44100,
         sample_format: SampleFormat::F32,
+        channel_mask: None,
     };
 
     // Streaming mode leaves the size fields at u32::MAX.
@@ -106,6 +108,7 @@ fn read_into_partial_buffer() {
         channels,
         sample_rate: 44100,
         sample_format: SampleFormat::F32,
+        channel_mask: None,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
@@ -131,6 +134,7 @@ fn header_roundtrip_offsets() {
         channels: 2,
         sample_rate: 44100,
         sample_format: SampleFormat::I32,
+        channel_mask: None,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
@@ -157,6 +161,7 @@ fn writes_i24_4_as_strict_extensible() {
         channels,
         sample_rate: 96000,
         sample_format: SampleFormat::I24_4,
+        channel_mask: None,
     };
 
     let mut cursor = Cursor::new(Vec::new());
@@ -219,6 +224,7 @@ fn writes_multichannel_as_extensible() {
         channels,
         sample_rate: 48000,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
 
     let mut cursor = Cursor::new(Vec::new());
@@ -274,6 +280,7 @@ fn float_write_emits_fact_chunk() {
         channels: 2,
         sample_rate: 48000,
         sample_format: SampleFormat::F32,
+        channel_mask: None,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
@@ -308,6 +315,7 @@ fn pcm_write_has_no_fact_chunk() {
         channels: 1,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
@@ -324,6 +332,7 @@ fn leading_and_trailing_chunks_roundtrip() {
         channels: 1,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     // An odd-length leading chunk exercises the pad byte, a trailing chunk after
     // odd-length data exercises the data pad byte.
@@ -357,6 +366,7 @@ fn reserved_chunk_id_is_rejected() {
         channels: 1,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let bad = vec![Chunk {
         id: *b"data",
@@ -372,6 +382,7 @@ fn audio_after_trailing_chunk_is_rejected() {
         channels: 1,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec).unwrap();
     writer.write_raw_interleaved(&[0u8; 4]).unwrap();
@@ -389,6 +400,7 @@ fn rf64_roundtrip() {
         channels,
         sample_rate: 48000,
         sample_format: SampleFormat::F32,
+        channel_mask: None,
     };
 
     let mut cursor = Cursor::new(Vec::new());
@@ -460,6 +472,7 @@ fn rf64_with_leading_chunk_roundtrips() {
         channels: 1,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let leading = vec![Chunk {
         id: *b"bext",
@@ -487,6 +500,7 @@ fn bw64_is_read_like_rf64() {
         channels: 2,
         sample_rate: 48000,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let source = make_buffer(2, 16);
     let mut cursor = Cursor::new(Vec::new());
@@ -596,6 +610,7 @@ fn oversized_spec_is_rejected() {
         channels: 70_000,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let result = WavWriter::new(Cursor::new(Vec::new()), spec);
     assert!(matches!(result, Err(waveadapter::WavError::InvalidSpec(_))));
@@ -605,6 +620,7 @@ fn oversized_spec_is_rejected() {
         channels: 0,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     assert!(matches!(
         WavWriter::new(Cursor::new(Vec::new()), spec),
@@ -621,6 +637,7 @@ fn reader_seek_to_frame() {
         channels,
         sample_rate: 48000,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
@@ -665,6 +682,7 @@ fn writer_seek_to_frame_overwrites() {
         channels,
         sample_rate: 48000,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
@@ -694,4 +712,65 @@ fn writer_seek_to_frame_overwrites() {
             "frame {frame}: {expected} vs {got}"
         );
     }
+}
+
+#[test]
+fn channel_mask_roundtrips() {
+    // Stereo with FRONT_LEFT | FRONT_RIGHT (0x3). A non-zero mask forces the
+    // extensible header even for stereo, and reading it back yields the value.
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: Some(0x3),
+    };
+    let source = make_buffer(2, 16);
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    cursor.set_position(0);
+
+    let params = read_wav_header(&mut cursor).unwrap();
+    assert_eq!(params.channel_mask, Some(0x3));
+    assert_eq!(params.format_code, 0xFFFE);
+}
+
+#[test]
+fn no_channel_mask_leaves_plain_header() {
+    // Without a mask, stereo PCM stays a plain WAVEFORMAT and reports no mask.
+    let spec = WavSpec::new(2, 48000, SampleFormat::I16);
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&make_buffer(2, 16)).unwrap();
+    writer.finalize().unwrap();
+    cursor.set_position(0);
+
+    let params = read_wav_header(&mut cursor).unwrap();
+    assert_eq!(params.channel_mask, None);
+    assert_eq!(params.format_code, 1);
+}
+
+#[test]
+fn channel_mask_bit_count_mismatch_is_rejected() {
+    // Three bits set but only two channels.
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: Some(0x7),
+    };
+    assert!(matches!(
+        WavWriter::new(Cursor::new(Vec::new()), spec),
+        Err(waveadapter::WavError::InvalidSpec(_))
+    ));
+
+    // A zero mask is always accepted ("unspecified").
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: Some(0),
+    };
+    assert!(WavWriter::new(Cursor::new(Vec::new()), spec).is_ok());
 }

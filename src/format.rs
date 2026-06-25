@@ -66,9 +66,29 @@ pub struct WavSpec {
     pub sample_rate: usize,
     /// The binary sample format to store the audio data as.
     pub sample_format: SampleFormat,
+    /// The speaker-position channel mask (`dwChannelMask`) to write into a
+    /// `WAVEFORMATEXTENSIBLE` header, or `None` to leave it unspecified (`0`).
+    ///
+    /// This crate does not interpret the mask, it only stores it. A non-zero mask
+    /// must have exactly one bit set per channel (`channel_mask.count_ones() ==
+    /// channels`); otherwise the writer returns
+    /// [`WavError::InvalidSpec`](crate::WavError::InvalidSpec). Supplying a
+    /// non-zero mask forces the extensible header form even for mono/stereo, since
+    /// that is the only place the mask can be stored.
+    pub channel_mask: Option<u32>,
 }
 
 impl WavSpec {
+    /// Build a spec with no channel mask (`channel_mask: None`).
+    pub fn new(channels: usize, sample_rate: usize, sample_format: SampleFormat) -> Self {
+        WavSpec {
+            channels,
+            sample_rate,
+            sample_format,
+            channel_mask: None,
+        }
+    }
+
     /// The number of bytes occupied by one frame (one sample for each channel).
     pub fn frame_bytes(&self) -> usize {
         self.channels * self.sample_format.bytes_per_sample()

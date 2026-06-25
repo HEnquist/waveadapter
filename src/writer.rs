@@ -39,11 +39,16 @@ impl WriterSpec {
                     spec.channels,
                     spec.sample_format,
                     spec.sample_rate,
+                    spec.channel_mask,
                 )?;
                 // The spec requires a `fact` chunk for every format that is not
                 // plain WAVE_FORMAT_PCM: float, and the WAVEFORMATEXTENSIBLE form.
                 let needs_fact = spec.sample_format.format_code() == 3
-                    || header::writes_as_extensible(spec.channels, spec.sample_format);
+                    || header::writes_as_extensible(
+                        spec.channels,
+                        spec.sample_format,
+                        spec.channel_mask,
+                    );
                 Ok((body, needs_fact))
             }
             // Raw writers never emit a `fact` chunk: the format is uninterpreted,
