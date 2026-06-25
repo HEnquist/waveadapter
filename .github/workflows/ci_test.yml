@@ -1,0 +1,42 @@
+on: [push, pull_request]
+
+name: CI test and lint
+
+jobs:
+  check_test:
+    name: Check, test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Regenerate WAV fixtures
+        run: python3 tests/utils/generate_wav_variants.py
+
+      - name: Run cargo check
+        run: cargo check
+
+      - name: Run cargo test
+        run: cargo test
+
+      - name: Fail if fixtures are out of date
+        run: |
+          if ! git diff --quiet --exit-code tests/wav_variants || \
+             [ -n "$(git status --porcelain tests/wav_variants)" ]; then
+            echo "Committed WAV fixtures are out of date." >&2
+            echo "Run 'python tests/utils/generate_wav_variants.py' and commit the result." >&2
+            git status --porcelain tests/wav_variants >&2
+            git diff -- tests/wav_variants >&2
+            exit 1
+          fi
