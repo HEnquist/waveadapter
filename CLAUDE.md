@@ -18,7 +18,7 @@ cargo test                          # runs both test binaries plus doctests
 cargo test --test wav_variants      # header-parsing fixtures (one binary)
 cargo test --test roundtrip         # write-then-read roundtrips
 cargo test read_baseline_16bit      # run a single test by name substring
-cargo run --example read_float      # examples in examples/ (read_float, read_raw, write_float, write_raw)
+cargo run --example read_float      # examples in examples/ (read_float, read_raw, read_list, write_float, write_raw)
 cargo clippy
 cargo fmt
 ```
@@ -74,6 +74,14 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   The writer manages even-byte padding, the RIFF/data size accounting, and rejects the reserved ids
   it controls (`RIFF`, `fmt `, `data`, `fact`). Audio cannot be written once a trailing chunk has
   been emitted.
+
+- **`metadata.rs`** is a thin typed layer over those blobs for the one common case, the
+  `LIST`/`INFO` tag list (title/artist/comment/...). `INFO` is not its own chunk: it is the form
+  type of a `LIST` chunk. `InfoList` parses a `Chunk`/`Vec<u8>` (`from_chunk`/`from_bytes`) into an
+  ordered, duplicate-preserving list of (`[u8;4]` id, `String`) tags and generates one back
+  (`to_chunk`/`to_bytes`), with id constants like `metadata::TITLE`. Everything else (`bext`, `cue `,
+  `iXML`, ...) stays a raw blob for a higher-level crate to interpret; this module is deliberately
+  only `LIST`/`INFO`.
 
 - **Streaming vs seekable writing** (`writer.rs`): `WavWriter::new` writes placeholder size fields
   (and a placeholder `fact` count for float) and patches them in `finalize` (needs `Seek`), using
