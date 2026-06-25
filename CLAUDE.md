@@ -75,13 +75,18 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   it controls (`RIFF`, `fmt `, `data`, `fact`). Audio cannot be written once a trailing chunk has
   been emitted.
 
-- **`metadata.rs`** is a thin typed layer over those blobs for the one common case, the
-  `LIST`/`INFO` tag list (title/artist/comment/...). `INFO` is not its own chunk: it is the form
-  type of a `LIST` chunk. `InfoList` parses a `Chunk`/`Vec<u8>` (`from_chunk`/`from_bytes`) into an
-  ordered, duplicate-preserving list of (`[u8;4]` id, `String`) tags and generates one back
-  (`to_chunk`/`to_bytes`), with id constants like `metadata::TITLE`. Everything else (`bext`, `cue `,
-  `iXML`, ...) stays a raw blob for a higher-level crate to interpret; this module is deliberately
-  only `LIST`/`INFO`.
+- **`metadata.rs`** is a thin typed layer over those blobs for the two common cases. Each type has
+  the same shape: `from_chunk`/`from_bytes` to decode and `to_chunk`/`to_bytes` to build a `Chunk`
+  for the writer.
+  - `InfoList` is the `LIST`/`INFO` tag list (title/artist/comment/...). `INFO` is not its own
+    chunk: it is the form type of a `LIST` chunk. It is an ordered, duplicate-preserving list of
+    (`[u8;4]` id, `String`) tags, with id constants like `metadata::TITLE`.
+  - `Bext` is the Broadcast Audio Extension (EBU Tech 3285): a fixed 602-byte struct (timecode
+    reference, originator/date/time, version-gated UMID and R128 loudness fields) plus a
+    variable-length coding-history string. Fixed-width string fields are truncated to fit on write.
+
+  Everything else (`cue `, `iXML`, `smpl`, ...) stays a raw blob for a higher-level crate; adding a
+  third typed chunk means following the same `from_*`/`to_*` shape here.
 
 - **Streaming vs seekable writing** (`writer.rs`): `WavWriter::new` writes placeholder size fields
   (and a placeholder `fact` count for float) and patches them in `finalize` (needs `Seek`), using
