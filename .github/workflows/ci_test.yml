@@ -1,0 +1,115 @@
+on: [push, pull_request]
+
+name: CI test and lint
+
+jobs:
+  check_test:
+    name: Check and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run cargo check
+        run: cargo check
+
+      - name: Run cargo test
+        run: cargo test
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  check_fixtures:
+    name: Check test fixtures are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Regenerate WAV fixtures
+        run: python tests/utils/generate_wav_variants.py
+
+      - name: Fail if fixtures are out of date
+        run: |
+          if ! git diff --quiet --exit-code tests/wav_variants || \
+             [ -n "$(git status --porcelain tests/wav_variants)" ]; then
+            echo "Committed WAV fixtures are out of date." >&2
+            echo "Run 'python tests/utils/generate_wav_variants.py' and commit the result." >&2
+            git status --porcelain tests/wav_variants >&2
+            git diff -- tests/wav_variants >&2
+            exit 1
+          fi
+
+  check_test_aarch64:
+    name: Check and test Linux arm 64bit
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo check on arm
+        run: cargo check
+
+      - name: Run cargo test on arm
+        run: cargo test
+
+  check_wasm32:
+    name: Check wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Run cargo check on wasm32
+        run: cargo check --target=wasm32-wasip1
+
+  test_32bit:
+    name: Test 32-bit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+
+      - name: Install multilib
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+
+      - name: Run cargo test on 32-bit
+        run: cargo test --target=i686-unknown-linux-gnu
