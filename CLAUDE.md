@@ -86,6 +86,13 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
     this with `RawSpec` + `WavWriter::new_raw` / `new_streaming_raw` (and `_with_chunks` variants),
     which writes the `fmt ` chunk verbatim, emits no `fact` chunk, and rejects `write_float_buffer`.
 
+  Both sides support random access when the stream is seekable. `WavReader::seek_to_frame` (the
+  reader already requires `Read + Seek`) repositions to any frame, clamped to the frame count.
+  `WavWriter::seek_to_frame` (in the `Write + Seek` impl) repositions the write cursor to overwrite
+  already-written audio; the writer tracks the current cursor (`data_pos`) separately from the
+  furthest extent reached (`data_bytes`, the declared `data` size), so seeking backwards and
+  rewriting never shrinks the file.
+
   Metadata chunks pass through as opaque blobs: read them from `WavReader::params().chunks`, and
   write them as *leading* chunks (before `data`, via `WavWriter::new_with_chunks` /
   `new_streaming_with_chunks`) or *trailing* chunks (after the audio, via `WavWriter::write_chunk`).

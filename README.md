@@ -51,6 +51,7 @@ let buffer = reader.read_all_to_float::<f32>()?;
 
 `read_into_float` fills an existing `AdapterMut` buffer block by block, and `read_raw_interleaved`
 hands back the untouched bytes for wrapping with the audioadapter byte/number adapters.
+`seek_to_frame` repositions the reader for random access (the reader is always seekable).
 
 ## Writing
 
@@ -60,6 +61,9 @@ Two modes are available:
   real values by `finalize`, producing a standard-compliant file.
 - **Streaming** (`WavWriter::new_streaming`): the size fields are set to `u32::MAX` up front and
   never updated, for pipes and other non-seekable outputs. Finish with `into_inner`.
+
+A seekable writer also supports random access via `seek_to_frame`, to overwrite already-written
+audio without shrinking the file.
 
 ```rust no_run
 use std::fs::File;
