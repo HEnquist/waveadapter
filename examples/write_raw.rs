@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         channels,
         sample_rate,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
 
     let mut writer = WavWriter::new_streaming(std::fs::File::create(&path)?, spec)?;

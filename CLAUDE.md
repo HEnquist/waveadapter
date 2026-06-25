@@ -53,7 +53,11 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype). `FmtChunk` is the single
   byte-layout definition shared by parser and writer. Writing emits the minimal canonical 16-byte
   `fmt ` chunk by default, switching to the 40-byte `WAVEFORMATEXTENSIBLE` form when the format
-  requires it (`I24_4`) or there are more than two channels (see `writes_as_extensible`). It also
+  requires it (`I24_4`), there are more than two channels, or the spec carries a non-zero channel
+  mask (see `writes_as_extensible`). The `dwChannelMask` is stored, not interpreted:
+  `WavSpec::channel_mask` is written verbatim into the extensible header (validated to have one bit
+  set per channel, or be zero) and surfaced on read as `WavParams::channel_mask` (`None` when the
+  header is not extensible). It also
   emits a `fact` chunk (sample-frame count) after `fmt ` for every format the spec treats as
   non-PCM: float, and the `WAVEFORMATEXTENSIBLE` form (format tag `0xFFFE`) even when its subformat
   is PCM. Only plain integer PCM omits it. The granular

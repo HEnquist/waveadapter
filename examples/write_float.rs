@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         channels,
         sample_rate,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
 
     // Seekable writer: the size fields are patched with the real lengths by

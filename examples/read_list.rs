@@ -22,6 +22,7 @@ fn synthesize_demo() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         channels: 1,
         sample_rate: 44100,
         sample_format: SampleFormat::I16,
+        channel_mask: None,
     };
 
     let mut info = InfoList::new();
