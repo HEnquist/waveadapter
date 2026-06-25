@@ -611,3 +611,87 @@ fn oversized_spec_is_rejected() {
         Err(waveadapter::WavError::InvalidSpec(_))
     ));
 }
+
+#[test]
+fn reader_seek_to_frame() {
+    let channels = 2;
+    let frames = 64;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    cursor.set_position(0);
+
+    let mut reader = WavReader::new(cursor).unwrap();
+    reader.seek_to_frame(40).unwrap();
+    assert_eq!(reader.position(), 40);
+    assert_eq!(reader.remaining(), frames - 40);
+
+    let mut target = InterleavedOwned::<f32>::new(0.0, channels, 4);
+    let got = reader.read_into_float(&mut target).unwrap();
+    assert_eq!(got, 4);
+    for frame in 0..4 {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, 40 + frame).unwrap();
+            let b = target.read_sample(ch, frame).unwrap();
+            assert!((a - b).abs() <= 1e-4, "frame {frame} ch {ch}: {a} vs {b}");
+        }
+    }
+
+    // Seeking backwards re-reads from the new position.
+    reader.seek_to_frame(0).unwrap();
+    assert_eq!(reader.position(), 0);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+
+    // Seeking past the end clamps to the frame count.
+    reader.seek_to_frame(1000).unwrap();
+    assert_eq!(reader.position(), frames);
+    assert_eq!(reader.remaining(), 0);
+}
+
+#[test]
+fn writer_seek_to_frame_overwrites() {
+    let channels = 1;
+    let frames = 32;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+
+    // Overwrite a few frames in the middle, then confirm the file length is
+    // unchanged and the data outside the patched region is intact.
+    let patch = make_buffer(channels, 4);
+    writer.seek_to_frame(10).unwrap();
+    writer.write_float_buffer(&patch).unwrap();
+    assert_eq!(writer.data_bytes(), (frames * channels * 2) as u64);
+    writer.finalize().unwrap();
+    cursor.set_position(0);
+
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), frames);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    for frame in 0..frames {
+        let expected = if (10..14).contains(&frame) {
+            patch.read_sample(0, frame - 10).unwrap()
+        } else {
+            source.read_sample(0, frame).unwrap()
+        };
+        let got = restored.read_sample(0, frame).unwrap();
+        assert!(
+            (expected - got).abs() <= 1e-4,
+            "frame {frame}: {expected} vs {got}"
+        );
+    }
+}

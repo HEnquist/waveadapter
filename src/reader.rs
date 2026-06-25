@@ -82,6 +82,27 @@ impl<R: Read + Seek> WavReader<R> {
         self.total_frames.saturating_sub(self.frames_pos)
     }
 
+    /// Seek to a frame for random-access reading.
+    ///
+    /// Positions the stream at the start of frame `frame`, so the next read
+    /// begins there. The target is clamped to [`frames`](WavReader::frames), so
+    /// seeking past the end leaves the reader at the end with no frames
+    /// remaining. Returns [`WavError::InvalidHeader`](crate::WavError::InvalidHeader)
+    /// if the frame size is unknown (block alignment is zero).
+    pub fn seek_to_frame(&mut self, frame: usize) -> Result<()> {
+        let frame_bytes = self.params.frame_bytes();
+        if frame_bytes == 0 {
+            return Err(WavError::InvalidHeader(
+                "cannot seek: block alignment is zero".to_string(),
+            ));
+        }
+        let frame = frame.min(self.total_frames);
+        let offset = self.params.data_offset + frame * frame_bytes;
+        self.inner.seek(SeekFrom::Start(offset as u64))?;
+        self.frames_pos = frame;
+        Ok(())
+    }
+
     /// Read audio data into a floating point buffer, converting on the fly.
     ///
     /// Reads up to `target.frames()` frames, scaling each sample to the range
