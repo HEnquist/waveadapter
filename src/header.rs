@@ -12,12 +12,27 @@ use crate::error::{Result, WavError};
 use crate::format::SampleFormat;
 
 const RIFF: &[u8] = b"RIFF";
+/// The RF64 form id, used in place of `RIFF` for files that may exceed 4 GB.
+const RF64: &[u8] = b"RF64";
+/// The BW64 form id (ITU-R BS.2088), structurally identical to RF64.
+const BW64: &[u8] = b"BW64";
 const WAVE: &[u8] = b"WAVE";
 const DATA: &[u8] = b"data";
 const FMT: &[u8] = b"fmt ";
+/// The `ds64` chunk that carries the 64-bit sizes of an RF64/BW64 file.
+const DS64: &[u8] = b"ds64";
 
 /// Byte offset of the 32-bit RIFF chunk size field, measured from the start of the file.
 pub(crate) const RIFF_SIZE_OFFSET: u64 = 4;
+
+/// The marker written into a 32-bit size field when the real size lives in the
+/// `ds64` chunk (RF64), and also the streaming "length unknown" placeholder for
+/// plain RIFF. The two uses are told apart by the file's form id.
+const SIZE_IN_DS64: u32 = u32::MAX;
+
+/// Body size of a `ds64` chunk with no oversized-chunk table: three 64-bit sizes
+/// plus the 32-bit table length.
+pub(crate) const DS64_BODY_SIZE: u32 = 28;
 
 /// Whether a header is written as `WAVE_FORMAT_EXTENSIBLE`.
 ///
@@ -135,6 +150,72 @@ fn read_u16(buffer: &[u8], start_index: usize) -> u16 {
             .try_into()
             .unwrap_or_default(),
     )
+}
+
+fn read_u64(buffer: &[u8], start_index: usize) -> u64 {
+    u64::from_le_bytes(
+        buffer[start_index..start_index + mem::size_of::<u64>()]
+            .try_into()
+            .unwrap_or_default(),
+    )
+}
+
+/// The 64-bit sizes carried by an RF64/BW64 `ds64` chunk.
+///
+/// The dedicated `riff_size`/`data_size` fields override the `0xFFFFFFFF`
+/// markers in the RIFF and `data` 32-bit size fields; any other chunk whose
+/// 32-bit size is `0xFFFFFFFF` is looked up by id in `table`.
+struct Ds64 {
+    data_size: u64,
+    table: Vec<([u8; 4], u64)>,
+}
+
+impl Ds64 {
+    /// Parse a `ds64` chunk body. Missing or short bodies yield zeroed sizes
+    /// rather than erroring, matching the lenient handling elsewhere in the parser.
+    fn parse(body: &[u8]) -> Self {
+        // riffSize (0..8) is recomputed from the file, so it is not retained.
+        let data_size = if body.len() >= 16 {
+            read_u64(body, 8)
+        } else {
+            0
+        };
+        // sampleCount (16..24) is surfaced via the fact chunk path, not here.
+        let table_length = if body.len() >= 28 {
+            read_u32(body, 24) as usize
+        } else {
+            0
+        };
+        let mut table = Vec::new();
+        let mut offset = 28;
+        for _ in 0..table_length {
+            if offset + 12 > body.len() {
+                break;
+            }
+            let mut id = [0u8; 4];
+            id.copy_from_slice(&body[offset..offset + 4]);
+            table.push((id, read_u64(body, offset + 4)));
+            offset += 12;
+        }
+        Ds64 { data_size, table }
+    }
+
+    /// The real body length of a chunk whose 32-bit size field is the
+    /// `0xFFFFFFFF` marker: the `data` chunk uses the dedicated field, anything
+    /// else is looked up by id in the table (falling back to the marker value).
+    fn size_for(&self, id: &[u8], declared: u32) -> u64 {
+        if declared != SIZE_IN_DS64 {
+            return declared as u64;
+        }
+        if compare_4cc(id, DATA) {
+            return self.data_size;
+        }
+        self.table
+            .iter()
+            .find(|(tid, _)| compare_4cc(id, tid))
+            .map(|(_, size)| *size)
+            .unwrap_or(declared as u64)
+    }
 }
 
 fn compare_4cc(buffer: &[u8], bytes: &[u8]) -> bool {
@@ -367,10 +448,13 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
 
-    // The file must start with RIFF, and bytes 8..12 must be WAVE.
-    if !compare_4cc(&header, RIFF) || !compare_4cc(&header[8..], WAVE) {
+    // The file must start with RIFF (plain wav) or RF64/BW64 (64-bit form), and
+    // bytes 8..12 must be WAVE. RF64 and BW64 share the RIFF layout but move the
+    // real sizes into a leading `ds64` chunk.
+    let is_rf64 = compare_4cc(&header, RF64) || compare_4cc(&header, BW64);
+    if (!compare_4cc(&header, RIFF) && !is_rf64) || !compare_4cc(&header[8..], WAVE) {
         return Err(WavError::InvalidHeader(
-            "missing RIFF or WAVE marker".to_string(),
+            "missing RIFF/RF64/BW64 or WAVE marker".to_string(),
         ));
     }
 
@@ -379,12 +463,19 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     let mut found_data = false;
     let mut buffer = [0; 8];
 
+    // The 64-bit sizes for an RF64/BW64 file, filled in when the `ds64` chunk is
+    // reached (it is required to come first). Stays zeroed for plain RIFF.
+    let mut ds64 = Ds64 {
+        data_size: 0,
+        table: Vec::new(),
+    };
+
     // Dummy values until the real ones are found.
     let mut sample_format = SampleFormat::I16;
     let mut sample_rate = 0;
     let mut channels = 0;
     let mut data_offset = 0;
-    let mut data_length = 0;
+    let mut data_length: u64 = 0;
     let mut chunks: Vec<Chunk> = Vec::new();
 
     // Walk every chunk to the end of the file, so that metadata chunks placed
@@ -396,6 +487,26 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         let chunk_length = read_u32(&buffer, 4);
         let is_data = compare_4cc(&buffer, DATA);
         let is_fmt = compare_4cc(&buffer, FMT);
+        let is_ds64 = is_rf64 && compare_4cc(&buffer, DS64);
+        // The real body length: for RF64 a `0xFFFFFFFF` size is resolved through
+        // the ds64 chunk, otherwise the 32-bit field is taken at face value.
+        let body_len = if is_rf64 {
+            ds64.size_for(&buffer[0..4], chunk_length)
+        } else {
+            chunk_length as u64
+        };
+        if is_ds64 {
+            // The ds64 chunk is container metadata, not exposed as a raw chunk.
+            // Honor the first one and parse its 64-bit sizes for later chunks.
+            let body_end = next_chunk_location + 8 + chunk_length as u64;
+            if body_end <= filesize {
+                let mut body = vec![0; chunk_length as usize];
+                file.read_exact(&mut body)?;
+                ds64 = Ds64::parse(&body);
+            }
+            next_chunk_location += 8 + chunk_length as u64 + (chunk_length as u64 & 1);
+            continue;
+        }
         if is_fmt {
             // Honor the first valid fmt chunk; ignore any later or malformed one.
             if !found_fmt && (chunk_length == 16 || chunk_length == 18 || chunk_length == 40) {
@@ -421,34 +532,41 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             if !found_data {
                 found_data = true;
                 data_offset = next_chunk_location + 8;
-                data_length = chunk_length;
-                // A streaming placeholder length means the data runs to the end
-                // of the file, so there is nothing to scan past it.
-                if chunk_length == u32::MAX {
+                data_length = body_len;
+                // For plain RIFF a `0xFFFFFFFF` length is the streaming
+                // placeholder, meaning the data runs to the end of the file, so
+                // there is nothing to scan past it. For RF64 the same field was
+                // already resolved through ds64 into a real length.
+                if !is_rf64 && chunk_length == u32::MAX {
                     break;
                 }
             }
         } else {
             // Any other chunk is captured verbatim, tolerating a bogus length
             // that would overrun the file by stopping the scan instead of erroring.
-            let body_end = next_chunk_location + 8 + chunk_length as u64;
+            let body_end = next_chunk_location + 8 + body_len;
             if body_end > filesize {
                 break;
             }
-            let mut body = vec![0; chunk_length as usize];
+            let read_len = usize::try_from(body_len).map_err(|_| {
+                WavError::InvalidHeader("chunk length does not fit in memory".to_string())
+            })?;
+            let mut body = vec![0; read_len];
             file.read_exact(&mut body)?;
             let mut id = [0u8; 4];
             id.copy_from_slice(&buffer[0..4]);
             chunks.push(Chunk { id, data: body });
         }
-        next_chunk_location += 8 + chunk_length as u64 + (chunk_length as u64 & 1);
+        next_chunk_location += 8 + body_len + (body_len & 1);
     }
     if found_data && found_fmt {
         return Ok(WavParams {
             sample_format,
             sample_rate: sample_rate as usize,
             channels: channels as usize,
-            data_length: data_length as usize,
+            data_length: usize::try_from(data_length).map_err(|_| {
+                WavError::InvalidHeader("data length does not fit in memory".to_string())
+            })?,
             data_offset: data_offset as usize,
             chunks,
         });
@@ -466,6 +584,30 @@ pub(crate) fn write_riff_wave(dest: &mut impl Write, riff_size: u32) -> std::io:
     write_chunk_header(dest, RIFF, riff_size)?;
     dest.write_all(WAVE)
 }
+
+/// Write the RF64 chunk header and the WAVE form type (12 bytes).
+///
+/// The 32-bit RIFF size field is always the `0xFFFFFFFF` marker for RF64; the
+/// real size lives in the following `ds64` chunk.
+pub(crate) fn write_rf64_wave(dest: &mut impl Write) -> std::io::Result<()> {
+    write_chunk_header(dest, RF64, SIZE_IN_DS64)?;
+    dest.write_all(WAVE)
+}
+
+/// Write a `ds64` chunk with zeroed 64-bit size fields and no oversized-chunk
+/// table (28-byte body). The `riffSize`, `dataSize` and `sampleCount` fields are
+/// patched with the real values on finalize.
+pub(crate) fn write_ds64_chunk(dest: &mut impl Write) -> std::io::Result<()> {
+    write_chunk_header(dest, DS64, DS64_BODY_SIZE)?;
+    dest.write_all(&0u64.to_le_bytes())?; // riffSize
+    dest.write_all(&0u64.to_le_bytes())?; // dataSize
+    dest.write_all(&0u64.to_le_bytes())?; // sampleCount
+    dest.write_all(&0u32.to_le_bytes()) // tableLength
+}
+
+/// The `0xFFFFFFFF` marker written into the `data` chunk's 32-bit size field in
+/// an RF64 file, where the real size lives in the `ds64` chunk.
+pub(crate) const RF64_DATA_SIZE_MARKER: u32 = SIZE_IN_DS64;
 
 /// Write the `fmt ` chunk (id, size and body) and return its body size in bytes.
 ///

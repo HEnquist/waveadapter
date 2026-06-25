@@ -174,6 +174,41 @@ def list_info_chunk(software="Test Generator") -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# RF64 / BW64 (64-bit container) helpers
+# ---------------------------------------------------------------------------
+
+DS64_SIZE_MARKER = 0xFFFFFFFF  # 32-bit size field meaning "see ds64"
+
+
+def data_chunk_marker(payload: bytes) -> bytes:
+    """A data chunk whose 32-bit size field is the 0xFFFFFFFF marker; the real
+    size is carried by the ds64 chunk. This is the usual real-world RF64 form."""
+    out = b"data" + struct.pack("<I", DS64_SIZE_MARKER) + payload
+    if len(payload) % 2 == 1:
+        out += b"\x00"
+    return out
+
+
+def rf64(body: bytes, data_size: int, sample_count: int, table=(),
+         form=b"RF64") -> bytes:
+    """Wrap chunks in an RF64/BW64 container. The form id replaces RIFF and its
+    32-bit size field is the 0xFFFFFFFF marker; a leading ds64 chunk carries the
+    real 64-bit riffSize/dataSize/sampleCount and an optional table of (id, size)
+    overrides for other oversized chunks. body is everything after the ds64 chunk
+    (typically fmt + data). form is b"RF64" or b"BW64" (structurally identical)."""
+    assert len(form) == 4
+    table_bytes = b"".join(tid + struct.pack("<Q", sz) for tid, sz in table)
+    assert all(len(tid) == 4 for tid, _ in table)
+    # riffSize is filled in once the ds64 chunk length (fixed) is known.
+    ds64_body = struct.pack("<QQQI", 0, data_size, sample_count, len(table)) + table_bytes
+    ds64_chunk = chunk(b"ds64", ds64_body)
+    riff_size = 4 + len(ds64_chunk) + len(body)  # bytes after the 8-byte header
+    ds64_body = struct.pack("<Q", riff_size) + ds64_body[8:]
+    ds64_chunk = chunk(b"ds64", ds64_body)
+    return form + struct.pack("<I", DS64_SIZE_MARKER) + b"WAVE" + ds64_chunk + body
+
+
+# ---------------------------------------------------------------------------
 # Individual variant cases
 # ---------------------------------------------------------------------------
 
@@ -446,6 +481,54 @@ def case_empty_riff_no_data_chunk():
     return riff(b"WAVE", f)
 
 
+def case_rf64_16bit_stereo():
+    """Canonical RF64: RF64 form id, a ds64 chunk carrying the 64-bit data size
+    and sample count, and a data chunk whose 32-bit size is the 0xFFFFFFFF marker.
+    The everyday real-world shape of a >4 GB-capable file (kept tiny here)."""
+    payload = pcm_ramp_data(NUM_FRAMES, 2, 16)
+    f = fmt_pcm(channels=2, bits_per_sample=16)
+    d = data_chunk_marker(payload)
+    return rf64(f + d, data_size=len(payload), sample_count=NUM_FRAMES)
+
+
+def case_bw64_16bit_stereo():
+    """The same file as rf64_16bit_stereo but with the BW64 form id (ITU-R
+    BS.2088), which is structurally identical to RF64 and must read the same."""
+    payload = pcm_ramp_data(NUM_FRAMES, 2, 16)
+    f = fmt_pcm(channels=2, bits_per_sample=16)
+    d = data_chunk_marker(payload)
+    return rf64(f + d, data_size=len(payload), sample_count=NUM_FRAMES, form=b"BW64")
+
+
+def case_rf64_float32_real_size():
+    """RF64 float32 mono where the data chunk keeps its real 32-bit size (it fits
+    in 32 bits) instead of the marker. ds64 still carries the sizes, but the
+    parser must take the non-marker field at face value. Also confirms RF64 needs
+    no fact chunk to report its frame count."""
+    payload = float_ramp_data(NUM_FRAMES, 1, bits_per_sample=32)
+    f = fmt_float(channels=1, bits_per_sample=32)
+    d = data_chunk(payload)  # real 32-bit size, not the marker
+    return rf64(f + d, data_size=len(payload), sample_count=NUM_FRAMES)
+
+
+def case_rf64_chunk_size_in_table():
+    """RF64 where a non-data chunk (a JUNK filler) is sized through the ds64
+    table: its own 32-bit size field is the 0xFFFFFFFF marker and the real size
+    is an entry in the ds64 size table. Exercises the table-lookup path that the
+    dedicated data/riff fields don't."""
+    junk_payload = b"\x00" * 8
+    junk = b"JUNK" + struct.pack("<I", DS64_SIZE_MARKER) + junk_payload
+    payload = pcm_ramp_data(NUM_FRAMES, 1, 16)
+    f = fmt_pcm(channels=1, bits_per_sample=16)
+    d = data_chunk_marker(payload)
+    return rf64(
+        f + junk + d,
+        data_size=len(payload),
+        sample_count=NUM_FRAMES,
+        table=[(b"JUNK", len(junk_payload))],
+    )
+
+
 CASES = {
     "baseline_16bit_stereo": case_baseline_16bit_stereo,
     "canonical_cd_16bit": case_canonical_cd_16bit,
@@ -479,6 +562,10 @@ CASES = {
     "mono_8bit_unsigned": case_mono_8bit_unsigned,
     "huge_channel_count": case_huge_channel_count,
     "empty_riff_no_data_chunk": case_empty_riff_no_data_chunk,
+    "rf64_16bit_stereo": case_rf64_16bit_stereo,
+    "bw64_16bit_stereo": case_bw64_16bit_stereo,
+    "rf64_float32_real_size": case_rf64_float32_real_size,
+    "rf64_chunk_size_in_table": case_rf64_chunk_size_in_table,
 }
 
 

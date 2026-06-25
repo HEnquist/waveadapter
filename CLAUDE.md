@@ -61,6 +61,17 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `write_data_header` helpers let the writer compose a header with `fact` and caller-supplied
   chunks; `write_wav_header` is the plain RIFF+fmt+data convenience built on them.
 
+  **RF64/BW64 (64-bit container).** The parser also accepts the `RF64` and `BW64` form ids (the
+  latter is ITU-R BS.2088, structurally identical). For these, the real sizes live in a leading
+  `ds64` chunk (parsed by `Ds64`, consumed like `fmt `/`data` rather than surfaced in
+  `WavParams::chunks`): any 32-bit size field of `0xFFFFFFFF` is resolved through it (`data` and the
+  RIFF size have dedicated fields, other oversized chunks via its id table). Resolving the `data`
+  size during parse keeps `data_length` a real 64-bit value, so the `u32::MAX` "streaming unknown"
+  sentinel only ever applies to plain RIFF (the two `0xFFFFFFFF` uses are told apart by the form
+  id). Writing RF64 uses `write_rf64_wave` + `write_ds64_chunk` (zeroed sizes, patched on finalize)
+  and a `data` header with the `RF64_DATA_SIZE_MARKER`; no `fact` chunk is written, since the sample
+  count lives in `ds64`. RF64 is write-only via `WavWriter::new_rf64`; the writer never emits BW64.
+
 - **`reader.rs` / `writer.rs`** provide two paths each:
   - *Float path* (`read_into_float` / `read_all_to_float` / `write_float_buffer`): converts on the
     fly to/from `f32`/`f64` scaled to -1.0..1.0 through `audioadapter`'s `Adapter`/`AdapterMut`.
@@ -93,7 +104,13 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   the byte offsets recorded in `Layout` while the header was written (so the patch positions stay
   correct regardless of `fact`/leading chunks). `WavWriter::new_streaming` writes `u32::MAX` sizes
   up front and never updates them (for pipes); finish with `into_inner`. The reader treats a
-  `u32::MAX` declared length as "unknown" and stops cleanly at EOF on a frame boundary.
+  `u32::MAX` declared length as "unknown" and stops cleanly at EOF on a frame boundary. The
+  `Container` choice (RIFF placeholder vs RF64) and `SizeFields` enum (which offsets `finalize`
+  patches: the RIFF size field, or the three `ds64` 64-bit fields) carry the form difference through
+  the writer. `WavWriter::new_rf64` is the seekable-only 64-bit path. A seekable RIFF writer guards
+  against the 4 GB ceiling up front: `check_capacity` errors on the offending audio write rather than
+  silently truncating at `finalize` (streaming RIFF skips the check since it never patches; RF64 has
+  no limit).
 
 ## Key invariants
 

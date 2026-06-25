@@ -252,6 +252,38 @@ const READABLE: &[(&str, Expect)] = &[
             frames: 20,
         },
     ),
+    (
+        "rf64_16bit_stereo",
+        Expect {
+            format: SampleFormat::I16,
+            channels: 2,
+            frames: 20,
+        },
+    ),
+    (
+        "bw64_16bit_stereo",
+        Expect {
+            format: SampleFormat::I16,
+            channels: 2,
+            frames: 20,
+        },
+    ),
+    (
+        "rf64_float32_real_size",
+        Expect {
+            format: SampleFormat::F32,
+            channels: 1,
+            frames: 20,
+        },
+    ),
+    (
+        "rf64_chunk_size_in_table",
+        Expect {
+            format: SampleFormat::I16,
+            channels: 1,
+            frames: 20,
+        },
+    ),
 ];
 
 /// Files our reader is expected to reject, with the reason they are unsupported.

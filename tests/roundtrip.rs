@@ -381,6 +381,129 @@ fn audio_after_trailing_chunk_is_rejected() {
 }
 
 #[test]
+fn rf64_roundtrip() {
+    let channels = 2;
+    let frames = 50;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::F32,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let rd64 = |o: usize| {
+        u64::from_le_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+            bytes[o + 4],
+            bytes[o + 5],
+            bytes[o + 6],
+            bytes[o + 7],
+        ])
+    };
+
+    // RF64 form id with a 0xFFFFFFFF RIFF size, then WAVE and a ds64 chunk.
+    assert_eq!(&bytes[0..4], b"RF64");
+    assert_eq!(rd32(4), u32::MAX, "RIFF size field is the marker");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    assert_eq!(&bytes[12..16], b"ds64", "ds64 chunk comes first");
+    assert_eq!(rd32(16), 28, "ds64 body is 28 bytes (no table)");
+
+    let data_bytes = (frames * channels * 4) as u64;
+    let riff_size = rd64(20);
+    assert_eq!(rd64(28), data_bytes, "ds64 dataSize");
+    assert_eq!(rd64(36), frames as u64, "ds64 sampleCount");
+    assert_eq!(rd32(44), 0, "ds64 tableLength is zero");
+    assert_eq!(
+        riff_size,
+        bytes.len() as u64 - 8,
+        "ds64 riffSize matches file"
+    );
+
+    // fmt follows ds64; no fact chunk is written for RF64. The data chunk's
+    // 32-bit size field carries the marker.
+    // ds64 ends at 48; the 16-byte-core fmt chunk (8 + 16) runs to 72.
+    assert_eq!(&bytes[48..52], b"fmt ");
+    assert_eq!(&bytes[72..76], b"data", "data follows fmt, no fact chunk");
+    assert_eq!(rd32(76), u32::MAX, "data size field is the marker");
+
+    // It reads back with the resolved 64-bit data length and intact audio.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), SampleFormat::F32);
+    assert_eq!(reader.channels(), channels);
+    assert_eq!(reader.frames(), frames);
+    assert_eq!(reader.params().data_length, data_bytes as usize);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    for frame in 0..frames {
+        for ch in 0..channels {
+            assert_eq!(
+                source.read_sample(ch, frame).unwrap(),
+                restored.read_sample(ch, frame).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn rf64_with_leading_chunk_roundtrips() {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+    };
+    let leading = vec![Chunk {
+        id: *b"bext",
+        data: vec![7u8; 10],
+    }];
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_rf64_with_chunks(&mut cursor, spec, &leading).unwrap();
+    writer.write_raw_interleaved(&[0u8; 8]).unwrap();
+    writer.finalize().unwrap();
+    cursor.set_position(0);
+
+    let params = read_wav_header(&mut cursor).unwrap();
+    assert_eq!(params.data_length, 8);
+    let bext = params.chunks.iter().find(|c| &c.id == b"bext").unwrap();
+    assert_eq!(bext.data, vec![7u8; 10]);
+    // The ds64 chunk is consumed by the parser, not surfaced as a raw chunk.
+    assert!(!params.chunks.iter().any(|c| &c.id == b"ds64"));
+}
+
+#[test]
+fn bw64_is_read_like_rf64() {
+    // BW64 is structurally identical to RF64. Write an RF64 file and swap the
+    // form id to BW64; it must read back the same.
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+    };
+    let source = make_buffer(2, 16);
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    let mut bytes = cursor.into_inner();
+    bytes[0..4].copy_from_slice(b"BW64");
+
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.channels(), 2);
+    assert_eq!(reader.frames(), 16);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), 16);
+}
+
+#[test]
 fn invalid_header_is_rejected() {
     let mut cursor = Cursor::new(vec![0u8; 100]);
     assert!(read_wav_header(&mut cursor).is_err());
