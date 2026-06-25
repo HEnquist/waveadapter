@@ -53,9 +53,11 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype). `FmtChunk` is the single
   byte-layout definition shared by parser and writer. Writing emits the minimal canonical 16-byte
   `fmt ` chunk by default, switching to the 40-byte `WAVEFORMATEXTENSIBLE` form when the format
-  requires it (`I24_4`) or there are more than two channels (see `writes_as_extensible`). For float
-  formats it also emits a `fact` chunk (sample-frame count) after `fmt `, as the spec expects for
-  non-PCM data. The granular `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/
+  requires it (`I24_4`) or there are more than two channels (see `writes_as_extensible`). It also
+  emits a `fact` chunk (sample-frame count) after `fmt ` for every format the spec treats as
+  non-PCM: float, and the `WAVEFORMATEXTENSIBLE` form (format tag `0xFFFE`) even when its subformat
+  is PCM. Only plain integer PCM omits it. The granular
+  `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/
   `write_data_header` helpers let the writer compose a header with `fact` and caller-supplied
   chunks; `write_wav_header` is the plain RIFF+fmt+data convenience built on them.
 

@@ -177,17 +177,21 @@ fn writes_i24_4_as_strict_extensible() {
     assert_eq!(rd16(34), 32, "wBitsPerSample carries the 32-bit container");
     assert_eq!(rd16(36), 22, "cbSize");
     assert_eq!(rd16(38), 24, "wValidBitsPerSample carries the real 24 bits");
+    // Extensible (non-PCM tag) means a fact chunk sits between fmt and data.
     assert_eq!(
         &bytes[60..64],
-        b"data",
-        "data chunk follows the 40-byte fmt"
+        b"fact",
+        "fact chunk follows the 40-byte fmt"
     );
+    assert_eq!(rd32(64), 4, "fact body is 4 bytes");
+    assert_eq!(rd32(68), frames as u32, "fact carries the frame count");
+    assert_eq!(&bytes[72..76], b"data", "data chunk follows the fact chunk");
 
-    // And it reads back as I24_4 with the audio intact and data starting at 68.
+    // And it reads back as I24_4 with the audio intact and data starting at 80.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
     assert_eq!(reader.sample_format(), SampleFormat::I24_4);
     assert_eq!(reader.channels(), channels);
-    assert_eq!(reader.params().data_offset, 68);
+    assert_eq!(reader.params().data_offset, 80);
 
     let restored = reader.read_all_to_float::<f32>().unwrap();
     assert_eq!(restored.frames(), frames);
@@ -234,11 +238,15 @@ fn writes_multichannel_as_extensible() {
     assert_eq!(rd16(34), 16, "wBitsPerSample carries the 16-bit container");
     assert_eq!(rd16(38), 16, "wValidBitsPerSample matches the container");
     assert_eq!(bytes[44], 1, "subformat GUID is KSDATAFORMAT_SUBTYPE_PCM");
+    // Extensible (non-PCM tag) means a fact chunk sits between fmt and data,
+    // even though the subformat here is PCM.
     assert_eq!(
         &bytes[60..64],
-        b"data",
-        "data chunk follows the 40-byte fmt"
+        b"fact",
+        "fact chunk follows the 40-byte fmt"
     );
+    assert_eq!(rd32(68), frames as u32, "fact carries the frame count");
+    assert_eq!(&bytes[72..76], b"data", "data chunk follows the fact chunk");
 
     // And it reads back as plain I16 with the audio intact.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();

@@ -70,9 +70,14 @@ fn write_header(
         header::write_fmt_chunk(inner, spec.channels, spec.sample_format, spec.sample_rate)?;
     pos += 8 + fmt_body as u64;
 
-    // Non-PCM (float) data needs a `fact` chunk carrying the sample-frame count.
-    // The 4-byte body sits right after the 8-byte chunk header.
-    let fact_offset = if spec.sample_format.format_code() == 3 {
+    // The spec requires a `fact` chunk (sample-frame count) for every format
+    // that is not plain WAVE_FORMAT_PCM: that means float, and also the
+    // WAVEFORMATEXTENSIBLE form (format tag 0xFFFE), even when its subformat is
+    // PCM. Plain integer PCM is the only case that omits it. The 4-byte body
+    // sits right after the 8-byte chunk header.
+    let needs_fact = spec.sample_format.format_code() == 3
+        || header::writes_as_extensible(spec.channels, spec.sample_format);
+    let fact_offset = if needs_fact {
         let offset = pos + 8;
         pos += header::write_named_chunk(inner, b"fact", &placeholder.to_le_bytes())?;
         Some(offset)
@@ -110,8 +115,10 @@ fn write_header(
 ///   set to [`u32::MAX`] up front and never updated, which is useful for pipes
 ///   and other non-seekable outputs. Call [`WavWriter::into_inner`] when done.
 ///
-/// For float formats a `fact` chunk (sample-frame count) is written
-/// automatically, as the wav spec expects for non-PCM data. Arbitrary extra
+/// A `fact` chunk (sample-frame count) is written automatically for every
+/// format the spec considers non-PCM: float, and the `WAVEFORMATEXTENSIBLE`
+/// form (`I24_4` or more than two channels). Only plain integer PCM omits it.
+/// Arbitrary extra
 /// chunks can be written before the audio (leading chunks, via
 /// [`WavWriter::new_with_chunks`] / [`WavWriter::new_streaming_with_chunks`]) or
 /// after it (trailing chunks, via [`WavWriter::write_chunk`]), so a higher-level
