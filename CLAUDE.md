@@ -77,7 +77,14 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
     fly to/from `f32`/`f64` scaled to -1.0..1.0 through `audioadapter`'s `Adapter`/`AdapterMut`.
     Writing returns the number of clipped samples.
   - *Raw path* (`read_raw_interleaved` / `write_raw_interleaved`): moves untouched interleaved bytes
-    so the caller can wrap them with audioadapter's byte/number adapters directly.
+    so the caller can wrap them with audioadapter's byte/number adapters directly. The raw path also
+    handles formats this crate does not model at all (8-bit PCM, A-law/µ-law, ADPCM, exotic
+    extensible subtypes): the parser records such a file with `WavParams::sample_format == None`
+    (keeping the raw `format_code`/`bits_per_sample`/`block_align` fields), and `read_raw_interleaved`
+    frames the bytes off `WavParams::frame_bytes()` (which falls back to `block_align` when the format
+    is uninterpreted). The float path returns `UnsupportedFormat` for these. The write side mirrors
+    this with `RawSpec` + `WavWriter::new_raw` / `new_streaming_raw` (and `_with_chunks` variants),
+    which writes the `fmt ` chunk verbatim, emits no `fact` chunk, and rejects `write_float_buffer`.
 
   Metadata chunks pass through as opaque blobs: read them from `WavReader::params().chunks`, and
   write them as *leading* chunks (before `data`, via `WavWriter::new_with_chunks` /
@@ -117,8 +124,10 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 - WAV data is always little-endian; only LE sample types are wired up. Don't add big-endian
   variants without a matching audioadapter sample type.
 - The reader stops at the last whole frame: a partial trailing frame is dropped, not errored.
-- Unsupported-but-valid files (e.g. 8-bit PCM, which audioadapter has no sample type for) must be
-  rejected with a `WavError`, never panic. The `wav_variants` test enforces this.
+- Unsupported-but-valid files (e.g. 8-bit PCM, which audioadapter has no sample type for) must never
+  panic. They parse with `sample_format == None` and are readable through the raw path; only the
+  *float* path rejects them with a `WavError::UnsupportedFormat`. The `wav_variants` test enforces
+  both: that the float path errors and that the raw path still yields the bytes.
 
 ## Conventions
 

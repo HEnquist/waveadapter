@@ -34,7 +34,7 @@ impl<R: Read + Seek> WavReader<R> {
     pub fn new(mut inner: R) -> Result<Self> {
         let params = read_wav_header(&mut inner)?;
         inner.seek(SeekFrom::Start(params.data_offset as u64))?;
-        let frame_bytes = params.channels * params.sample_format.bytes_per_sample();
+        let frame_bytes = params.frame_bytes();
         let total_frames = params.data_length.checked_div(frame_bytes).unwrap_or(0);
         Ok(Self {
             inner,
@@ -49,8 +49,11 @@ impl<R: Read + Seek> WavReader<R> {
         &self.params
     }
 
-    /// The sample format of the audio data.
-    pub fn sample_format(&self) -> SampleFormat {
+    /// The sample format of the audio data, or `None` if the file uses a valid
+    /// but unsupported format. In that case the audio can still be read with
+    /// [`read_raw_interleaved`](WavReader::read_raw_interleaved); the float read
+    /// methods return [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat).
+    pub fn sample_format(&self) -> Option<SampleFormat> {
         self.params.sample_format
     }
 
@@ -92,10 +95,11 @@ impl<R: Read + Seek> WavReader<R> {
     where
         T: FloatCore + ToPrimitive,
     {
+        let format = self.require_sample_format()?;
         let file_channels = self.params.channels;
         let want = target.frames().min(self.remaining());
         let mut produced = 0;
-        with_sample_type!(self.params.sample_format, S, {
+        with_sample_type!(format, S, {
             'outer: for frame in 0..want {
                 for ch in 0..file_channels {
                     match self.inner.read_converted::<S, T>() {
@@ -124,10 +128,11 @@ impl<R: Read + Seek> WavReader<R> {
     where
         T: FloatCore + ToPrimitive + Zero,
     {
+        let format = self.require_sample_format()?;
         let channels = self.params.channels;
         let want = self.remaining();
         let mut data: Vec<T> = Vec::new();
-        with_sample_type!(self.params.sample_format, S, {
+        with_sample_type!(format, S, {
             'outer: for _ in 0..want {
                 for ch in 0..channels {
                     match self.inner.read_converted::<S, T>() {
@@ -152,11 +157,18 @@ impl<R: Read + Seek> WavReader<R> {
     /// `buf`.
     ///
     /// The bytes are exactly as stored in the file, so each frame is
-    /// `channels * bytes_per_sample` bytes. This is the entry point for callers
-    /// who want to wrap the data with the audioadapter byte or number adapters
-    /// themselves. Returns the number of frames read.
+    /// [`WavParams::frame_bytes`] bytes. This works for any file, including ones
+    /// whose format is unsupported by the float path (`sample_format` is `None`),
+    /// which is the way to read 8-bit or otherwise unmodeled audio. This is also
+    /// the entry point for callers who want to wrap the data with the audioadapter
+    /// byte or number adapters themselves. Returns the number of frames read.
     pub fn read_raw_interleaved(&mut self, frames: usize, buf: &mut Vec<u8>) -> Result<usize> {
-        let frame_bytes = self.params.channels * self.params.sample_format.bytes_per_sample();
+        let frame_bytes = self.params.frame_bytes();
+        if frame_bytes == 0 {
+            return Err(WavError::InvalidHeader(
+                "cannot read raw frames: block alignment is zero".to_string(),
+            ));
+        }
         let want = frames.min(self.remaining());
         let start = buf.len();
         buf.resize(start + want * frame_bytes, 0);
@@ -179,5 +191,19 @@ impl<R: Read + Seek> WavReader<R> {
     /// Consume the reader and return the inner stream.
     pub fn into_inner(self) -> R {
         self.inner
+    }
+
+    /// The interpreted sample format, or an [`UnsupportedFormat`] error if the
+    /// file uses a format the float path cannot handle.
+    ///
+    /// [`UnsupportedFormat`]: crate::WavError::UnsupportedFormat
+    fn require_sample_format(&self) -> Result<SampleFormat> {
+        self.params.sample_format.ok_or_else(|| {
+            WavError::UnsupportedFormat(format!(
+                "format code {}, {} bits per sample cannot be read as float; \
+                 use read_raw_interleaved instead",
+                self.params.format_code, self.params.bits_per_sample
+            ))
+        })
     }
 }

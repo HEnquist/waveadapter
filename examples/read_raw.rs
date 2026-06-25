@@ -28,6 +28,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bytes.len()
     );
 
+    // A file in a format this crate does not model (8-bit PCM, A-law, ...) hands
+    // back its bytes just the same, but there is no audioadapter sample type to
+    // decode them with, so stop here.
+    let Some(format) = format else {
+        println!("format not modeled by waveadapter; raw bytes only");
+        return Ok(());
+    };
+
     // Decode each channel of that frame to a normalized f32 using the byte type
     // that matches the file's format. `read_converted` comes from the
     // audioadapter-sample ReadSamples trait, implemented for any std::io::Read

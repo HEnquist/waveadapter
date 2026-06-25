@@ -5,7 +5,7 @@ use std::io::Cursor;
 use audioadapter::{Adapter, AdapterMut};
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::header::read_wav_header;
-use waveadapter::{Chunk, SampleFormat, WavReader, WavSpec, WavWriter};
+use waveadapter::{Chunk, RawSpec, SampleFormat, WavReader, WavSpec, WavWriter};
 
 fn make_buffer(channels: usize, frames: usize) -> InterleavedOwned<f32> {
     let mut buf = InterleavedOwned::<f32>::new(0.0, channels, frames);
@@ -39,7 +39,7 @@ fn roundtrip(format: SampleFormat, tolerance: f32) {
     let mut reader = WavReader::new(cursor).unwrap();
     assert_eq!(reader.channels(), channels);
     assert_eq!(reader.sample_rate(), 48000);
-    assert_eq!(reader.sample_format(), format);
+    assert_eq!(reader.sample_format(), Some(format));
     assert_eq!(reader.frames(), frames);
 
     let restored = reader.read_all_to_float::<f32>().unwrap();
@@ -140,7 +140,7 @@ fn header_roundtrip_offsets() {
     cursor.set_position(0);
 
     let params = read_wav_header(&mut cursor).unwrap();
-    assert_eq!(params.sample_format, SampleFormat::I32);
+    assert_eq!(params.sample_format, Some(SampleFormat::I32));
     assert_eq!(params.channels, 2);
     assert_eq!(params.sample_rate, 44100);
     assert_eq!(params.data_offset, 44);
@@ -189,7 +189,7 @@ fn writes_i24_4_as_strict_extensible() {
 
     // And it reads back as I24_4 with the audio intact and data starting at 80.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
-    assert_eq!(reader.sample_format(), SampleFormat::I24_4);
+    assert_eq!(reader.sample_format(), Some(SampleFormat::I24_4));
     assert_eq!(reader.channels(), channels);
     assert_eq!(reader.params().data_offset, 80);
 
@@ -250,7 +250,7 @@ fn writes_multichannel_as_extensible() {
 
     // And it reads back as plain I16 with the audio intact.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
-    assert_eq!(reader.sample_format(), SampleFormat::I16);
+    assert_eq!(reader.sample_format(), Some(SampleFormat::I16));
     assert_eq!(reader.channels(), channels);
 
     let restored = reader.read_all_to_float::<f32>().unwrap();
@@ -297,7 +297,7 @@ fn float_write_emits_fact_chunk() {
     // It reads back cleanly, with the fact chunk surfaced as a raw chunk.
     let cursor = Cursor::new(bytes);
     let reader = WavReader::new(cursor).unwrap();
-    assert_eq!(reader.sample_format(), SampleFormat::F32);
+    assert_eq!(reader.sample_format(), Some(SampleFormat::F32));
     assert_eq!(reader.frames(), 10);
     assert!(reader.params().chunks.iter().any(|c| &c.id == b"fact"));
 }
@@ -438,7 +438,7 @@ fn rf64_roundtrip() {
 
     // It reads back with the resolved 64-bit data length and intact audio.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
-    assert_eq!(reader.sample_format(), SampleFormat::F32);
+    assert_eq!(reader.sample_format(), Some(SampleFormat::F32));
     assert_eq!(reader.channels(), channels);
     assert_eq!(reader.frames(), frames);
     assert_eq!(reader.params().data_length, data_bytes as usize);
@@ -501,6 +501,86 @@ fn bw64_is_read_like_rf64() {
     assert_eq!(reader.frames(), 16);
     let restored = reader.read_all_to_float::<f32>().unwrap();
     assert_eq!(restored.frames(), 16);
+}
+
+#[test]
+fn raw_writer_roundtrips_an_unmodeled_format() {
+    // 8-bit unsigned PCM: a valid format this crate does not model. Two channels,
+    // so one frame is two bytes.
+    let spec = RawSpec {
+        format_code: 1,
+        channels: 2,
+        sample_rate: 22050,
+        bits_per_sample: 8,
+        block_align: 2,
+    };
+    let samples: Vec<u8> = (0..32u8).collect();
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_raw(&mut cursor, spec).unwrap();
+    writer.write_raw_interleaved(&samples).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    // The format is not interpreted, but the raw fmt fields survive.
+    assert_eq!(reader.sample_format(), None);
+    assert_eq!(reader.channels(), 2);
+    assert_eq!(reader.sample_rate(), 22050);
+    assert_eq!(reader.params().format_code, 1);
+    assert_eq!(reader.params().bits_per_sample, 8);
+    assert_eq!(reader.params().block_align, 2);
+    assert_eq!(reader.frames(), 16);
+
+    // No `fact` chunk is written for a raw format.
+    assert!(!reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+
+    // The bytes come back untouched through the raw read path.
+    let mut out = Vec::new();
+    let frames_read = reader.read_raw_interleaved(16, &mut out).unwrap();
+    assert_eq!(frames_read, 16);
+    assert_eq!(out, samples);
+}
+
+#[test]
+fn float_read_on_raw_format_errors() {
+    let spec = RawSpec {
+        format_code: 1,
+        channels: 1,
+        sample_rate: 8000,
+        bits_per_sample: 8,
+        block_align: 1,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_raw(&mut cursor, spec).unwrap();
+    writer
+        .write_raw_interleaved(&[0, 64, 128, 192, 255])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert!(matches!(
+        reader.read_all_to_float::<f32>(),
+        Err(waveadapter::WavError::UnsupportedFormat(_))
+    ));
+}
+
+#[test]
+fn float_write_on_raw_writer_errors() {
+    let spec = RawSpec {
+        format_code: 1,
+        channels: 1,
+        sample_rate: 8000,
+        bits_per_sample: 8,
+        block_align: 1,
+    };
+    let mut writer = WavWriter::new_raw(Cursor::new(Vec::new()), spec).unwrap();
+    let buf = InterleavedOwned::<f32>::new(0.0, 1, 4);
+    assert!(matches!(
+        writer.write_float_buffer(&buf),
+        Err(waveadapter::WavError::UnsupportedFormat(_))
+    ));
 }
 
 #[test]
