@@ -8,6 +8,31 @@ Audio data can be read into and written from any `Adapter` / `AdapterMut` buffer
 floating point samples, or moved as raw interleaved bytes for the caller to wrap with the
 audioadapter adapters directly.
 
+## Features
+
+- **audioadapter integration**: read into and write from any `Adapter` / `AdapterMut` buffer
+  (interleaved or planar, owned or borrowed), with on-the-fly conversion to and from `f32`/`f64`
+  scaled to -1.0..1.0. The write path reports how many samples were clipped.
+- **Raw byte passthrough**: move the interleaved sample bytes untouched, to wrap with the
+  audioadapter byte/number adapters yourself, or to handle formats this crate does not model.
+- **Wide format coverage**: 16-, 24- (both 3-byte packed and 4-byte left-justified), and 32-bit
+  integer PCM, plus 32- and 64-bit IEEE float.
+- **Any container, even unmodeled formats**: 8-bit PCM, A-law/µ-law, ADPCM and exotic
+  `WAVEFORMATEXTENSIBLE` subtypes round-trip as raw bytes, so the crate is a complete WAV container
+  library, not just the formats it can decode.
+- **Plain and extensible headers**: reads and writes both `WAVEFORMAT`/`WAVEFORMATEX` and
+  `WAVEFORMATEXTENSIBLE`, picking the minimal form automatically. The `dwChannelMask` speaker layout
+  is read and written.
+- **Streaming or seekable**: write to a seekable file (sizes patched on finalize) or straight to a
+  pipe with no seeking (`u32::MAX` sizes). Reading handles unknown-length streams, stopping cleanly
+  at end of file.
+- **Random access**: seek to any frame for reading or writing on a seekable stream.
+- **RF64 / BW64 (>4 GB)**: reads both forms, writes RF64, for files past the 4 GB RIFF limit.
+- **Chunk passthrough with typed metadata**: every non-audio chunk round-trips verbatim (leading or
+  trailing), with a thin typed layer for `LIST`/`INFO` tags and the `bext` Broadcast Audio
+  Extension.
+- **Robust parsing**: tolerates junk, padding and out-of-order chunks.
+
 ## Supported sample formats
 
 Wav data is always little-endian, so only little-endian formats are listed. The names mirror the
