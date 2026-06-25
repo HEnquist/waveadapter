@@ -303,7 +303,11 @@ fn reads_all_supported_variants() {
         let mut reader =
             WavReader::new(file).unwrap_or_else(|e| panic!("parsing header of {name}: {e}"));
 
-        assert_eq!(reader.sample_format(), exp.format, "{name}: sample format");
+        assert_eq!(
+            reader.sample_format(),
+            Some(exp.format),
+            "{name}: sample format"
+        );
         assert_eq!(reader.channels(), exp.channels, "{name}: channel count");
 
         let buffer = reader
@@ -330,6 +334,28 @@ fn rejects_unsupported_variants() {
             "{name} should be rejected ({reason}) but was read successfully"
         );
     }
+}
+
+#[test]
+fn unsupported_format_reads_as_raw() {
+    // An 8-bit file has no audioadapter sample type, so the float path rejects
+    // it, but it still parses and its audio is readable as raw bytes.
+    let file = std::fs::File::open(fixture("mono_8bit_unsigned")).unwrap();
+    let mut reader = WavReader::new(file).expect("8-bit file should parse");
+    assert_eq!(
+        reader.sample_format(),
+        None,
+        "8-bit should be uninterpreted"
+    );
+    assert_eq!(reader.params().bits_per_sample, 8);
+    assert!(reader.params().block_align >= 1);
+
+    let mut bytes = Vec::new();
+    let frames = reader
+        .read_raw_interleaved(reader.frames(), &mut bytes)
+        .unwrap();
+    assert!(frames > 0, "expected to read some raw frames");
+    assert_eq!(bytes.len(), frames * reader.params().frame_bytes());
 }
 
 #[test]

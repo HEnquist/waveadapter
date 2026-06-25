@@ -9,7 +9,7 @@ mod reader;
 mod writer;
 
 pub use error::{Result, WavError};
-pub use format::{SampleFormat, WavSpec};
+pub use format::{RawSpec, SampleFormat, WavSpec};
 pub use header::{Chunk, WavParams};
 pub use metadata::{Bext, InfoList};
 pub use reader::WavReader;

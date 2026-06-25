@@ -9,8 +9,49 @@ use num_traits::float::FloatCore;
 
 use crate::dispatch::with_sample_type;
 use crate::error::{Result, WavError};
-use crate::format::WavSpec;
+use crate::format::{RawSpec, WavSpec};
 use crate::header::{self, Chunk, RIFF_SIZE_OFFSET};
+
+/// The format a writer was created with: an interpreted [`WavSpec`] (the float
+/// and raw write paths are both available) or raw [`RawSpec`] fmt fields (only
+/// the raw byte path is available).
+enum WriterSpec {
+    Typed(WavSpec),
+    Raw(RawSpec),
+}
+
+impl WriterSpec {
+    /// The number of bytes per frame, used to count frames on finalize.
+    fn frame_bytes(&self) -> usize {
+        match self {
+            WriterSpec::Typed(spec) => spec.frame_bytes(),
+            WriterSpec::Raw(spec) => spec.frame_bytes(),
+        }
+    }
+
+    /// Write the `fmt ` chunk for this format and report whether a `fact` chunk
+    /// is required. Returns `(fmt body size, needs_fact)`.
+    fn write_fmt(&self, dest: &mut impl Write) -> Result<(u32, bool)> {
+        match self {
+            WriterSpec::Typed(spec) => {
+                let body = header::write_fmt_chunk(
+                    dest,
+                    spec.channels,
+                    spec.sample_format,
+                    spec.sample_rate,
+                )?;
+                // The spec requires a `fact` chunk for every format that is not
+                // plain WAVE_FORMAT_PCM: float, and the WAVEFORMATEXTENSIBLE form.
+                let needs_fact = spec.sample_format.format_code() == 3
+                    || header::writes_as_extensible(spec.channels, spec.sample_format);
+                Ok((body, needs_fact))
+            }
+            // Raw writers never emit a `fact` chunk: the format is uninterpreted,
+            // so the sample-frame count carries no defined meaning.
+            WriterSpec::Raw(spec) => Ok((header::write_fmt_chunk_raw(dest, spec)?, false)),
+        }
+    }
+}
 
 /// Chunk ids this crate manages itself, which callers may not supply as extra
 /// metadata chunks.
@@ -81,7 +122,7 @@ struct Layout {
 /// chunk header with a `0xFFFFFFFF` size marker.
 fn write_header(
     inner: &mut impl Write,
-    spec: &WavSpec,
+    spec: &WriterSpec,
     leading: &[Chunk],
     container: Container,
 ) -> Result<Layout> {
@@ -94,21 +135,12 @@ fn write_header(
         Container::Riff { placeholder } => {
             header::write_riff_wave(inner, placeholder)?;
 
-            let fmt_body = header::write_fmt_chunk(
-                inner,
-                spec.channels,
-                spec.sample_format,
-                spec.sample_rate,
-            )?;
+            let (fmt_body, needs_fact) = spec.write_fmt(inner)?;
             pos += 8 + fmt_body as u64;
 
-            // The spec requires a `fact` chunk (sample-frame count) for every
-            // format that is not plain WAVE_FORMAT_PCM: that means float, and
-            // also the WAVEFORMATEXTENSIBLE form (format tag 0xFFFE), even when
-            // its subformat is PCM. Plain integer PCM is the only case that omits
-            // it. The 4-byte body sits right after the 8-byte chunk header.
-            let needs_fact = spec.sample_format.format_code() == 3
-                || header::writes_as_extensible(spec.channels, spec.sample_format);
+            // A `fact` chunk (sample-frame count) follows for every format that
+            // is not plain WAVE_FORMAT_PCM (see `WriterSpec::write_fmt`). The
+            // 4-byte body sits right after the 8-byte chunk header.
             let fact_offset = if needs_fact {
                 let offset = pos + 8;
                 pos += header::write_named_chunk(inner, b"fact", &placeholder.to_le_bytes())?;
@@ -140,12 +172,7 @@ fn write_header(
             header::write_ds64_chunk(inner)?;
             pos += 8 + header::DS64_BODY_SIZE as u64;
 
-            let fmt_body = header::write_fmt_chunk(
-                inner,
-                spec.channels,
-                spec.sample_format,
-                spec.sample_rate,
-            )?;
+            let (fmt_body, _needs_fact) = spec.write_fmt(inner)?;
             pos += 8 + fmt_body as u64;
 
             // No `fact` chunk: RF64 carries the sample count in the ds64 chunk.
@@ -201,7 +228,7 @@ fn write_header(
 /// library can attach metadata such as `LIST`/`INFO`.
 pub struct WavWriter<W: Write> {
     inner: W,
-    spec: WavSpec,
+    spec: WriterSpec,
     data_bytes: u64,
     /// Bytes written by trailing chunks (and the data pad byte), after the audio
     /// data. Tracked so [`finalize`](WavWriter::finalize) can size the RIFF chunk.
@@ -232,6 +259,7 @@ impl<W: Write> WavWriter<W> {
         spec: WavSpec,
         leading: &[Chunk],
     ) -> Result<Self> {
+        let spec = WriterSpec::Typed(spec);
         let layout = write_header(
             &mut inner,
             &spec,
@@ -250,9 +278,58 @@ impl<W: Write> WavWriter<W> {
         })
     }
 
-    /// The spec the writer was created with.
-    pub fn spec(&self) -> WavSpec {
-        self.spec
+    /// Create a streaming raw writer for a format this crate does not interpret.
+    ///
+    /// The `fmt ` chunk is written verbatim from the [`RawSpec`] and no `fact`
+    /// chunk is emitted. Only [`write_raw_interleaved`](WavWriter::write_raw_interleaved)
+    /// is available; [`write_float_buffer`](WavWriter::write_float_buffer) returns
+    /// [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat). Size
+    /// fields are left at [`u32::MAX`]; finish with [`into_inner`](WavWriter::into_inner).
+    pub fn new_streaming_raw(inner: W, spec: RawSpec) -> Result<Self> {
+        Self::new_streaming_raw_with_chunks(inner, spec, &[])
+    }
+
+    /// Like [`new_streaming_raw`](WavWriter::new_streaming_raw) but with leading
+    /// metadata chunks between the `fmt ` chunk and the audio data.
+    pub fn new_streaming_raw_with_chunks(
+        mut inner: W,
+        spec: RawSpec,
+        leading: &[Chunk],
+    ) -> Result<Self> {
+        let spec = WriterSpec::Raw(spec);
+        let layout = write_header(
+            &mut inner,
+            &spec,
+            leading,
+            Container::Riff {
+                placeholder: u32::MAX,
+            },
+        )?;
+        Ok(Self {
+            inner,
+            spec,
+            data_bytes: 0,
+            trailing_bytes: 0,
+            seekable: false,
+            layout,
+        })
+    }
+
+    /// The interpreted spec the writer was created with, or `None` for a raw
+    /// writer (see [`raw_spec`](WavWriter::raw_spec)).
+    pub fn spec(&self) -> Option<WavSpec> {
+        match self.spec {
+            WriterSpec::Typed(spec) => Some(spec),
+            WriterSpec::Raw(_) => None,
+        }
+    }
+
+    /// The raw spec a raw writer was created with, or `None` for a typed writer.
+    pub fn raw_spec(&self) -> Option<RawSpec> {
+        match self.spec {
+            WriterSpec::Raw(spec) => Some(spec),
+            WriterSpec::Typed(_) => None,
+        }
     }
 
     /// The number of audio data bytes written so far.
@@ -275,12 +352,22 @@ impl<W: Write> WavWriter<W> {
         T: FloatCore + ToPrimitive,
     {
         self.ensure_data_open()?;
+        let spec = match self.spec {
+            WriterSpec::Typed(spec) => spec,
+            WriterSpec::Raw(_) => {
+                return Err(WavError::UnsupportedFormat(
+                    "cannot write a float buffer to a raw writer; \
+                     use write_raw_interleaved instead"
+                        .to_string(),
+                ));
+            }
+        };
         let frames = src.frames();
         let channels = src.channels();
-        let byte_count = (frames * channels * self.spec.sample_format.bytes_per_sample()) as u64;
+        let byte_count = (frames * channels * spec.sample_format.bytes_per_sample()) as u64;
         self.check_capacity(byte_count)?;
         let mut clipped = 0;
-        with_sample_type!(self.spec.sample_format, S, {
+        with_sample_type!(spec.sample_format, S, {
             for frame in 0..frames {
                 for ch in 0..channels {
                     let value = src.read_sample(ch, frame).unwrap();
@@ -386,6 +473,38 @@ impl<W: Write + Seek> WavWriter<W> {
     /// representation. Reserved ids (`fmt `, `data`, `fact`, `RIFF`) are rejected
     /// with [`WavError::InvalidSpec`](crate::WavError::InvalidSpec).
     pub fn new_with_chunks(mut inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
+        let spec = WriterSpec::Typed(spec);
+        let layout = write_header(
+            &mut inner,
+            &spec,
+            leading,
+            Container::Riff { placeholder: 0 },
+        )?;
+        Ok(Self {
+            inner,
+            spec,
+            data_bytes: 0,
+            trailing_bytes: 0,
+            seekable: true,
+            layout,
+        })
+    }
+
+    /// Create a seekable raw writer for a format this crate does not interpret.
+    ///
+    /// The `fmt ` chunk is written verbatim from the [`RawSpec`] and no `fact`
+    /// chunk is emitted. Only [`write_raw_interleaved`](WavWriter::write_raw_interleaved)
+    /// is available; [`write_float_buffer`](WavWriter::write_float_buffer) returns
+    /// [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat). Size
+    /// fields are patched by [`finalize`](WavWriter::finalize).
+    pub fn new_raw(inner: W, spec: RawSpec) -> Result<Self> {
+        Self::new_raw_with_chunks(inner, spec, &[])
+    }
+
+    /// Like [`new_raw`](WavWriter::new_raw) but with leading metadata chunks
+    /// between the `fmt ` chunk and the audio data.
+    pub fn new_raw_with_chunks(mut inner: W, spec: RawSpec, leading: &[Chunk]) -> Result<Self> {
+        let spec = WriterSpec::Raw(spec);
         let layout = write_header(
             &mut inner,
             &spec,
@@ -421,6 +540,7 @@ impl<W: Write + Seek> WavWriter<W> {
     /// `fact`, `RIFF`) are rejected with
     /// [`WavError::InvalidSpec`](crate::WavError::InvalidSpec).
     pub fn new_rf64_with_chunks(mut inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
+        let spec = WriterSpec::Typed(spec);
         let layout = write_header(&mut inner, &spec, leading, Container::Rf64)?;
         Ok(Self {
             inner,

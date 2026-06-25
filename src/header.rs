@@ -9,7 +9,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::mem;
 
 use crate::error::{Result, WavError};
-use crate::format::SampleFormat;
+use crate::format::{RawSpec, SampleFormat};
 
 const RIFF: &[u8] = b"RIFF";
 /// The RF64 form id, used in place of `RIFF` for files that may exceed 4 GB.
@@ -118,8 +118,22 @@ pub struct Chunk {
 /// The parameters extracted from a wav header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WavParams {
-    /// The binary sample format of the audio data.
-    pub sample_format: SampleFormat,
+    /// The binary sample format of the audio data, if it is one this crate can
+    /// interpret. `None` means the `fmt ` chunk described a valid but
+    /// unsupported format (for example 8-bit PCM or A-law); the audio can still
+    /// be read as raw bytes via
+    /// [`WavReader::read_raw_interleaved`](crate::WavReader::read_raw_interleaved),
+    /// using the raw `fmt ` fields below to make sense of it. The float read path
+    /// is unavailable in that case.
+    pub sample_format: Option<SampleFormat>,
+    /// The `fmt ` format code (`wFormatTag`) as stored in the file. For
+    /// `WAVEFORMATEXTENSIBLE` files this is `0xFFFE`.
+    pub format_code: u16,
+    /// Bits per single-channel sample (`wBitsPerSample`) as stored in the file.
+    pub bits_per_sample: u16,
+    /// Bytes per frame (`nBlockAlign`) as stored in the file. This is the source
+    /// of truth for framing raw byte reads when `sample_format` is `None`.
+    pub block_align: u16,
     /// The sample rate in Hz.
     pub sample_rate: usize,
     /// The number of channels.
@@ -134,6 +148,20 @@ pub struct WavParams {
     /// Every non-audio chunk found in the file, in the order encountered, with
     /// its body bytes read out. See [`Chunk`].
     pub chunks: Vec<Chunk>,
+}
+
+impl WavParams {
+    /// The number of bytes per frame (one sample for each channel).
+    ///
+    /// For an interpreted format this is the channel count times the format's
+    /// byte width; for a raw/unsupported format (`sample_format` is `None`) it is
+    /// the `nBlockAlign` field read from the file.
+    pub fn frame_bytes(&self) -> usize {
+        match self.sample_format {
+            Some(format) => self.channels * format.bytes_per_sample(),
+            None => self.block_align as usize,
+        }
+    }
 }
 
 fn read_u32(buffer: &[u8], start_index: usize) -> u32 {
@@ -334,6 +362,45 @@ impl FmtChunk {
         }
     }
 
+    /// Build a plain 16-byte core chunk from raw `fmt ` fields, without
+    /// interpreting them as a [`SampleFormat`]. Used by the raw writer.
+    ///
+    /// Returns an error if the channel count or sample rate cannot be
+    /// represented in the header fields.
+    fn for_raw(spec: &RawSpec) -> Result<Self> {
+        if spec.channels == 0 {
+            return Err(WavError::InvalidSpec(
+                "channel count must be at least 1".to_string(),
+            ));
+        }
+        let channels = u16::try_from(spec.channels).map_err(|_| {
+            WavError::InvalidSpec(format!(
+                "channel count {} does not fit in 16 bits",
+                spec.channels
+            ))
+        })?;
+        let sample_rate = u32::try_from(spec.sample_rate).map_err(|_| {
+            WavError::InvalidSpec(format!(
+                "sample rate {} does not fit in 32 bits",
+                spec.sample_rate
+            ))
+        })?;
+        let byte_rate = (spec.block_align as u32)
+            .checked_mul(sample_rate)
+            .ok_or_else(|| {
+                WavError::InvalidSpec("bytes per second does not fit in 32 bits".to_string())
+            })?;
+        Ok(FmtChunk {
+            format_code: spec.format_code,
+            channels,
+            sample_rate,
+            byte_rate,
+            block_align: spec.block_align,
+            bits_per_sample: spec.bits_per_sample,
+            extension: None,
+        })
+    }
+
     /// Parse the first 16 bytes of a `fmt ` chunk body (the core; any extensible
     /// fields are read separately in [`look_up_extended_format`]).
     fn parse(data: &[u8]) -> Self {
@@ -471,7 +538,10 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     };
 
     // Dummy values until the real ones are found.
-    let mut sample_format = SampleFormat::I16;
+    let mut sample_format = None;
+    let mut format_code = 0u16;
+    let mut bits_per_sample = 0u16;
+    let mut block_align = 0u16;
     let mut sample_rate = 0;
     let mut channels = 0;
     let mut data_offset = 0;
@@ -516,16 +586,27 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 let fmt = FmtChunk::parse(&data);
                 channels = fmt.channels;
                 sample_rate = fmt.sample_rate;
+                format_code = fmt.format_code;
+                bits_per_sample = fmt.bits_per_sample;
+                block_align = fmt.block_align;
                 let bytes_per_sample = fmt
                     .bytes_per_sample()
                     .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
-                sample_format = look_up_format(
+                // A valid but unsupported format (no matching audioadapter sample
+                // type, e.g. 8-bit PCM) is not an error here: it is recorded as
+                // `None` so the file can still be read as raw bytes. A genuinely
+                // malformed fmt chunk still errors.
+                sample_format = match look_up_format(
                     &data,
                     fmt.format_code,
                     fmt.bits_per_sample,
                     bytes_per_sample,
                     chunk_length,
-                )?;
+                ) {
+                    Ok(format) => Some(format),
+                    Err(WavError::UnsupportedFormat(_)) => None,
+                    Err(other) => return Err(other),
+                };
             }
         } else if is_data {
             // Honor the first data chunk; ignore any later one.
@@ -562,6 +643,9 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     if found_data && found_fmt {
         return Ok(WavParams {
             sample_format,
+            format_code,
+            bits_per_sample,
+            block_align,
             sample_rate: sample_rate as usize,
             channels: channels as usize,
             data_length: usize::try_from(data_length).map_err(|_| {
@@ -620,6 +704,19 @@ pub(crate) fn write_fmt_chunk(
     sample_rate: usize,
 ) -> Result<u32> {
     let fmt = FmtChunk::for_format(channels, sample_format, sample_rate)?;
+    let body_size = fmt.body_size();
+    write_chunk_header(dest, FMT, body_size)?;
+    fmt.write_body(dest)?;
+    Ok(body_size)
+}
+
+/// Write a `fmt ` chunk from raw, uninterpreted fields (a 16-byte core chunk)
+/// and return its body size in bytes.
+///
+/// Returns [`WavError::InvalidSpec`] if the channel count or sample rate cannot
+/// be represented in the header fields.
+pub(crate) fn write_fmt_chunk_raw(dest: &mut impl Write, spec: &RawSpec) -> Result<u32> {
+    let fmt = FmtChunk::for_raw(spec)?;
     let body_size = fmt.body_size();
     write_chunk_header(dest, FMT, body_size)?;
     fmt.write_body(dest)?;
