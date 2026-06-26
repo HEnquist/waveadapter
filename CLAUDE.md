@@ -117,6 +117,13 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   Everything else (`cue `, `iXML`, `smpl`, ...) stays a raw blob for a higher-level crate; adding a
   third typed chunk means following the same `from_*`/`to_*` shape here.
 
+- **`highlevel.rs`** holds the two path-based one-call helpers for callers who do not need the
+  full reader/writer: `read_wav_file::<T, _>(path)` opens a file and reads everything into a
+  `WavData<T>` (the `InterleavedOwned<T>` samples plus the `sample_rate` the buffer does not carry),
+  and `write_wav_file(path, samples, sample_rate, format)` writes a plain seekable RIFF file and
+  finalizes it, returning the clipped-sample count. They are thin wrappers over `WavReader` /
+  `WavWriter` (no chunks, RF64, raw formats or streaming); both are re-exported from the crate root.
+
 - **Streaming vs seekable writing** (`writer.rs`): `WavWriter::new` writes placeholder size fields
   (and a placeholder `fact` count for float) and patches them in `finalize` (needs `Seek`), using
   the byte offsets recorded in `Layout` while the header was written (so the patch positions stay
