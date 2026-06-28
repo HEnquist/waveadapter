@@ -10,6 +10,9 @@ audioadapter adapters directly.
 
 ## Features
 
+- **One-call file helpers**: `read_wav_file(path)` decodes a whole file into floats plus its sample
+  rate, and `write_wav_file(path, buffer, rate, format)` writes a buffer out, for when you do not
+  need streaming, chunks or random access.
 - **audioadapter integration**: read into and write from any `Adapter` / `AdapterMut` buffer
   (interleaved or planar, owned or borrowed), with on-the-fly conversion to and from `f32`/`f64`
   scaled to -1.0..1.0. The write path reports how many samples were clipped.
@@ -64,6 +67,26 @@ When writing, the minimal 16-byte `fmt ` chunk is used by default, and the 40-by
 layout; a non-zero mask must have exactly one bit set per channel. The crate stores the mask but
 does not interpret it, and exposes it on read as `WavParams::channel_mask` (`None` for a plain
 header that carries no mask).
+
+## One-call helpers
+
+For the common "just read/write a file" cases, two free functions wrap the reader and writer:
+
+```rust no_run
+use waveadapter::{SampleFormat, read_wav_file, write_wav_file};
+
+// Decode a whole file into f32 samples plus the sample rate.
+let audio = read_wav_file::<f32, _>("input.wav")?;
+println!("{} ch, {} Hz, {} frames", audio.channels(), audio.sample_rate, audio.frames());
+
+// Write a buffer out as 16-bit PCM.
+let clipped = write_wav_file("output.wav", &audio.samples, audio.sample_rate, SampleFormat::I16)?;
+# let _ = clipped;
+# Ok::<(), waveadapter::WavError>(())
+```
+
+Reach for `WavReader` / `WavWriter` below when you need streaming, metadata chunks, RF64, raw
+formats or random access.
 
 ## Reading
 

@@ -774,3 +774,40 @@ fn channel_mask_bit_count_mismatch_is_rejected() {
     };
     assert!(WavWriter::new(Cursor::new(Vec::new()), spec).is_ok());
 }
+
+#[test]
+fn convenience_file_roundtrip() {
+    use waveadapter::{WavData, read_wav_file, write_wav_file};
+
+    let channels = 2;
+    let frames = 64;
+    let source = make_buffer(channels, frames);
+
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "waveadapter_convenience_{}.wav",
+        std::process::id()
+    ));
+
+    let clipped = write_wav_file(&path, &source, 44100, SampleFormat::I16).unwrap();
+    assert_eq!(clipped, 0);
+
+    let audio: WavData<f32> = read_wav_file(&path).unwrap();
+    assert_eq!(audio.sample_rate, 44100);
+    assert_eq!(audio.channels(), channels);
+    assert_eq!(audio.frames(), frames);
+
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = audio.samples.read_sample(ch, frame).unwrap();
+            // I16 quantization tolerance.
+            assert!(
+                (a - b).abs() <= 1.0 / 32767.0,
+                "frame {frame} ch {ch}: {a} vs {b}"
+            );
+        }
+    }
+
+    std::fs::remove_file(&path).unwrap();
+}
