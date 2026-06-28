@@ -104,7 +104,7 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   it controls (`RIFF`, `fmt `, `data`, `fact`). Audio cannot be written once a trailing chunk has
   been emitted.
 
-- **`metadata.rs`** is a thin typed layer over those blobs for the two common cases. Each type has
+- **`metadata.rs`** is a thin typed layer over those blobs for the common cases. Each type has
   the same shape: `from_chunk`/`from_bytes` to decode and `to_chunk`/`to_bytes` to build a `Chunk`
   for the writer.
   - `InfoList` is the `LIST`/`INFO` tag list (title/artist/comment/...). `INFO` is not its own
@@ -113,9 +113,15 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   - `Bext` is the Broadcast Audio Extension (EBU Tech 3285): a fixed 602-byte struct (timecode
     reference, originator/date/time, version-gated UMID and R128 loudness fields) plus a
     variable-length coding-history string. Fixed-width string fields are truncated to fit on write.
+  - `Cue` + `AdtlList` are the marker pair. `Cue` is the `cue ` chunk: a count followed by 24-byte
+    `CuePoint`s (id, play-order position, containing chunk, and chunk/block/sample offsets); the
+    `CuePoint::at` constructor covers the common single-`data`-chunk PCM marker. `AdtlList` is the
+    `LIST`/`adtl` companion that names those markers, an ordered list of `AdtlEntry` (`labl`, `note`,
+    or `ltxt`-for-regions) keyed by `CuePoint::id`. It is a `LIST` chunk like `InfoList`, told apart
+    by its `adtl` form type, so the two never collide on decode.
 
-  Everything else (`cue `, `iXML`, `smpl`, ...) stays a raw blob for a higher-level crate; adding a
-  third typed chunk means following the same `from_*`/`to_*` shape here.
+  Everything else (`iXML`, `smpl`, ...) stays a raw blob for a higher-level crate; adding another
+  typed chunk means following the same `from_*`/`to_*` shape here.
 
 - **`highlevel.rs`** holds the two path-based one-call helpers for callers who do not need the
   full reader/writer: `read_wav_file::<T, _>(path)` opens a file and reads everything into a

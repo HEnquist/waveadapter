@@ -1,12 +1,14 @@
 //! Parsing and generating typed metadata chunks.
 //!
 //! waveadapter passes every non-audio chunk through as a raw [`Chunk`] blob.
-//! This module is a thin typed layer over those blobs for the two common cases,
-//! [`InfoList`] (the `LIST`/`INFO` tag list) and [`Bext`] (the Broadcast Audio
-//! Extension). Each offers `from_chunk`/`from_bytes` to decode and
-//! `to_chunk`/`to_bytes` to build one ready for
-//! [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) or a leading-chunk
-//! constructor. Anything else stays a raw blob for a caller to interpret.
+//! This module is a thin typed layer over those blobs for the common cases:
+//! [`InfoList`] (the `LIST`/`INFO` tag list), [`Bext`] (the Broadcast Audio
+//! Extension), and the marker pair [`Cue`] (the `cue ` chunk) plus
+//! [`AdtlList`] (the `LIST`/`adtl` labels that name those markers). Each offers
+//! `from_chunk`/`from_bytes` to decode and `to_chunk`/`to_bytes` to build one
+//! ready for [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) or a
+//! leading-chunk constructor. Anything else stays a raw blob for a caller to
+//! interpret.
 //!
 //! The RIFF `INFO` tag list is the common, simple form of wav metadata (title,
 //! artist, comment, ...). It is not a chunk of its own: it is a [`LIST`](Chunk)
@@ -357,6 +359,334 @@ impl Bext {
     }
 }
 
+/// The four-character id of the `cue ` chunk (note the trailing space).
+pub const CUE_ID: [u8; 4] = *b"cue ";
+
+/// The `LIST` form type for an associated-data (label) list.
+pub const ADTL: [u8; 4] = *b"adtl";
+
+/// The four-character id of a label sub-chunk (`labl`).
+pub const LABL_ID: [u8; 4] = *b"labl";
+/// The four-character id of a note sub-chunk (`note`).
+pub const NOTE_ID: [u8; 4] = *b"note";
+/// The four-character id of a labeled-text sub-chunk (`ltxt`).
+pub const LTXT_ID: [u8; 4] = *b"ltxt";
+
+/// A single cue point: a named position in the file.
+///
+/// For ordinary uncompressed PCM in one `data` chunk, the only fields that
+/// matter are [`id`](CuePoint::id) and [`sample_offset`](CuePoint::sample_offset)
+/// (the marker's frame position), with [`position`](CuePoint::position) equal to
+/// it; the rest are zero with [`chunk`](CuePoint::chunk) set to `data`. Use
+/// [`CuePoint::at`] to build that common case. The remaining fields exist so the
+/// `wavl`/compressed layouts round-trip without loss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CuePoint {
+    /// Identifier, used to tie a cue point to its label in an [`AdtlList`].
+    pub id: u32,
+    /// Play-order position: the sample offset within the play sequence (equals
+    /// [`sample_offset`](CuePoint::sample_offset) when there is no playlist).
+    pub position: u32,
+    /// The chunk this cue point refers into, usually `data`.
+    pub chunk: [u8; 4],
+    /// Byte offset of the start of the containing chunk (`0` for `data`).
+    pub chunk_start: u32,
+    /// Byte offset of the start of the block holding the point (`0` for PCM).
+    pub block_start: u32,
+    /// Sample offset of the point from the start of its block. For PCM this is
+    /// the marker's frame position in the file.
+    pub sample_offset: u32,
+}
+
+impl CuePoint {
+    /// Build a cue point for the common case: a marker at `sample_offset` frames
+    /// into the `data` chunk, with the given `id`.
+    pub fn at(id: u32, sample_offset: u32) -> Self {
+        Self {
+            id,
+            position: sample_offset,
+            chunk: *b"data",
+            chunk_start: 0,
+            block_start: 0,
+            sample_offset,
+        }
+    }
+}
+
+/// The number of bytes a single cue point occupies on disk.
+const CUE_POINT_LEN: usize = 24;
+
+/// A parsed `cue ` chunk: an ordered list of [`CuePoint`]s.
+///
+/// Cue points carry only positions and ids; their names live in a companion
+/// [`AdtlList`] (`LIST`/`adtl`) keyed by [`CuePoint::id`]. Write both chunks to
+/// give a DAW named markers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cue {
+    /// The cue points, in file order.
+    pub points: Vec<CuePoint>,
+}
+
+impl Cue {
+    /// Create an empty cue list.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode a `cue ` chunk body: a 32-bit count followed by that many 24-byte
+    /// cue points.
+    ///
+    /// Parsing is lenient: points beyond what the body actually holds are
+    /// dropped rather than erroring. Returns `None` only if the body is too
+    /// short to hold the count.
+    pub fn from_bytes(body: &[u8]) -> Option<Self> {
+        if body.len() < 4 {
+            return None;
+        }
+        let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+        let mut points = Vec::new();
+        let mut pos = 4;
+        for _ in 0..count {
+            if pos + CUE_POINT_LEN > body.len() {
+                break; // truncated, stop rather than read past the end
+            }
+            let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+            points.push(CuePoint {
+                id: u32_at(pos),
+                position: u32_at(pos + 4),
+                chunk: body[pos + 8..pos + 12].try_into().unwrap(),
+                chunk_start: u32_at(pos + 12),
+                block_start: u32_at(pos + 16),
+                sample_offset: u32_at(pos + 20),
+            });
+            pos += CUE_POINT_LEN;
+        }
+        Some(Self { points })
+    }
+
+    /// Decode a `cue ` chunk from a parsed [`Chunk`]. Returns `None` if the
+    /// chunk is not a `cue ` chunk.
+    pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
+        if chunk.id != CUE_ID {
+            return None;
+        }
+        Self::from_bytes(&chunk.data)
+    }
+
+    /// Encode the `cue ` chunk body: the count followed by the cue points.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + self.points.len() * CUE_POINT_LEN);
+        body.extend_from_slice(&(self.points.len() as u32).to_le_bytes());
+        for p in &self.points {
+            body.extend_from_slice(&p.id.to_le_bytes());
+            body.extend_from_slice(&p.position.to_le_bytes());
+            body.extend_from_slice(&p.chunk);
+            body.extend_from_slice(&p.chunk_start.to_le_bytes());
+            body.extend_from_slice(&p.block_start.to_le_bytes());
+            body.extend_from_slice(&p.sample_offset.to_le_bytes());
+        }
+        body
+    }
+
+    /// Build a `cue ` [`Chunk`] ready to hand to the writer.
+    pub fn to_chunk(&self) -> Chunk {
+        Chunk {
+            id: CUE_ID,
+            data: self.to_bytes(),
+        }
+    }
+}
+
+/// One entry in an associated-data (`adtl`) list, naming a cue point.
+///
+/// Each entry references a [`CuePoint::id`]. [`Label`](AdtlEntry::Label) is a
+/// short marker name, [`Note`](AdtlEntry::Note) a longer comment, and
+/// [`LabeledText`](AdtlEntry::LabeledText) turns a marker into a region by
+/// giving it a sample length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdtlEntry {
+    /// A `labl` sub-chunk: the name of a marker.
+    Label {
+        /// The [`CuePoint::id`] this label names.
+        cue_id: u32,
+        /// The label text.
+        text: String,
+    },
+    /// A `note` sub-chunk: a comment attached to a marker.
+    Note {
+        /// The [`CuePoint::id`] this note annotates.
+        cue_id: u32,
+        /// The comment text.
+        text: String,
+    },
+    /// An `ltxt` sub-chunk: text spanning a region that starts at the cue point
+    /// and runs for [`sample_length`](AdtlEntry::LabeledText::sample_length)
+    /// samples.
+    LabeledText {
+        /// The [`CuePoint::id`] the region starts at.
+        cue_id: u32,
+        /// Length of the region in samples.
+        sample_length: u32,
+        /// Purpose id, conventionally `rgn ` for a region.
+        purpose: [u8; 4],
+        /// Country code (`0` if unused).
+        country: u16,
+        /// Language code (`0` if unused).
+        language: u16,
+        /// Dialect code (`0` if unused).
+        dialect: u16,
+        /// Code page of the text (`0` if unused).
+        code_page: u16,
+        /// The region text.
+        text: String,
+    },
+}
+
+/// The fixed part of an `ltxt` sub-chunk before its text.
+const LTXT_FIXED_LEN: usize = 20;
+
+/// A parsed `LIST`/`adtl` chunk: an ordered list of [`AdtlEntry`] labels keyed
+/// to cue-point ids.
+///
+/// This is the companion to [`Cue`]: a `cue ` chunk gives markers positions,
+/// this gives them names. Like [`InfoList`] it is a `LIST` chunk, told apart by
+/// its `adtl` form type, so the two never collide on decode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdtlList {
+    /// The label entries, in file order.
+    pub entries: Vec<AdtlEntry>,
+}
+
+impl AdtlList {
+    /// Create an empty list.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode an `adtl` list body: the form type `adtl` followed by the label
+    /// sub-chunks. This is the raw bytes of the `LIST` chunk.
+    ///
+    /// Returns `None` if the body is not an `adtl` list. Parsing is lenient:
+    /// truncated or unrecognized sub-chunks are skipped.
+    pub fn from_bytes(body: &[u8]) -> Option<Self> {
+        if body.len() < 4 || body[0..4] != ADTL {
+            return None;
+        }
+        let mut entries = Vec::new();
+        let mut pos = 4;
+        while pos + 8 <= body.len() {
+            let id: [u8; 4] = body[pos..pos + 4].try_into().unwrap();
+            let size = u32::from_le_bytes(body[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            if pos + size > body.len() {
+                break; // truncated sub-chunk, stop rather than read past the end
+            }
+            let data = &body[pos..pos + size];
+            match &id {
+                b"labl" | b"note" if size >= 4 => {
+                    let cue_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    let text = decode_text(&data[4..]);
+                    entries.push(if id == LABL_ID {
+                        AdtlEntry::Label { cue_id, text }
+                    } else {
+                        AdtlEntry::Note { cue_id, text }
+                    });
+                }
+                b"ltxt" if size >= LTXT_FIXED_LEN => {
+                    let u32_at = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+                    let u16_at = |o: usize| u16::from_le_bytes(data[o..o + 2].try_into().unwrap());
+                    entries.push(AdtlEntry::LabeledText {
+                        cue_id: u32_at(0),
+                        sample_length: u32_at(4),
+                        purpose: data[8..12].try_into().unwrap(),
+                        country: u16_at(12),
+                        language: u16_at(14),
+                        dialect: u16_at(16),
+                        code_page: u16_at(18),
+                        text: decode_text(&data[LTXT_FIXED_LEN..]),
+                    });
+                }
+                _ => {} // unknown or too-short sub-chunk: skip it
+            }
+            pos += size + (size & 1); // step over the pad byte for odd sizes
+        }
+        Some(Self { entries })
+    }
+
+    /// Decode an `adtl` list from a parsed [`Chunk`]. Returns `None` if the
+    /// chunk is not a `LIST` chunk of `adtl` form type.
+    pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
+        if chunk.id != LIST_ID {
+            return None;
+        }
+        Self::from_bytes(&chunk.data)
+    }
+
+    /// Encode the list as a `LIST` chunk body: the form type `adtl` followed by
+    /// the label sub-chunks, each padded to an even length.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&ADTL);
+        for entry in &self.entries {
+            match entry {
+                AdtlEntry::Label { cue_id, text } => {
+                    let mut sub = cue_id.to_le_bytes().to_vec();
+                    sub.extend_from_slice(text.as_bytes());
+                    sub.push(0); // NUL terminator
+                    push_subchunk(&mut body, &LABL_ID, &sub);
+                }
+                AdtlEntry::Note { cue_id, text } => {
+                    let mut sub = cue_id.to_le_bytes().to_vec();
+                    sub.extend_from_slice(text.as_bytes());
+                    sub.push(0); // NUL terminator
+                    push_subchunk(&mut body, &NOTE_ID, &sub);
+                }
+                AdtlEntry::LabeledText {
+                    cue_id,
+                    sample_length,
+                    purpose,
+                    country,
+                    language,
+                    dialect,
+                    code_page,
+                    text,
+                } => {
+                    let mut sub = Vec::with_capacity(LTXT_FIXED_LEN + text.len() + 1);
+                    sub.extend_from_slice(&cue_id.to_le_bytes());
+                    sub.extend_from_slice(&sample_length.to_le_bytes());
+                    sub.extend_from_slice(purpose);
+                    sub.extend_from_slice(&country.to_le_bytes());
+                    sub.extend_from_slice(&language.to_le_bytes());
+                    sub.extend_from_slice(&dialect.to_le_bytes());
+                    sub.extend_from_slice(&code_page.to_le_bytes());
+                    sub.extend_from_slice(text.as_bytes());
+                    sub.push(0); // NUL terminator
+                    push_subchunk(&mut body, &LTXT_ID, &sub);
+                }
+            }
+        }
+        body
+    }
+
+    /// Build a `LIST` [`Chunk`] ready to hand to the writer.
+    pub fn to_chunk(&self) -> Chunk {
+        Chunk {
+            id: LIST_ID,
+            data: self.to_bytes(),
+        }
+    }
+}
+
+/// Append a sub-chunk (4-byte id, 32-bit size, body, even-length pad byte).
+fn push_subchunk(body: &mut Vec<u8>, id: &[u8; 4], data: &[u8]) {
+    body.extend_from_slice(id);
+    body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    body.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        body.push(0); // pad to an even length
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +818,116 @@ mod tests {
         };
         let parsed = Bext::from_bytes(&bext.to_bytes()).unwrap();
         assert_eq!(parsed.origination_date, "2026-06-25");
+    }
+
+    #[test]
+    fn cue_roundtrips_through_chunk() {
+        let cue = Cue {
+            points: vec![
+                CuePoint::at(1, 0),
+                CuePoint::at(2, 48_000),
+                // A non-default point exercises every field.
+                CuePoint {
+                    id: 3,
+                    position: 100,
+                    chunk: *b"wavl",
+                    chunk_start: 64,
+                    block_start: 32,
+                    sample_offset: 12,
+                },
+            ],
+        };
+        let chunk = cue.to_chunk();
+        assert_eq!(&chunk.id, b"cue ");
+        // The body leads with the point count.
+        assert_eq!(&chunk.data[0..4], &3u32.to_le_bytes());
+        assert_eq!(Cue::from_chunk(&chunk), Some(cue));
+    }
+
+    #[test]
+    fn cue_drops_truncated_points() {
+        // Claims 5 points but only one is present.
+        let mut body = 5u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&CuePoint::at(7, 10).id.to_le_bytes());
+        body.resize(4 + CUE_POINT_LEN, 0);
+        let cue = Cue::from_bytes(&body).unwrap();
+        assert_eq!(cue.points.len(), 1);
+        assert_eq!(cue.points[0].id, 7);
+    }
+
+    #[test]
+    fn cue_rejects_short_and_wrong_chunk() {
+        assert!(Cue::from_bytes(&[0u8; 2]).is_none());
+        let not_cue = Chunk {
+            id: *b"LIST",
+            data: vec![0u8; 4],
+        };
+        assert!(Cue::from_chunk(&not_cue).is_none());
+    }
+
+    #[test]
+    fn adtl_roundtrips_through_chunk() {
+        let adtl = AdtlList {
+            entries: vec![
+                AdtlEntry::Label {
+                    cue_id: 1,
+                    text: "Intro".to_string(),
+                },
+                // An odd-length text exercises the pad byte.
+                AdtlEntry::Note {
+                    cue_id: 1,
+                    text: "odd".to_string(),
+                },
+                AdtlEntry::LabeledText {
+                    cue_id: 2,
+                    sample_length: 48_000,
+                    purpose: *b"rgn ",
+                    country: 0,
+                    language: 9,
+                    dialect: 1,
+                    code_page: 0,
+                    text: "Verse".to_string(),
+                },
+            ],
+        };
+        let chunk = adtl.to_chunk();
+        assert_eq!(&chunk.id, b"LIST");
+        assert_eq!(&chunk.data[0..4], b"adtl");
+        assert_eq!(AdtlList::from_chunk(&chunk), Some(adtl));
+    }
+
+    #[test]
+    fn adtl_and_info_lists_do_not_collide() {
+        // Both are LIST chunks; the form type tells them apart.
+        let mut info = InfoList::new();
+        info.set(TITLE, "x");
+        assert!(AdtlList::from_chunk(&info.to_chunk()).is_none());
+
+        let adtl = AdtlList {
+            entries: vec![AdtlEntry::Label {
+                cue_id: 1,
+                text: "x".to_string(),
+            }],
+        };
+        assert!(InfoList::from_chunk(&adtl.to_chunk()).is_none());
+    }
+
+    #[test]
+    fn adtl_skips_unknown_subchunks() {
+        let mut body = ADTL.to_vec();
+        // An unknown sub-chunk between two labels is skipped.
+        push_subchunk(&mut body, b"labl", &{
+            let mut s = 1u32.to_le_bytes().to_vec();
+            s.extend_from_slice(b"A\0");
+            s
+        });
+        push_subchunk(&mut body, b"ZZZZ", b"junk");
+        push_subchunk(&mut body, b"labl", &{
+            let mut s = 2u32.to_le_bytes().to_vec();
+            s.extend_from_slice(b"B\0");
+            s
+        });
+        let adtl = AdtlList::from_bytes(&body).unwrap();
+        assert_eq!(adtl.entries.len(), 2);
     }
 }
