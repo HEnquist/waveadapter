@@ -32,8 +32,8 @@ audioadapter adapters directly.
 - **Random access**: seek to any frame for reading or writing on a seekable stream.
 - **RF64 / BW64 (>4 GB)**: reads both forms, writes RF64, for files past the 4 GB RIFF limit.
 - **Chunk passthrough with typed metadata**: every non-audio chunk round-trips verbatim (leading or
-  trailing), with a thin typed layer for `LIST`/`INFO` tags and the `bext` Broadcast Audio
-  Extension.
+  trailing), with a thin typed layer for `LIST`/`INFO` tags, the `bext` Broadcast Audio Extension,
+  and `cue ` markers with their `LIST`/`adtl` labels.
 - **Robust parsing**: tolerates junk, padding and out-of-order chunks.
 
 ## Supported sample formats
