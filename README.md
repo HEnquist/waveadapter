@@ -28,8 +28,9 @@ audioadapter adapters directly.
   `WAVEFORMATEXTENSIBLE`, picking the minimal form automatically. The `dwChannelMask` speaker layout
   is read and written.
 - **Streaming or seekable**: write to a seekable file (sizes patched on finalize) or straight to a
-  pipe with no seeking (`u32::MAX` sizes). Reading handles unknown-length streams, stopping cleanly
-  at end of file.
+  pipe with no seeking. Reading handles unknown-length streams, stopping cleanly at end of file.
+- **Crash tolerant writing**: an interrupted file stays readable, and `update_header` keeps the
+  sizes current during a long recording.
 - **Random access**: seek to any frame for reading or writing on a seekable stream.
 - **RF64 / BW64 (>4 GB)**: reads both forms, writes RF64, for files past the 4 GB RIFF limit.
 - **Chunk passthrough with typed metadata**: every non-audio chunk round-trips verbatim (leading or
@@ -113,8 +114,13 @@ Two modes are available:
 
 - **Seekable** (`WavWriter::new`): the size fields start as placeholders and are patched with the
   real values by `finalize`, producing a standard-compliant file.
-- **Streaming** (`WavWriter::new_streaming`): the size fields are set to `u32::MAX` up front and
-  never updated, for pipes and other non-seekable outputs. Finish with `into_inner`.
+- **Streaming** (`WavWriter::new_streaming`): the size fields are never updated, for pipes and other
+  non-seekable outputs. Finish with `into_inner`.
+
+Both write the placeholder as `u32::MAX`, the "runs to the end of the file" marker, so a plain RIFF
+file whose writer never reached `finalize` still reads back as the audio that made it to disk. RF64
+has no such marker, so for long recordings call `update_header` now and then: it patches the sizes
+in place and returns to the write position, leaving a valid file behind at every step.
 
 A seekable writer also supports random access via `seek_to_frame`, to overwrite already-written
 audio without shrinking the file.

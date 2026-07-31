@@ -26,9 +26,14 @@ const DS64: &[u8] = b"ds64";
 pub(crate) const RIFF_SIZE_OFFSET: u64 = 4;
 
 /// The marker written into a 32-bit size field when the real size lives in the
-/// `ds64` chunk (RF64), and also the streaming "length unknown" placeholder for
-/// plain RIFF. The two uses are told apart by the file's form id.
+/// `ds64` chunk (RF64), and also the "length unknown" placeholder for plain
+/// RIFF. The two uses are told apart by the file's form id.
 const SIZE_IN_DS64: u32 = u32::MAX;
+
+/// The value a plain RIFF size field carries while the real length is not yet
+/// known: the data runs to the end of the file. Written by both the streaming
+/// and the seekable writer, the latter patching it in `finalize`.
+pub(crate) const UNKNOWN_SIZE: u32 = SIZE_IN_DS64;
 
 /// Body size of a `ds64` chunk with no oversized-chunk table: three 64-bit sizes
 /// plus the 32-bit table length.

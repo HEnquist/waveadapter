@@ -811,3 +811,137 @@ fn convenience_file_roundtrip() {
 
     std::fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn abandoned_riff_writer_is_still_readable() {
+    let channels = 2;
+    let frames = 48;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 44100,
+        sample_format: SampleFormat::F32,
+        channel_mask: None,
+    };
+
+    // Write audio but never call finalize, standing in for a process that was
+    // interrupted mid-recording.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+        writer.write_float_buffer(&source).unwrap();
+    }
+    let bytes = cursor.into_inner();
+
+    // The unpatched size fields carry the "runs to end of file" marker, not zero.
+    let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    assert_eq!(rd32(4), u32::MAX, "RIFF size is the unknown-length marker");
+
+    // So the audio that reached the file reads back intact.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert_eq!(a, b, "frame {frame} ch {ch}");
+        }
+    }
+}
+
+#[test]
+fn update_header_makes_an_abandoned_rf64_readable() {
+    let channels = 2;
+    let half = 32;
+    let source = make_buffer(channels, half);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::F32,
+        channel_mask: None,
+    };
+
+    // Write a block, update the header, write a second block, then never
+    // finalize. RF64 has no unknown-length marker, so only the updated ds64
+    // sizes make the file readable.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+        writer.write_float_buffer(&source).unwrap();
+        writer.update_header().unwrap();
+        writer.write_float_buffer(&source).unwrap();
+    }
+    let bytes = cursor.into_inner();
+
+    // Both blocks are on disk, but the header only declares the first.
+    let expected_bytes = (half * channels * 4) as u64;
+    assert_eq!(
+        bytes.len() as u64,
+        72 + 8 + 2 * expected_bytes,
+        "both blocks were written"
+    );
+    let rd64 = |o: usize| {
+        u64::from_le_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+            bytes[o + 4],
+            bytes[o + 5],
+            bytes[o + 6],
+            bytes[o + 7],
+        ])
+    };
+    assert_eq!(rd64(28), expected_bytes, "ds64 dataSize from the update");
+    assert_eq!(rd64(36), half as u64, "ds64 sampleCount from the update");
+
+    // The declared audio reads back intact.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.frames(), half);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), half);
+    for frame in 0..half {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert_eq!(a, b, "frame {frame} ch {ch}");
+        }
+    }
+}
+
+#[test]
+fn update_header_resumes_writing_at_the_right_place() {
+    let channels = 1;
+    let frames = 16;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    // Interleaving updates with writes must not disturb the write cursor: the
+    // finalized file has to match one written without any updates.
+    let mut updated = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut updated, spec).unwrap();
+    writer.update_header().unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.update_header().unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.update_header().unwrap();
+    writer.finalize().unwrap();
+
+    let mut plain = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut plain, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+
+    assert_eq!(
+        updated.into_inner(),
+        plain.into_inner(),
+        "updating the header must not change the finished file"
+    );
+}
