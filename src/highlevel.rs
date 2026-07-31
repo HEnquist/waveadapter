@@ -90,9 +90,11 @@ where
 /// # Ok::<(), waveadapter::WavError>(())
 /// ```
 ///
-/// Returns the number of samples that were clipped during conversion. This is
-/// the "I have this audio, just write it" path: a plain RIFF file with no extra
-/// chunks. Use [`WavWriter`] for metadata, RF64, raw formats or streaming output.
+/// Returns the number of samples that were clipped during conversion, which is
+/// always zero for the float formats (see
+/// [`WavWriter::write_float_buffer`]). This is the "I have this audio, just
+/// write it" path: a plain RIFF file with no extra chunks. Use [`WavWriter`]
+/// for metadata, RF64, raw formats or streaming output.
 pub fn write_wav_file<T, P>(
     path: P,
     samples: &dyn Adapter<T>,

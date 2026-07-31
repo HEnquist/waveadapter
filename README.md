@@ -15,7 +15,8 @@ audioadapter adapters directly.
   need streaming, chunks or random access.
 - **audioadapter integration**: read into and write from any `Adapter` / `AdapterMut` buffer
   (interleaved or planar, owned or borrowed), with on-the-fly conversion to and from `f32`/`f64`
-  scaled to -1.0..1.0. The write path reports how many samples were clipped.
+  scaled to -1.0..1.0. The write path reports how many samples were clipped by the integer
+  formats (the float formats keep their headroom and never clip).
 - **Raw byte passthrough**: move the interleaved sample bytes untouched, to wrap with the
   audioadapter byte/number adapters yourself, or to handle formats this crate does not model.
 - **Wide format coverage**: 16-, 24- (both 3-byte packed and 4-byte left-justified), and 32-bit

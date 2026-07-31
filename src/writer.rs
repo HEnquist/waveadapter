@@ -354,9 +354,13 @@ impl<W: Write> WavWriter<W> {
     /// Write all frames of a floating point buffer, converting to the file's
     /// sample format.
     ///
-    /// Each sample is scaled from the range -1.0..1.0 and clipped if it falls
-    /// outside the range representable by the target format. Returns the number
-    /// of samples that were clipped.
+    /// Each sample is scaled from the range -1.0..1.0. For the integer formats,
+    /// values outside that range are clipped to the nearest limit, and the
+    /// return value counts how many samples were clipped. The float formats
+    /// ([`SampleFormat::F32`](crate::SampleFormat::F32) and
+    /// [`SampleFormat::F64`](crate::SampleFormat::F64)) are not range limited:
+    /// values outside -1.0..1.0 are valid headroom and pass through unchanged,
+    /// so writing to them always returns zero.
     ///
     /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
     /// trailing chunk has already been written, since audio data must precede
