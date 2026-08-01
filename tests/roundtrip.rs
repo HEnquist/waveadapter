@@ -945,3 +945,52 @@ fn update_header_resumes_writing_at_the_right_place() {
         "updating the header must not change the finished file"
     );
 }
+
+#[test]
+fn rf64_chunk_size_from_ds64_cannot_overflow_the_scan() {
+    // Found by the parse_header fuzz target. For RF64 the real chunk size comes
+    // from the ds64 table as an unvalidated 64-bit value, so a file can name a
+    // size near u64::MAX. The offset arithmetic that checks whether a chunk
+    // overruns the file used to overflow before it could reject it: a panic in
+    // debug, and in release a wrapped offset that passed the overrun check and
+    // went on to request a multi-exabyte allocation.
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RF64");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+    file.extend_from_slice(b"WAVE");
+
+    // ds64 with a one-entry table claiming a JUNK chunk of u64::MAX bytes.
+    file.extend_from_slice(b"ds64");
+    file.extend_from_slice(&40u32.to_le_bytes());
+    file.extend_from_slice(&0u64.to_le_bytes()); // riffSize
+    file.extend_from_slice(&0u64.to_le_bytes()); // dataSize
+    file.extend_from_slice(&0u64.to_le_bytes()); // sampleCount
+    file.extend_from_slice(&1u32.to_le_bytes()); // tableLength
+    file.extend_from_slice(b"JUNK");
+    file.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    // A perfectly good 16-bit stereo fmt and a short data chunk.
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&16u32.to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    file.extend_from_slice(&2u16.to_le_bytes()); // channels
+    file.extend_from_slice(&44100u32.to_le_bytes());
+    file.extend_from_slice(&176400u32.to_le_bytes()); // byte rate
+    file.extend_from_slice(&4u16.to_le_bytes()); // block align
+    file.extend_from_slice(&16u16.to_le_bytes()); // bits
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&4u32.to_le_bytes());
+    file.extend_from_slice(&[0u8; 4]);
+
+    // The oversized chunk, whose 0xFFFFFFFF size resolves through the table.
+    file.extend_from_slice(b"JUNK");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+
+    // The bogus length must stop the scan, not blow up, and the chunks found
+    // before it must survive.
+    let params = read_wav_header(Cursor::new(file)).expect("header should still parse");
+    assert_eq!(params.channels, 2);
+    assert_eq!(params.sample_rate, 44100);
+    assert_eq!(params.sample_format, Some(SampleFormat::I16));
+    assert_eq!(params.data_length, 4);
+}

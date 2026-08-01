@@ -1,0 +1,7 @@
+target
+coverage
+
+# The working corpus grows without bound and is regenerated from the seeds, so it
+# is not committed. Crash inputs under artifacts/ are: tests/fuzz_replay.rs
+# replays them on stable, which turns every find into a permanent regression test.
+corpus
