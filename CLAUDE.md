@@ -133,8 +133,14 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 - **Streaming vs seekable writing** (`writer.rs`): `WavWriter::new` writes placeholder size fields
   (and a placeholder `fact` count for float) and patches them in `finalize` (needs `Seek`), using
   the byte offsets recorded in `Layout` while the header was written (so the patch positions stay
-  correct regardless of `fact`/leading chunks). `WavWriter::new_streaming` writes `u32::MAX` sizes
-  up front and never updates them (for pipes); finish with `into_inner`. The reader treats a
+  correct regardless of `fact`/leading chunks). `WavWriter::new_streaming` never updates them (for
+  pipes); finish with `into_inner`. Both write the same `header::UNKNOWN_SIZE` (`u32::MAX`)
+  placeholder, the "data runs to the end of the file" convention, so a seekable file that never
+  reached `finalize` (interrupted process) still reads back as the audio on disk instead of as an
+  empty file. Only `seekable` distinguishes the two modes. RF64 has no such convention (its `ds64`
+  sizes start at zero), so `update_header` patches the sizes in place and seeks back to the write
+  position, to be called periodically during a long recording; `finalize` and `update_header` share
+  the `patch_sizes` helper. The reader treats a
   `u32::MAX` declared length as "unknown" and stops cleanly at EOF on a frame boundary. The
   `Container` choice (RIFF placeholder vs RF64) and `SizeFields` enum (which offsets `finalize`
   patches: the RIFF size field, or the three `ds64` 64-bit fields) carry the form difference through
