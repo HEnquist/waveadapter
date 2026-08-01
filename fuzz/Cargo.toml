@@ -1,0 +1,35 @@
+[package]
+name = "waveadapter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.waveadapter]
+path = ".."
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_audio"
+path = "fuzz_targets/read_audio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_chunks"
+path = "fuzz_targets/metadata_chunks.rs"
+test = false
+doc = false
+bench = false

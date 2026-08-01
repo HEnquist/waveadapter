@@ -555,7 +555,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         ));
     }
 
-    let mut next_chunk_location = 12;
+    let mut next_chunk_location: u64 = 12;
     let mut found_fmt = false;
     let mut found_data = false;
     let mut buffer = [0; 8];
@@ -582,7 +582,13 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     // Walk every chunk to the end of the file, so that metadata chunks placed
     // after the data chunk are captured too. A chunk is padded to an even length
     // with a trailing byte that is not counted in its declared size.
-    while next_chunk_location + 8 <= filesize {
+    //
+    // Every offset computed from a declared length uses saturating arithmetic.
+    // For RF64 the length comes from the ds64 table as an unvalidated 64-bit
+    // value, so a hostile or corrupt file can name a size near `u64::MAX`.
+    // Saturating turns that into an offset past `filesize`, which the existing
+    // overrun checks already treat as "stop scanning".
+    while next_chunk_location.saturating_add(8) <= filesize {
         file.seek(SeekFrom::Start(next_chunk_location))?;
         file.read_exact(&mut buffer)?;
         let chunk_length = read_u32(&buffer, 4);
@@ -599,13 +605,14 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         if is_ds64 {
             // The ds64 chunk is container metadata, not exposed as a raw chunk.
             // Honor the first one and parse its 64-bit sizes for later chunks.
-            let body_end = next_chunk_location + 8 + chunk_length as u64;
+            let body_end = next_chunk_location.saturating_add(8 + chunk_length as u64);
             if body_end <= filesize {
                 let mut body = vec![0; chunk_length as usize];
                 file.read_exact(&mut body)?;
                 ds64 = Ds64::parse(&body);
             }
-            next_chunk_location += 8 + chunk_length as u64 + (chunk_length as u64 & 1);
+            next_chunk_location = next_chunk_location
+                .saturating_add(8 + chunk_length as u64 + (chunk_length as u64 & 1));
             continue;
         }
         if is_fmt {
@@ -661,7 +668,9 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         } else {
             // Any other chunk is captured verbatim, tolerating a bogus length
             // that would overrun the file by stopping the scan instead of erroring.
-            let body_end = next_chunk_location + 8 + body_len;
+            let body_end = next_chunk_location
+                .saturating_add(8)
+                .saturating_add(body_len);
             if body_end > filesize {
                 break;
             }
@@ -674,7 +683,10 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             id.copy_from_slice(&buffer[0..4]);
             chunks.push(Chunk { id, data: body });
         }
-        next_chunk_location += 8 + body_len + (body_len & 1);
+        next_chunk_location = next_chunk_location
+            .saturating_add(8)
+            .saturating_add(body_len)
+            .saturating_add(body_len & 1);
     }
     if found_data && found_fmt {
         return Ok(WavParams {
