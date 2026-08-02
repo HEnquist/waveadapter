@@ -2,7 +2,7 @@
 name = "waveadapter"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 authors = ["HEnquist <henrik.enquist@gmail.com>"]
 description = "Reading and writing wav files into audioadapter buffers"
 license = "MIT OR Apache-2.0"

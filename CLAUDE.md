@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`waveadapter` is a small Rust library (edition 2024, MSRV 1.85) that reads and writes the WAV
+`waveadapter` is a small Rust library (edition 2024, MSRV 1.88) that reads and writes the WAV
 container and bridges it to the [audioadapter](https://github.com/HEnquist/audioadapter-rs) family
 of crates. It does not implement sample conversion itself: the byte<->number conversion lives in
 `audioadapter-sample`, and this crate is the WAV-specific glue plus header parsing/writing
