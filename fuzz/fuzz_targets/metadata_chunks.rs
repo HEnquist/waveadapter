@@ -28,15 +28,7 @@ fuzz_target!(|data: &[u8]| {
     if let Some(bext) = Bext::from_bytes(data) {
         let again = Bext::from_bytes(&bext.to_bytes())
             .expect("re-decoding a Bext's own output must succeed");
-        // Only checked when the fixed-width fields are ASCII. Non-UTF-8 bytes
-        // there are a known defect: `decode_text` turns each one into a 3-byte
-        // U+FFFD, and `encode_fixed` then truncates back to the field width, so
-        // a full 32-byte field of non-ASCII comes back as 11 characters. Widen
-        // this assertion once the charset handling is settled.
-        let fixed_is_ascii = data[..338].iter().all(u8::is_ascii);
-        if fixed_is_ascii {
-            assert_eq!(bext, again, "Bext encode/decode is not idempotent");
-        }
+        assert_eq!(bext, again, "Bext encode/decode is not idempotent");
     }
 
     if let Some(cue) = Cue::from_bytes(data) {

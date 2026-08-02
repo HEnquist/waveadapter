@@ -116,7 +116,8 @@ impl InfoList {
         let mut body = Vec::new();
         body.extend_from_slice(&INFO);
         for (id, text) in &self.tags {
-            let mut value = text.as_bytes().to_vec();
+            let mut value = Vec::new();
+            encode_text(&mut value, text, usize::MAX);
             value.push(0); // NUL terminator
             body.extend_from_slice(id);
             body.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -181,22 +182,59 @@ impl InfoList {
     }
 }
 
-/// Decode a NUL-terminated, fixed-width or trailing text field: take the bytes
-/// up to the first NUL (the rest is padding) and interpret them as text,
-/// replacing invalid sequences. Used for both `INFO` values and the fixed-width
-/// `bext` string fields.
+/// Decode a NUL-terminated text field: take the bytes up to the first NUL (the
+/// rest is padding) and interpret them as text. Used for `INFO` values, the
+/// `adtl` label text and the `bext` string fields.
+///
+/// The bytes are read as UTF-8 when they are valid UTF-8, and as Latin-1
+/// (ISO-8859-1, one byte per character) otherwise. EBU Tech 3285 and the RIFF
+/// spec both call for ASCII, which the two readings agree on, but files in the
+/// wild carry Latin-1 and UTF-8 alike.
+///
+/// This is the inverse of [`encode_text`]. Decoding with `from_utf8_lossy`
+/// instead would be lossy in a way that cannot be undone: every invalid byte
+/// becomes a 3-byte replacement character, so a field would grow on decode and
+/// then get truncated back on encode, losing content on every read/write cycle.
 fn decode_text(raw: &[u8]) -> String {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    String::from_utf8_lossy(&raw[..end]).into_owned()
+    let field = &raw[..end];
+    match str::from_utf8(field) {
+        Ok(text) => text.to_string(),
+        // Latin-1 maps every byte to a code point, so this cannot fail.
+        Err(_) => field.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Append `s` in the encoding [`decode_text`] reads back, writing at most
+/// `max_bytes` and cutting on a character boundary rather than mid-sequence.
+/// Returns the number of bytes written.
+///
+/// Latin-1 is used whenever every character fits in one byte. That is what
+/// `decode_text` produces for non-UTF-8 input, so such fields survive a
+/// read/write cycle byte for byte, and it also guarantees a decoded field always
+/// fits back into the field it came from. Text containing anything above U+00FF
+/// cannot be Latin-1 and is written as UTF-8.
+fn encode_text(out: &mut Vec<u8>, s: &str, max_bytes: usize) -> usize {
+    let start = out.len();
+    if s.chars().all(|c| (c as u32) <= 0xFF) {
+        out.extend(s.chars().take(max_bytes).map(|c| c as u8));
+    } else {
+        let mut buf = [0u8; 4];
+        for (offset, c) in s.char_indices() {
+            if offset + c.len_utf8() > max_bytes {
+                break;
+            }
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out.len() - start
 }
 
 /// Append `s` as a fixed-width NUL-padded field of `width` bytes, truncating the
 /// text if it is longer than the field.
 fn encode_fixed(out: &mut Vec<u8>, s: &str, width: usize) {
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(width);
-    out.extend_from_slice(&bytes[..n]);
-    out.resize(out.len() + (width - n), 0);
+    let written = encode_text(out, s, width);
+    out.resize(out.len() + (width - written), 0);
 }
 
 /// The four-character id of the Broadcast Audio Extension chunk.
@@ -346,7 +384,7 @@ impl Bext {
         out.extend_from_slice(&self.max_short_term_loudness.to_le_bytes());
         // Reserved field: pad the fixed part out to its full 602 bytes.
         out.resize(BEXT_FIXED_LEN, 0);
-        out.extend_from_slice(self.coding_history.as_bytes());
+        encode_text(&mut out, &self.coding_history, usize::MAX);
         out
     }
 
@@ -631,13 +669,13 @@ impl AdtlList {
             match entry {
                 AdtlEntry::Label { cue_id, text } => {
                     let mut sub = cue_id.to_le_bytes().to_vec();
-                    sub.extend_from_slice(text.as_bytes());
+                    encode_text(&mut sub, text, usize::MAX);
                     sub.push(0); // NUL terminator
                     push_subchunk(&mut body, &LABL_ID, &sub);
                 }
                 AdtlEntry::Note { cue_id, text } => {
                     let mut sub = cue_id.to_le_bytes().to_vec();
-                    sub.extend_from_slice(text.as_bytes());
+                    encode_text(&mut sub, text, usize::MAX);
                     sub.push(0); // NUL terminator
                     push_subchunk(&mut body, &NOTE_ID, &sub);
                 }
@@ -659,7 +697,7 @@ impl AdtlList {
                     sub.extend_from_slice(&language.to_le_bytes());
                     sub.extend_from_slice(&dialect.to_le_bytes());
                     sub.extend_from_slice(&code_page.to_le_bytes());
-                    sub.extend_from_slice(text.as_bytes());
+                    encode_text(&mut sub, text, usize::MAX);
                     sub.push(0); // NUL terminator
                     push_subchunk(&mut body, &LTXT_ID, &sub);
                 }
@@ -818,6 +856,73 @@ mod tests {
         };
         let parsed = Bext::from_bytes(&bext.to_bytes()).unwrap();
         assert_eq!(parsed.origination_date, "2026-06-25");
+    }
+
+    #[test]
+    fn latin1_text_fields_survive_a_read_write_cycle() {
+        // A bext whose fixed fields are full of non-UTF-8 bytes, the case that
+        // used to lose content: decoding turned each byte into a 3-byte U+FFFD,
+        // and encoding truncated back to the field width.
+        let mut body = vec![0u8; 602];
+        body[256..288].fill(0xFF); // originator, the full 32 bytes
+        body[288..320].copy_from_slice(&[0xE9; 32]); // originator_reference
+
+        let bext = Bext::from_bytes(&body).unwrap();
+        assert_eq!(bext.originator.chars().count(), 32);
+        assert_eq!(bext.originator_reference.chars().count(), 32);
+
+        // Byte-exact, not merely stable: the field comes back as it went in.
+        let encoded = bext.to_bytes();
+        assert_eq!(&encoded[256..288], &body[256..288]);
+        assert_eq!(&encoded[288..320], &body[288..320]);
+        assert_eq!(Bext::from_bytes(&encoded).unwrap(), bext);
+    }
+
+    #[test]
+    fn utf8_text_fields_are_decoded_as_utf8() {
+        // Valid UTF-8 is read as UTF-8 rather than as Latin-1 mojibake.
+        let mut body = vec![0u8; 602];
+        let text = "Grabación";
+        body[256..256 + text.len()].copy_from_slice(text.as_bytes());
+
+        let bext = Bext::from_bytes(&body).unwrap();
+        assert_eq!(bext.originator, text);
+        // Every character here is below U+00FF, so it is written back in the
+        // shorter Latin-1 form. That is a different byte sequence, but it
+        // decodes to the same string and can no longer overflow the field.
+        assert_eq!(Bext::from_bytes(&bext.to_bytes()).unwrap(), bext);
+    }
+
+    #[test]
+    fn text_above_latin1_stays_utf8_and_cuts_on_a_char_boundary() {
+        // Characters above U+00FF cannot be Latin-1, so the field keeps UTF-8.
+        let bext = Bext {
+            // 8 three-byte characters is 24 bytes; the date field holds 10, so
+            // only three fit. The cut must not split the fourth.
+            origination_date: "\u{20AC}".repeat(8),
+            ..Bext::new()
+        };
+        let encoded = bext.to_bytes();
+        assert_eq!(&encoded[320..329], "\u{20AC}".repeat(3).as_bytes());
+        assert_eq!(encoded[329], 0, "the odd byte left over is NUL padding");
+
+        let parsed = Bext::from_bytes(&encoded).unwrap();
+        assert_eq!(parsed.origination_date, "\u{20AC}".repeat(3));
+    }
+
+    #[test]
+    fn latin1_survives_the_variable_length_fields_too() {
+        // The same encoding is used for every text field, not just the fixed
+        // ones: INFO tags, adtl labels and the bext coding history.
+        let raw = b"caf\xe9 sessions";
+        let mut list = InfoList::new();
+        list.push(TITLE, decode_text(raw));
+        let body = list.to_bytes();
+        assert!(
+            body.windows(raw.len()).any(|w| w == raw),
+            "the original bytes should appear verbatim in the encoded chunk"
+        );
+        assert_eq!(InfoList::from_bytes(&body).unwrap(), list);
     }
 
     #[test]
