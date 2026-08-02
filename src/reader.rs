@@ -183,6 +183,46 @@ impl<R: Read + Seek> WavReader<R> {
     /// which is the way to read A-law or otherwise unmodeled audio. This is also
     /// the entry point for callers who want to wrap the data with the audioadapter
     /// byte or number adapters themselves. Returns the number of frames read.
+    ///
+    /// # Examples
+    ///
+    /// Wrapping the bytes in an adapter that converts to `f32` on access, rather
+    /// than copying them into a float buffer up front. The sample type has to
+    /// match the format of the file, so check
+    /// [`sample_format`](WavReader::sample_format) before picking it:
+    ///
+    /// ```
+    /// # use audioadapter_buffers::owned::InterleavedOwned;
+    /// # use waveadapter::{WavSpec, WavWriter};
+    /// use std::io::Cursor;
+    /// use audioadapter::Adapter;
+    /// use audioadapter_buffers::number_to_float::InterleavedNumbers;
+    /// use audioadapter_buffers::sample::I16_LE;
+    /// use waveadapter::{SampleFormat, WavReader};
+    ///
+    /// # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+    /// # let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec)?;
+    /// # writer.write_float_buffer(&InterleavedOwned::<f32>::new(0.5, 2, 128))?;
+    /// # let wav_bytes = writer.finalize()?.into_inner();
+    /// // A whole wav file held in memory; a File reads exactly the same way.
+    /// let mut reader = WavReader::new(Cursor::new(wav_bytes))?;
+    /// assert_eq!(reader.sample_format(), Some(SampleFormat::I16));
+    /// let channels = reader.channels();
+    ///
+    /// let mut bytes = Vec::new();
+    /// let frames = reader.read_raw_interleaved(1024, &mut bytes)?;
+    ///
+    /// let audio = InterleavedNumbers::<&[I16_LE], f32>::new_from_bytes(&bytes, channels, frames)
+    ///     .expect("the buffer holds exactly this many frames");
+    /// let first: f32 = audio.read_sample(0, 0).unwrap();
+    /// assert!((first - 0.5).abs() < 1e-4);
+    /// # Ok::<(), waveadapter::WavError>(())
+    /// ```
+    ///
+    /// A format this crate does not model has no matching sample type, so the
+    /// bytes are as far as this goes; decode them with whatever does understand
+    /// them, using the raw `fmt ` fields of [`params`](WavReader::params) to make
+    /// sense of the framing.
     pub fn read_raw_interleaved(&mut self, frames: usize, buf: &mut Vec<u8>) -> Result<usize> {
         let frame_bytes = self.params.frame_bytes();
         if frame_bytes == 0 {

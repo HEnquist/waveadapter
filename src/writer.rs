@@ -296,6 +296,61 @@ fn write_header(
 /// [`WavWriter::new_with_chunks`] / [`WavWriter::new_streaming_with_chunks`]) or
 /// after it (trailing chunks, via [`WavWriter::write_chunk`]), so a higher-level
 /// library can attach metadata such as `LIST`/`INFO`.
+///
+/// # Picking a constructor
+///
+/// The constructors vary along two independent axes: how the output is written
+/// (seekable RIFF, seekable RF64, or streaming), and whether the sample format
+/// is interpreted, a [`WavSpec`] giving both write paths, or passed through
+/// verbatim, a [`RawSpec`] giving only the raw byte path.
+///
+/// | Output | [`WavSpec`]: float and raw | [`RawSpec`]: raw only |
+/// |---|---|---|
+/// | Seekable, plain RIFF, up to 4 GB | [`new`](WavWriter::new) | [`new_raw`](WavWriter::new_raw) |
+/// | Seekable, RF64, no size limit | [`new_rf64`](WavWriter::new_rf64) | not available |
+/// | Streaming, no seeking needed | [`new_streaming`](WavWriter::new_streaming) | [`new_streaming_raw`](WavWriter::new_streaming_raw) |
+///
+/// Each of the five has a `_with_chunks` twin taking a `&[Chunk]` of metadata
+/// chunks to write ahead of the audio, for example
+/// [`new_with_chunks`](WavWriter::new_with_chunks). Finish a seekable writer
+/// with [`finalize`](WavWriter::finalize), which patches the size fields and
+/// hands back the inner writer, and a streaming one with
+/// [`into_inner`](WavWriter::into_inner).
+///
+/// # Examples
+///
+/// The common case, a seekable output written from a float buffer:
+///
+/// ```
+/// use std::io::Cursor;
+/// use audioadapter_buffers::owned::InterleavedOwned;
+/// use waveadapter::{SampleFormat, WavSpec, WavWriter};
+///
+/// let audio = InterleavedOwned::<f32>::new(0.0, 2, 128);
+/// let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+///
+/// let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec)?;
+/// let clipped = writer.write_float_buffer(&audio)?;
+/// let file = writer.finalize()?.into_inner();
+/// assert_eq!(&file[0..4], b"RIFF");
+/// # Ok::<(), waveadapter::WavError>(())
+/// ```
+///
+/// The same audio to an output that cannot seek, a pipe or a plain
+/// [`Vec<u8>`], where nothing can be patched afterwards, so the sizes keep
+/// their [`u32::MAX`] placeholders:
+///
+/// ```
+/// # use audioadapter_buffers::owned::InterleavedOwned;
+/// # use waveadapter::{SampleFormat, WavSpec, WavWriter};
+/// # let audio = InterleavedOwned::<f32>::new(0.0f32, 2, 128);
+/// # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+/// let mut writer = WavWriter::new_streaming(Vec::new(), spec)?;
+/// writer.write_float_buffer(&audio)?;
+/// let file = writer.into_inner()?;
+/// assert_eq!(file[4..8], u32::MAX.to_le_bytes());
+/// # Ok::<(), waveadapter::WavError>(())
+/// ```
 pub struct WavWriter<W: Write> {
     inner: W,
     spec: WriterSpec,

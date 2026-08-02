@@ -31,6 +31,60 @@
 //! let parsed = InfoList::from_chunk(&chunk).unwrap();
 //! assert_eq!(parsed.get(metadata::TITLE), Some("Demo Tone"));
 //! ```
+//!
+//! # Editing the metadata of a file
+//!
+//! The full loop ties three APIs together. Chunks come off the reader as raw
+//! blobs in [`WavParams::chunks`](crate::WavParams::chunks), get decoded and
+//! edited here, and go back through a leading-chunk constructor such as
+//! [`WavWriter::new_with_chunks`](crate::WavWriter::new_with_chunks). Chunks
+//! that are not recognized are passed along untouched, which is what keeps the
+//! metadata this crate has no types for from being dropped on the way:
+//!
+//! ```
+//! # use audioadapter_buffers::owned::InterleavedOwned;
+//! use std::io::Cursor;
+//! use waveadapter::metadata::{self, InfoList};
+//! use waveadapter::{Chunk, SampleFormat, WavReader, WavSpec, WavWriter};
+//!
+//! # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+//! # let mut demo = InfoList::new();
+//! # demo.set(metadata::TITLE, "Demo Tone");
+//! # let mut w = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &[demo.to_chunk()])?;
+//! # w.write_float_buffer(&InterleavedOwned::<f32>::new(0.0, 2, 128))?;
+//! # let wav_bytes = w.finalize()?.into_inner();
+//! // A whole wav file held in memory; a File works the same on both ends.
+//! let mut reader = WavReader::new(Cursor::new(wav_bytes))?;
+//! let audio = reader.read_all_to_float::<f32>()?;
+//!
+//! // Decode the chunk we want to edit, and keep every other one as it is.
+//! let mut info = InfoList::new();
+//! let mut chunks: Vec<Chunk> = Vec::new();
+//! for chunk in &reader.params().chunks {
+//!     match InfoList::from_chunk(chunk) {
+//!         Some(list) => info = list,
+//!         None => chunks.push(chunk.clone()),
+//!     }
+//! }
+//! info.set(metadata::SOFTWARE, "waveadapter");
+//! chunks.push(info.to_chunk());
+//!
+//! let spec = WavSpec::new(reader.channels(), reader.sample_rate(), SampleFormat::I16);
+//! let mut writer = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &chunks)?;
+//! writer.write_float_buffer(&audio)?;
+//! let output = writer.finalize()?.into_inner();
+//! # let edited = WavReader::new(Cursor::new(output))?;
+//! # let list = InfoList::from_chunk(&edited.params().chunks[0]).unwrap();
+//! # assert_eq!(list.get(metadata::TITLE), Some("Demo Tone"));
+//! # assert_eq!(list.get(metadata::SOFTWARE), Some("waveadapter"));
+//! # Ok::<(), waveadapter::WavError>(())
+//! ```
+//!
+//! Chunks can also go *after* the audio, written one at a time with
+//! [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) once all the audio
+//! is written. That is the only option for anything that depends on the final
+//! length, and the usual place for an [`AdtlList`] naming markers that were
+//! decided while recording.
 
 use crate::header::Chunk;
 
