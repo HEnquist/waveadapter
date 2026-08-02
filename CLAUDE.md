@@ -51,10 +51,11 @@ and the replay test because a separate crate cannot reach into them; keep the tw
 The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.rs` (frame loop)
 <-> `audioadapter-sample` conversion <-> caller's `Adapter`/`AdapterMut` buffer.
 
-- **`format.rs`** is the hub. `SampleFormat` enumerates the six supported on-disk formats (I16,
-  I24_3, I24_4, I32, F32, F64; all little-endian). It deliberately mirrors the byte-wrapper sample
-  types in `audioadapter_sample::sample`. `WavSpec` (channels/rate/format) is the input to the
-  writer; `WavParams` (in `header.rs`) is the output of the reader.
+- **`format.rs`** is the hub. `SampleFormat` enumerates the seven supported on-disk formats (U8,
+  I16, I24_3, I24_4, I32, F32, F64; all little-endian, and U8 unsigned as wav 8-bit PCM always is).
+  It deliberately mirrors the byte-wrapper sample types in `audioadapter_sample::sample`. `WavSpec`
+  (channels/rate/format) is the input to the writer; `WavParams` (in `header.rs`) is the output of
+  the reader.
 
 - **`dispatch.rs`** holds the `with_sample_type!` macro, the single bridge from a *value-level*
   `SampleFormat` to the *type-level* parameter required by `read_converted::<S, T>` /
@@ -101,7 +102,7 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
     Writing returns the number of clipped samples.
   - *Raw path* (`read_raw_interleaved` / `write_raw_interleaved`): moves untouched interleaved bytes
     so the caller can wrap them with audioadapter's byte/number adapters directly. The raw path also
-    handles formats this crate does not model at all (8-bit PCM, A-law/µ-law, ADPCM, exotic
+    handles formats this crate does not model at all (A-law/µ-law, ADPCM, exotic
     extensible subtypes): the parser records such a file with `WavParams::sample_format == None`
     (keeping the raw `format_code`/`bits_per_sample`/`block_align` fields), and `read_raw_interleaved`
     frames the bytes off `WavParams::frame_bytes()` (which falls back to `block_align` when the format
@@ -173,7 +174,7 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 - WAV data is always little-endian; only LE sample types are wired up. Don't add big-endian
   variants without a matching audioadapter sample type.
 - The reader stops at the last whole frame: a partial trailing frame is dropped, not errored.
-- Unsupported-but-valid files (e.g. 8-bit PCM, which audioadapter has no sample type for) must never
+- Unsupported-but-valid files (e.g. A-law, which audioadapter has no sample type for) must never
   panic. They parse with `sample_format == None` and are readable through the raw path; only the
   *float* path rejects them with a `WavError::UnsupportedFormat`. The `wav_variants` test enforces
   both: that the float path errors and that the raw path still yields the bytes.

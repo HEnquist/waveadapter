@@ -180,7 +180,7 @@ impl<R: Read + Seek> WavReader<R> {
     /// The bytes are exactly as stored in the file, so each frame is
     /// [`WavParams::frame_bytes`] bytes. This works for any file, including ones
     /// whose format is unsupported by the float path (`sample_format` is `None`),
-    /// which is the way to read 8-bit or otherwise unmodeled audio. This is also
+    /// which is the way to read A-law or otherwise unmodeled audio. This is also
     /// the entry point for callers who want to wrap the data with the audioadapter
     /// byte or number adapters themselves. Returns the number of frames read.
     pub fn read_raw_interleaved(&mut self, frames: usize, buf: &mut Vec<u8>) -> Result<usize> {

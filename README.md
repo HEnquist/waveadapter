@@ -19,9 +19,9 @@ audioadapter adapters directly.
   formats (the float formats keep their headroom and never clip).
 - **Raw byte passthrough**: move the interleaved sample bytes untouched, to wrap with the
   audioadapter byte/number adapters yourself, or to handle formats this crate does not model.
-- **Wide format coverage**: 16-, 24- (both 3-byte packed and 4-byte left-justified), and 32-bit
-  integer PCM, plus 32- and 64-bit IEEE float.
-- **Any container, even unmodeled formats**: 8-bit PCM, A-law/µ-law, ADPCM and exotic
+- **Wide format coverage**: 8- (unsigned), 16-, 24- (both 3-byte packed and 4-byte left-justified),
+  and 32-bit integer PCM, plus 32- and 64-bit IEEE float.
+- **Any container, even unmodeled formats**: A-law/µ-law, ADPCM and exotic
   `WAVEFORMATEXTENSIBLE` subtypes round-trip as raw bytes, so the crate is a complete WAV container
   library, not just the formats it can decode.
 - **Plain and extensible headers**: reads and writes both `WAVEFORMAT`/`WAVEFORMATEX` and
@@ -45,12 +45,16 @@ audioadapter byte-wrapper sample types.
 
 | `SampleFormat` | Wav format | Bits | Bytes |
 | -------------- | ---------- | ---- | ----- |
+| `U8`           | PCM (unsigned) | 8 | 1  |
 | `I16`          | PCM        | 16   | 2     |
 | `I24_3`        | PCM        | 24   | 3 (packed) |
 | `I24_4`        | PCM        | 24   | 4 (left justified) |
 | `I32`          | PCM        | 32   | 4     |
 | `F32`          | IEEE float | 32   | 4     |
 | `F64`          | IEEE float | 64   | 8     |
+
+`U8` is the odd one out: wav 8-bit PCM is unsigned and centered at 128, while every deeper integer
+depth is signed. The conversion handles that, so `0` reads back as -1.0 and `255` as +1.0.
 
 Both plain `WAVEFORMAT`/`WAVEFORMATEX` and extended `WAVEFORMATEXTENSIBLE` headers are parsed.
 

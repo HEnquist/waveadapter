@@ -68,6 +68,24 @@ def fmt_pcm(channels=1, sample_rate=SAMPLE_RATE, bits_per_sample=16, fmt_size=16
     return chunk(b"fmt ", data)
 
 
+def fmt_mulaw(channels=1, sample_rate=SAMPLE_RATE):
+    """Mu-law fmt chunk (format tag 7). One byte per sample, but the bytes are
+    companded, so this crate does not model the format at all."""
+    block_align = channels
+    byte_rate = sample_rate * block_align
+    data = struct.pack(
+        "<HHIIHH",
+        7,  # WAVE_FORMAT_MULAW
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        8,
+    )
+    data += struct.pack("<H", 0)  # cbSize = 0, mu-law uses the 18-byte form
+    return chunk(b"fmt ", data)
+
+
 def fmt_pcm_padded24(channels=1, sample_rate=SAMPLE_RATE):
     """24-bit samples stored in 4-byte (padded) containers. block_align
     reflects the *actual* on-disk byte width (4), not the bit depth (24)."""
@@ -465,6 +483,29 @@ def case_mono_8bit_unsigned():
     return riff(b"WAVE", f + d)
 
 
+def case_extensible_8bit():
+    """8-bit unsigned PCM in the extensible form, the only place the strict
+    spec says a channel mask can live."""
+    f = fmt_extensible(channels=2, bits_per_sample=8, valid_bits_per_sample=8,
+                       channel_mask=0x3, sub_format=KSDATAFORMAT_SUBTYPE_PCM)
+    # An unsigned ramp per channel, one rising and one falling around the
+    # 128 center point (pcm_ramp_data only makes a rising unsigned ramp).
+    payload = bytearray()
+    for frame in range(NUM_FRAMES):
+        step = int(127 * frame / (NUM_FRAMES - 1))
+        payload += bytes([128 + step, 128 - step])
+    d = data_chunk(bytes(payload))
+    return riff(b"WAVE", f + d)
+
+
+def case_mulaw_mono():
+    """Mu-law (format tag 7): a valid format with no audioadapter sample type,
+    so it parses but stays uninterpreted and is readable only as raw bytes."""
+    f = fmt_mulaw(channels=1)
+    d = data_chunk(bytes(range(NUM_FRAMES)))
+    return riff(b"WAVE", f + d)
+
+
 def case_huge_channel_count():
     """Unusual but spec-legal high channel count (e.g. ambisonics/array
     mics), exercises any hardcoded mono/stereo/5.1 assumptions."""
@@ -560,6 +601,8 @@ CASES = {
     "zero_length_data": case_zero_length_data,
     "multiple_data_chunks": case_multiple_data_chunks,
     "mono_8bit_unsigned": case_mono_8bit_unsigned,
+    "extensible_8bit": case_extensible_8bit,
+    "mulaw_mono": case_mulaw_mono,
     "huge_channel_count": case_huge_channel_count,
     "empty_riff_no_data_chunk": case_empty_riff_no_data_chunk,
     "rf64_16bit_stereo": case_rf64_16bit_stereo,

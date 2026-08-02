@@ -67,13 +67,13 @@ fn parse_header(data: &[u8]) {
 
 /// Mirrors `fuzz_targets/read_audio.rs`.
 fn read_audio(data: &[u8]) {
-    if let Ok(mut reader) = WavReader::new(Cursor::new(data)) {
-        if reader.read_all_to_float::<f32>().is_ok() {
-            assert!(
-                reader.position() <= reader.frames(),
-                "reading past the declared frame count"
-            );
-        }
+    if let Ok(mut reader) = WavReader::new(Cursor::new(data))
+        && reader.read_all_to_float::<f32>().is_ok()
+    {
+        assert!(
+            reader.position() <= reader.frames(),
+            "reading past the declared frame count"
+        );
     }
 
     if let Ok(mut reader) = WavReader::new(Cursor::new(data)) {

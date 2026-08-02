@@ -12,6 +12,11 @@ use crate::dispatch::with_sample_type;
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
+    /// Unsigned integer, 8 bits in 1 byte, centered at 128.
+    ///
+    /// Wav 8-bit PCM is unsigned, unlike every deeper integer depth. A stored
+    /// `0` is -1.0 and `255` is +1.0.
+    U8,
     /// Signed integer, 16 bits in 2 bytes.
     I16,
     /// Signed integer, 24 bits in 3 bytes (packed).
@@ -30,6 +35,7 @@ impl SampleFormat {
     /// The number of significant bits per sample, as stored in the wav `fmt ` chunk.
     pub fn bits_per_sample(&self) -> usize {
         match self {
+            SampleFormat::U8 => 8,
             SampleFormat::I16 => 16,
             SampleFormat::I24_3 => 24,
             SampleFormat::I24_4 => 24,
@@ -101,7 +107,7 @@ impl WavSpec {
 ///
 /// This is the write-side counterpart to a [`WavParams`](crate::WavParams) whose
 /// `sample_format` is `None`: it lets a caller emit a container for a format this
-/// crate does not model (8-bit PCM, A-law/µ-law, ADPCM, an exotic
+/// crate does not model (A-law/µ-law, ADPCM, an exotic
 /// `WAVEFORMATEXTENSIBLE` subtype, ...) and then push the audio through
 /// [`WavWriter::write_raw_interleaved`](crate::WavWriter::write_raw_interleaved).
 /// The float write path is not available for a raw writer.

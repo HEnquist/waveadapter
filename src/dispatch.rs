@@ -12,6 +12,10 @@ macro_rules! with_sample_type {
         use audioadapter_sample::sample::*;
         use $crate::format::SampleFormat;
         match $fmt {
+            SampleFormat::U8 => {
+                type $alias = U8;
+                $body
+            }
             SampleFormat::I16 => {
                 type $alias = I16_LE;
                 $body

@@ -40,3 +40,26 @@ jobs:
             git diff -- tests/wav_variants >&2
             exit 1
           fi
+
+  msrv:
+    name: Check MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      # Taken from Cargo.toml so the declared MSRV is the one that gets tested.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "Declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Run cargo check
+        run: cargo check --all-targets

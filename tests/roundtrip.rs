@@ -62,6 +62,7 @@ fn roundtrip(format: SampleFormat, tolerance: f32) {
 #[test]
 fn roundtrip_all_formats() {
     // Integer formats lose precision according to their bit depth.
+    roundtrip(SampleFormat::U8, 1.0 / 127.0 * 2.0);
     roundtrip(SampleFormat::I16, 1.0 / 32767.0 * 2.0);
     roundtrip(SampleFormat::I24_3, 1.0 / 8_388_607.0 * 2.0);
     roundtrip(SampleFormat::I24_4, 1.0 / 8_388_607.0 * 2.0);
@@ -262,6 +263,97 @@ fn writes_multichannel_as_extensible() {
     let restored = reader.read_all_to_float::<f32>().unwrap();
     assert_eq!(restored.frames(), frames);
     let tolerance = 1.0 / 32_767.0 * 2.0;
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert!(
+                (a - b).abs() <= tolerance,
+                "frame {frame} ch {ch}: {a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn writes_8bit_as_unsigned_centered_at_128() {
+    // Wav 8-bit PCM is unsigned, unlike every deeper depth, so check the bytes
+    // that land on disk rather than only the float roundtrip.
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 8000,
+        sample_format: SampleFormat::U8,
+        channel_mask: None,
+    };
+    let mut source = InterleavedOwned::<f32>::new(0.0, 1, 3);
+    source.write_sample(0, 0, &-1.0);
+    source.write_sample(0, 1, &0.0);
+    source.write_sample(0, 2, &1.0);
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    // +1.0 clips to 255, the same asymmetry the signed formats have at +1.0.
+    assert_eq!(
+        writer.write_float_buffer(&source).unwrap(),
+        1,
+        "the +1.0 sample clips"
+    );
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    // Plain 16-byte fmt, no fact chunk: 8-bit PCM is unambiguous.
+    assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 1, "format tag");
+    assert_eq!(u16::from_le_bytes([bytes[32], bytes[33]]), 1, "block align");
+    assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 8, "bit depth");
+    assert_eq!(&bytes[36..40], b"data");
+    assert_eq!(&bytes[44..47], &[0, 128, 255], "unsigned, centered at 128");
+
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), Some(SampleFormat::U8));
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.read_sample(0, 0).unwrap(), -1.0);
+    assert_eq!(restored.read_sample(0, 1).unwrap(), 0.0);
+    assert_eq!(restored.read_sample(0, 2).unwrap(), 127.0 / 128.0);
+}
+
+#[test]
+fn writes_multichannel_8bit_as_extensible() {
+    // More than two channels forces the extensible form, so the 8-bit subformat
+    // has to survive the GUID round trip too.
+    let channels = 4;
+    let frames = 8;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 22050,
+        sample_format: SampleFormat::U8,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    assert_eq!(
+        u16::from_le_bytes([bytes[20], bytes[21]]),
+        0xFFFE,
+        "format tag is WAVE_FORMAT_EXTENSIBLE"
+    );
+    assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 8, "bit depth");
+    assert_eq!(
+        u16::from_le_bytes([bytes[38], bytes[39]]),
+        8,
+        "wValidBitsPerSample"
+    );
+
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), Some(SampleFormat::U8));
+    assert_eq!(reader.channels(), channels);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    let tolerance = 1.0 / 127.0 * 2.0;
     for frame in 0..frames {
         for ch in 0..channels {
             let a = source.read_sample(ch, frame).unwrap();
@@ -519,10 +611,10 @@ fn bw64_is_read_like_rf64() {
 
 #[test]
 fn raw_writer_roundtrips_an_unmodeled_format() {
-    // 8-bit unsigned PCM: a valid format this crate does not model. Two channels,
-    // so one frame is two bytes.
+    // Mu-law: a valid format this crate does not model. Two channels, so one
+    // frame is two bytes.
     let spec = RawSpec {
-        format_code: 1,
+        format_code: 7,
         channels: 2,
         sample_rate: 22050,
         bits_per_sample: 8,
@@ -541,7 +633,7 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
     assert_eq!(reader.sample_format(), None);
     assert_eq!(reader.channels(), 2);
     assert_eq!(reader.sample_rate(), 22050);
-    assert_eq!(reader.params().format_code, 1);
+    assert_eq!(reader.params().format_code, 7);
     assert_eq!(reader.params().bits_per_sample, 8);
     assert_eq!(reader.params().block_align, 2);
     assert_eq!(reader.frames(), 16);
@@ -559,7 +651,7 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
 #[test]
 fn float_read_on_raw_format_errors() {
     let spec = RawSpec {
-        format_code: 1,
+        format_code: 7,
         channels: 1,
         sample_rate: 8000,
         bits_per_sample: 8,
@@ -583,7 +675,7 @@ fn float_read_on_raw_format_errors() {
 #[test]
 fn float_write_on_raw_writer_errors() {
     let spec = RawSpec {
-        format_code: 1,
+        format_code: 7,
         channels: 1,
         sample_rate: 8000,
         bits_per_sample: 8,
