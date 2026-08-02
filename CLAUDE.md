@@ -115,7 +115,16 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `WavWriter::seek_to_frame` (in the `Write + Seek` impl) repositions the write cursor to overwrite
   already-written audio; the writer tracks the current cursor (`data_pos`) separately from the
   furthest extent reached (`data_bytes`, the declared `data` size), so seeking backwards and
-  rewriting never shrinks the file.
+  rewriting never shrinks the file. Seeking *forward* past the extent writes the gap out as zeros
+  right there, rather than leaving it to whatever the inner writer does with a seek past the end, so
+  skipping ahead means silence and the file grows to the target even if nothing follows.
+
+  Both numbers are exposed in frames, mirroring the reader: `frames_written` (extent) and `position`
+  (cursor), alongside the byte-level `data_bytes` and `data_offset` (where the audio starts, the
+  write-side `WavParams::data_offset`). `remaining_frames` reports the room left before the 4 GB
+  plain-RIFF ceiling from the cursor, and is `None` wherever no ceiling applies (streaming, RF64, a
+  `RawSpec` with zero block alignment). It shares the budget with the eager `check_capacity` guard,
+  both going through `check_extent`.
 
   Metadata chunks pass through as opaque blobs: read them from `WavReader::params().chunks`, and
   write them as *leading* chunks (before `data`, via `WavWriter::new_with_chunks` /

@@ -340,8 +340,86 @@ impl<W: Write> WavWriter<W> {
     }
 
     /// The number of audio data bytes written so far.
+    ///
+    /// This is the furthest extent reached, the value that becomes the declared
+    /// `data` chunk size. See [`frames_written`](WavWriter::frames_written) for
+    /// the same number in frames, and [`position`](WavWriter::position) for where
+    /// the write cursor currently is.
     pub fn data_bytes(&self) -> u64 {
         self.data_bytes
+    }
+
+    /// The absolute byte offset in the output where the audio data starts.
+    ///
+    /// This is the size of everything written before the audio: the RIFF/RF64
+    /// header, the `fmt ` chunk, any `fact` or `ds64` chunk, the leading metadata
+    /// chunks and the `data` chunk header. It mirrors
+    /// [`WavParams::data_offset`](crate::WavParams::data_offset) on the read side.
+    pub fn data_offset(&self) -> u64 {
+        self.layout.header_len
+    }
+
+    /// The number of frames written, counted to the furthest extent reached.
+    ///
+    /// After a backwards [`seek_to_frame`](WavWriter::seek_to_frame) this stays at
+    /// the high-water mark, since overwriting does not shrink the file. A partial
+    /// trailing frame, only possible through
+    /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved), is not counted.
+    /// Zero if the frame size is unknown (a [`RawSpec`] with a zero block
+    /// alignment).
+    pub fn frames_written(&self) -> usize {
+        self.frames_at(self.data_bytes)
+    }
+
+    /// The current write position, in frames from the start of the audio data.
+    ///
+    /// Equal to [`frames_written`](WavWriter::frames_written) for append-only
+    /// writing; the two differ once [`seek_to_frame`](WavWriter::seek_to_frame) has
+    /// moved the cursor back. Mirrors [`WavReader::position`](crate::WavReader::position).
+    pub fn position(&self) -> usize {
+        self.frames_at(self.data_pos)
+    }
+
+    /// The number of frames that can still be written before the 4 GB size limit
+    /// of plain RIFF, or `None` when no limit applies.
+    ///
+    /// The limit only exists for a seekable RIFF writer, the one case where
+    /// [`finalize`](WavWriter::finalize) has to fit the real lengths into the
+    /// 32-bit size fields. A streaming writer never patches them and RF64 has
+    /// 64-bit fields, so both return `None`, as does a [`RawSpec`] writer with a
+    /// zero block alignment, where frames have no size.
+    ///
+    /// The room left is counted from the current write position, and assumes no
+    /// further trailing chunks: every byte a later
+    /// [`write_chunk`](WavWriter::write_chunk) adds comes out of this budget.
+    /// Once a trailing chunk has been written the answer is `Some(0)`, since no
+    /// more audio can follow it.
+    pub fn remaining_frames(&self) -> Option<usize> {
+        if !self.seekable || !matches!(self.layout.sizes, SizeFields::Riff { .. }) {
+            return None;
+        }
+        let frame_bytes = self.spec.frame_bytes() as u64;
+        if frame_bytes == 0 {
+            return None;
+        }
+        if self.trailing_bytes != 0 {
+            return Some(0);
+        }
+        // The largest data extent that still fits, the same budget `check_capacity`
+        // enforces, counted from the cursor since that is where a write lands.
+        let ceiling =
+            (u32::MAX as u64 + 8).saturating_sub(self.layout.header_len + self.trailing_bytes);
+        let bytes = ceiling.saturating_sub(self.data_pos);
+        Some(usize::try_from(bytes / frame_bytes).unwrap_or(usize::MAX))
+    }
+
+    /// Whole frames covered by `bytes` of audio data, zero if the frame size is
+    /// unknown.
+    fn frames_at(&self, bytes: u64) -> usize {
+        let frames = bytes
+            .checked_div(self.spec.frame_bytes() as u64)
+            .unwrap_or(0);
+        usize::try_from(frames).unwrap_or(usize::MAX)
     }
 
     /// Write all frames of a floating point buffer, converting to the file's
@@ -414,6 +492,22 @@ impl<W: Write> WavWriter<W> {
         self.data_bytes = self.data_bytes.max(self.data_pos);
     }
 
+    /// Write `count` zero bytes at the current position, as audio data.
+    ///
+    /// Used to fill the gap left by a forward seek. Callers must have checked the
+    /// capacity first.
+    fn write_zeros(&mut self, count: u64) -> Result<()> {
+        const ZEROS: [u8; 8192] = [0; 8192];
+        let mut left = count;
+        while left > 0 {
+            let chunk = left.min(ZEROS.len() as u64) as usize;
+            self.inner.write_all(&ZEROS[..chunk])?;
+            left -= chunk as u64;
+        }
+        self.advance(count);
+        Ok(())
+    }
+
     /// Write a metadata chunk after the audio data.
     ///
     /// Call this once all audio data has been written; afterwards no more audio
@@ -450,10 +544,14 @@ impl<W: Write> WavWriter<W> {
     /// This only applies to seekable RIFF output: streaming RIFF deliberately
     /// leaves the size fields at [`u32::MAX`], and RF64 has no such limit.
     fn check_capacity(&self, additional: u64) -> Result<()> {
+        // The write may land before the current end (after a backwards seek),
+        // so size against whichever extent is larger.
+        self.check_extent(self.data_bytes.max(self.data_pos + additional))
+    }
+
+    /// Reject a data extent that a seekable RIFF file could not describe.
+    fn check_extent(&self, extent: u64) -> Result<()> {
         if self.seekable && matches!(self.layout.sizes, SizeFields::Riff { .. }) {
-            // The write may land before the current end (after a backwards seek),
-            // so size against whichever extent is larger.
-            let extent = self.data_bytes.max(self.data_pos + additional);
             let projected = self.layout.header_len + extent + self.trailing_bytes;
             if projected.saturating_sub(8) > u32::MAX as u64 {
                 return Err(WavError::InvalidSpec(
@@ -572,13 +670,17 @@ impl<W: Write + Seek> WavWriter<W> {
     /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved) overwrites the
     /// audio from there. Seeking backwards and overwriting does not shrink the
     /// file: the declared `data` size still covers the furthest point reached, so
-    /// data beyond the rewritten region is preserved. Seeking past the current end
-    /// and writing leaves the bytes in between undefined (whatever the underlying
-    /// stream produces for the gap).
+    /// data beyond the rewritten region is preserved.
+    ///
+    /// Seeking past the current end fills the gap with zeros, so skipping ahead
+    /// leaves silence rather than undefined bytes. The zeros are written straight
+    /// away and count as audio data, so the file grows to the seek target even if
+    /// nothing is written afterwards.
     ///
     /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
     /// trailing chunk has already been written, since audio data must precede
-    /// trailing chunks.
+    /// trailing chunks, or if the target lies beyond the 4 GB limit of a seekable
+    /// RIFF file.
     pub fn seek_to_frame(&mut self, frame: usize) -> Result<()> {
         self.ensure_data_open()?;
         let frame_bytes = self.spec.frame_bytes() as u64;
@@ -587,10 +689,23 @@ impl<W: Write + Seek> WavWriter<W> {
                 "cannot seek: frame size is zero".to_string(),
             ));
         }
-        let offset = frame_bytes * frame as u64;
-        self.inner
-            .seek(SeekFrom::Start(self.layout.header_len + offset))?;
-        self.data_pos = offset;
+        let offset = frame_bytes
+            .checked_mul(frame as u64)
+            .ok_or_else(|| WavError::InvalidSpec("seek target overflows".to_string()))?;
+        if offset > self.data_bytes {
+            // Past the end: fill the gap with silence from the current extent, so
+            // the skipped region has defined contents whatever the inner writer
+            // does with a seek beyond the end of the stream.
+            self.check_extent(offset)?;
+            self.inner
+                .seek(SeekFrom::Start(self.layout.header_len + self.data_bytes))?;
+            self.data_pos = self.data_bytes;
+            self.write_zeros(offset - self.data_bytes)?;
+        } else {
+            self.inner
+                .seek(SeekFrom::Start(self.layout.header_len + offset))?;
+            self.data_pos = offset;
+        }
         Ok(())
     }
 
