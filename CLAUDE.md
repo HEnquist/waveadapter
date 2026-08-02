@@ -14,9 +14,10 @@ of crates. It does not implement sample conversion itself: the byte<->number con
 
 ```bash
 cargo build
-cargo test                          # runs both test binaries plus doctests
+cargo test                          # runs every test binary plus doctests
 cargo test --test wav_variants      # header-parsing fixtures (one binary)
 cargo test --test roundtrip         # write-then-read roundtrips
+cargo test --test metadata_roundtrip # typed metadata chunks through writer and reader
 cargo test read_baseline_16bit      # run a single test by name substring
 cargo run --example read_float      # examples in examples/ (read_float, read_raw, read_list, write_float, write_raw)
 cargo clippy
@@ -167,7 +168,8 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 
   Everything else (`iXML`, ...) stays a raw blob for a higher-level crate; adding another
   typed chunk means following the same `from_*`/`to_*` shape here, plus an idempotence check in the
-  `metadata_chunks` fuzz target and its `fuzz_replay.rs` mirror.
+  `metadata_chunks` fuzz target and its `fuzz_replay.rs` mirror, and a pass through the writer in
+  `tests/metadata_roundtrip.rs`.
 
 - **`highlevel.rs`** holds the two path-based one-call helpers for callers who do not need the
   full reader/writer: `read_wav_file::<T, _>(path)` opens a file and reads everything into a
