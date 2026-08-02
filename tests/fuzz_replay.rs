@@ -18,7 +18,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use waveadapter::{AdtlList, Bext, Cue, InfoList, WavReader};
+use waveadapter::{AdtlList, Bext, Cue, InfoList, Smpl, WavReader};
 
 const MAX_RAW_FRAMES: usize = 4096;
 
@@ -121,6 +121,11 @@ fn metadata_chunks(data: &[u8]) {
         let again = AdtlList::from_bytes(&adtl.to_bytes())
             .expect("re-decoding an AdtlList's own output must succeed");
         assert_eq!(adtl, again, "AdtlList encode/decode is not idempotent");
+    }
+    if let Some(smpl) = Smpl::from_bytes(data) {
+        let again = Smpl::from_bytes(&smpl.to_bytes())
+            .expect("re-decoding a Smpl's own output must succeed");
+        assert_eq!(smpl, again, "Smpl encode/decode is not idempotent");
     }
 }
 

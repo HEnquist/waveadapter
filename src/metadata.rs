@@ -3,8 +3,9 @@
 //! waveadapter passes every non-audio chunk through as a raw [`Chunk`] blob.
 //! This module is a thin typed layer over those blobs for the common cases:
 //! [`InfoList`] (the `LIST`/`INFO` tag list), [`Bext`] (the Broadcast Audio
-//! Extension), and the marker pair [`Cue`] (the `cue ` chunk) plus
-//! [`AdtlList`] (the `LIST`/`adtl` labels that name those markers). Each offers
+//! Extension), the marker pair [`Cue`] (the `cue ` chunk) plus
+//! [`AdtlList`] (the `LIST`/`adtl` labels that name those markers), and
+//! [`Smpl`] (the `smpl` sampler chunk with its loop points). Each offers
 //! `from_chunk`/`from_bytes` to decode and `to_chunk`/`to_bytes` to build one
 //! ready for [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) or a
 //! leading-chunk constructor. Anything else stays a raw blob for a caller to
@@ -715,6 +716,218 @@ impl AdtlList {
     }
 }
 
+/// The four-character id of the sampler chunk.
+pub const SMPL_ID: [u8; 4] = *b"smpl";
+
+/// Loop type: play forward from start to end, then jump back to start.
+pub const LOOP_FORWARD: u32 = 0;
+/// Loop type: alternate between forward and backward playback (ping-pong).
+pub const LOOP_ALTERNATING: u32 = 1;
+/// Loop type: play backward from end to start.
+pub const LOOP_BACKWARD: u32 = 2;
+
+/// The size of the fixed part of a `smpl` chunk, before the loops.
+const SMPL_FIXED_LEN: usize = 36;
+
+/// The number of bytes a single sample loop occupies on disk.
+const SAMPLE_LOOP_LEN: usize = 24;
+
+/// One loop region in a [`Smpl`] chunk.
+///
+/// The loop runs from [`start`](SampleLoop::start) to [`end`](SampleLoop::end),
+/// both frame positions in the `data` chunk, with `end` being the last frame
+/// played before jumping back. Use [`SampleLoop::forward`] for the common case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleLoop {
+    /// Identifier, tying the loop to a [`CuePoint::id`] when one names it.
+    pub cue_id: u32,
+    /// How the loop plays: [`LOOP_FORWARD`], [`LOOP_ALTERNATING`],
+    /// [`LOOP_BACKWARD`], or a value of 32 and up for a sampler-specific type.
+    pub loop_type: u32,
+    /// First frame of the loop.
+    pub start: u32,
+    /// Last frame of the loop, played before jumping back to `start`.
+    pub end: u32,
+    /// Fractional adjustment of the loop end, in 1/2^32 of a frame (`0` if
+    /// unused).
+    pub fraction: u32,
+    /// How many times to play the loop, `0` meaning forever.
+    pub play_count: u32,
+}
+
+impl SampleLoop {
+    /// Build a forward loop over the frames `start..=end`, repeating forever,
+    /// with the given `cue_id`.
+    pub fn forward(cue_id: u32, start: u32, end: u32) -> Self {
+        Self {
+            cue_id,
+            loop_type: LOOP_FORWARD,
+            start,
+            end,
+            fraction: 0,
+            play_count: 0,
+        }
+    }
+}
+
+/// A parsed `smpl` chunk: the sampler information, above all the loop points and
+/// the note the recording sounds at.
+///
+/// This is what a sampler or software instrument reads to play a one-shot
+/// recording as a pitched, sustaining instrument: [`midi_unity_note`](Smpl::midi_unity_note)
+/// says which note it was recorded at, and [`loops`](Smpl::loops) says which part
+/// to repeat while the key is held.
+///
+/// The fields are public so they can be read and modified directly. The manufacturer
+/// and product codes, the SMPTE fields and [`sampler_data`](Smpl::sampler_data)
+/// are stored, not interpreted, so a file round-trips without loss.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Smpl {
+    /// MMA manufacturer code of the target sampler (`0` if unspecified).
+    pub manufacturer: u32,
+    /// Manufacturer-defined product code of the target sampler (`0` if
+    /// unspecified).
+    pub product: u32,
+    /// Duration of one frame in nanoseconds, conventionally
+    /// `1_000_000_000 / sample_rate`.
+    pub sample_period: u32,
+    /// MIDI note number the recording sounds at, 0-127 (60 is middle C).
+    pub midi_unity_note: u32,
+    /// Fraction of a semitone to detune by, in 1/2^32 of a semitone (`0` if
+    /// unused).
+    pub midi_pitch_fraction: u32,
+    /// SMPTE format of [`smpte_offset`](Smpl::smpte_offset): 0 (none), 24, 25,
+    /// 29 or 30 frames per second.
+    pub smpte_format: u32,
+    /// SMPTE time offset of the first frame, as packed hours/minutes/seconds/
+    /// frames bytes (`0` if unused).
+    pub smpte_offset: u32,
+    /// The loop regions, in file order.
+    pub loops: Vec<SampleLoop>,
+    /// Sampler-specific trailing bytes, passed through untouched.
+    pub sampler_data: Vec<u8>,
+}
+
+impl Smpl {
+    /// Create a `smpl` with all fields zeroed and no loops.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a `smpl` for a recording at `sample_rate`, filling in the matching
+    /// [`sample_period`](Smpl::sample_period) and a unity note of 60 (middle C).
+    pub fn at_rate(sample_rate: u32) -> Self {
+        Self {
+            sample_period: if sample_rate == 0 {
+                0
+            } else {
+                (1_000_000_000u64 / sample_rate as u64) as u32
+            },
+            midi_unity_note: 60,
+            ..Self::default()
+        }
+    }
+
+    /// Decode a `smpl` chunk body: the fixed 36-byte structure, that many
+    /// 24-byte loops, and the sampler-specific trailing bytes.
+    ///
+    /// Returns `None` if the body is shorter than the fixed structure. Parsing is
+    /// otherwise lenient: loops and sampler data beyond what the body actually
+    /// holds are dropped rather than erroring.
+    pub fn from_bytes(body: &[u8]) -> Option<Self> {
+        if body.len() < SMPL_FIXED_LEN {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+
+        let loop_count = u32_at(28) as usize;
+        let sampler_data_len = u32_at(32) as usize;
+        let mut loops = Vec::new();
+        let mut pos = SMPL_FIXED_LEN;
+        for _ in 0..loop_count {
+            if pos + SAMPLE_LOOP_LEN > body.len() {
+                break; // truncated, stop rather than read past the end
+            }
+            loops.push(SampleLoop {
+                cue_id: u32_at(pos),
+                loop_type: u32_at(pos + 4),
+                start: u32_at(pos + 8),
+                end: u32_at(pos + 12),
+                fraction: u32_at(pos + 16),
+                play_count: u32_at(pos + 20),
+            });
+            pos += SAMPLE_LOOP_LEN;
+        }
+        // Take as much of the declared sampler data as is actually there.
+        let available = body.len() - pos;
+        let sampler_data = body[pos..pos + sampler_data_len.min(available)].to_vec();
+
+        Some(Self {
+            manufacturer: u32_at(0),
+            product: u32_at(4),
+            sample_period: u32_at(8),
+            midi_unity_note: u32_at(12),
+            midi_pitch_fraction: u32_at(16),
+            smpte_format: u32_at(20),
+            smpte_offset: u32_at(24),
+            loops,
+            sampler_data,
+        })
+    }
+
+    /// Decode a `smpl` from a parsed [`Chunk`]. Returns `None` if the chunk is
+    /// not a `smpl` chunk.
+    pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
+        if chunk.id != SMPL_ID {
+            return None;
+        }
+        Self::from_bytes(&chunk.data)
+    }
+
+    /// Encode the `smpl` chunk body: the fixed structure, the loops, and the
+    /// sampler-specific bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(
+            SMPL_FIXED_LEN + self.loops.len() * SAMPLE_LOOP_LEN + self.sampler_data.len(),
+        );
+        for field in [
+            self.manufacturer,
+            self.product,
+            self.sample_period,
+            self.midi_unity_note,
+            self.midi_pitch_fraction,
+            self.smpte_format,
+            self.smpte_offset,
+            self.loops.len() as u32,
+            self.sampler_data.len() as u32,
+        ] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        for l in &self.loops {
+            for field in [
+                l.cue_id,
+                l.loop_type,
+                l.start,
+                l.end,
+                l.fraction,
+                l.play_count,
+            ] {
+                body.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        body.extend_from_slice(&self.sampler_data);
+        body
+    }
+
+    /// Build a `smpl` [`Chunk`] ready to hand to the writer.
+    pub fn to_chunk(&self) -> Chunk {
+        Chunk {
+            id: SMPL_ID,
+            data: self.to_bytes(),
+        }
+    }
+}
+
 /// Append a sub-chunk (4-byte id, 32-bit size, body, even-length pad byte).
 fn push_subchunk(body: &mut Vec<u8>, id: &[u8; 4], data: &[u8]) {
     body.extend_from_slice(id);
@@ -1034,5 +1247,74 @@ mod tests {
         });
         let adtl = AdtlList::from_bytes(&body).unwrap();
         assert_eq!(adtl.entries.len(), 2);
+    }
+
+    #[test]
+    fn smpl_roundtrips_through_chunk() {
+        let smpl = Smpl {
+            manufacturer: 0x4B,
+            product: 7,
+            midi_pitch_fraction: 0x8000_0000,
+            smpte_format: 25,
+            smpte_offset: 0x01_02_03_04,
+            loops: vec![
+                SampleLoop::forward(1, 0, 47_999),
+                // A non-default loop exercises every field.
+                SampleLoop {
+                    cue_id: 2,
+                    loop_type: LOOP_ALTERNATING,
+                    start: 100,
+                    end: 200,
+                    fraction: 42,
+                    play_count: 3,
+                },
+            ],
+            sampler_data: vec![0xAA, 0xBB, 0xCC],
+            ..Smpl::at_rate(48_000)
+        };
+        assert_eq!(smpl.sample_period, 20833);
+        assert_eq!(smpl.midi_unity_note, 60);
+
+        let chunk = smpl.to_chunk();
+        assert_eq!(&chunk.id, b"smpl");
+        // The loop count and sampler-data length close the fixed part.
+        assert_eq!(&chunk.data[28..32], &2u32.to_le_bytes());
+        assert_eq!(&chunk.data[32..36], &3u32.to_le_bytes());
+        assert_eq!(chunk.data.len(), SMPL_FIXED_LEN + 2 * SAMPLE_LOOP_LEN + 3);
+        assert_eq!(Smpl::from_chunk(&chunk), Some(smpl));
+    }
+
+    #[test]
+    fn smpl_drops_truncated_loops_and_sampler_data() {
+        // Claims 4 loops and 16 bytes of sampler data, but holds one loop and
+        // 2 trailing bytes.
+        let mut body = vec![0u8; SMPL_FIXED_LEN];
+        body[28..32].copy_from_slice(&4u32.to_le_bytes());
+        body[32..36].copy_from_slice(&16u32.to_le_bytes());
+        body.resize(SMPL_FIXED_LEN + SAMPLE_LOOP_LEN, 0);
+        body[SMPL_FIXED_LEN..SMPL_FIXED_LEN + 4].copy_from_slice(&9u32.to_le_bytes());
+        body.extend_from_slice(&[1, 2]);
+
+        let smpl = Smpl::from_bytes(&body).unwrap();
+        assert_eq!(smpl.loops.len(), 1);
+        assert_eq!(smpl.loops[0].cue_id, 9);
+        assert_eq!(smpl.sampler_data, vec![1, 2]);
+        // The counts are rewritten from what survived, so a second pass is stable.
+        assert_eq!(Smpl::from_bytes(&smpl.to_bytes()), Some(smpl));
+    }
+
+    #[test]
+    fn smpl_rejects_short_and_wrong_chunk() {
+        assert!(Smpl::from_bytes(&[0u8; SMPL_FIXED_LEN - 1]).is_none());
+        let not_smpl = Chunk {
+            id: *b"cue ",
+            data: vec![0u8; SMPL_FIXED_LEN],
+        };
+        assert!(Smpl::from_chunk(&not_smpl).is_none());
+    }
+
+    #[test]
+    fn smpl_at_rate_handles_zero() {
+        assert_eq!(Smpl::at_rate(0).sample_period, 0);
     }
 }

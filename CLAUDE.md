@@ -158,9 +158,16 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
     `LIST`/`adtl` companion that names those markers, an ordered list of `AdtlEntry` (`labl`, `note`,
     or `ltxt`-for-regions) keyed by `CuePoint::id`. It is a `LIST` chunk like `InfoList`, told apart
     by its `adtl` form type, so the two never collide on decode.
+  - `Smpl` is the `smpl` sampler chunk: a fixed 36-byte struct (manufacturer/product codes, frame
+    period, MIDI unity note and pitch fraction, SMPTE fields) followed by 24-byte `SampleLoop`s and
+    a trailing blob of sampler-specific bytes that is passed through untouched. `Smpl::at_rate`
+    fills in the frame period and a middle-C unity note; `SampleLoop::forward` covers the common
+    forward loop. Loop types are plain `u32`s with `LOOP_FORWARD`/`LOOP_ALTERNATING`/`LOOP_BACKWARD`
+    constants, so sampler-specific values round-trip.
 
-  Everything else (`iXML`, `smpl`, ...) stays a raw blob for a higher-level crate; adding another
-  typed chunk means following the same `from_*`/`to_*` shape here.
+  Everything else (`iXML`, ...) stays a raw blob for a higher-level crate; adding another
+  typed chunk means following the same `from_*`/`to_*` shape here, plus an idempotence check in the
+  `metadata_chunks` fuzz target and its `fuzz_replay.rs` mirror.
 
 - **`highlevel.rs`** holds the two path-based one-call helpers for callers who do not need the
   full reader/writer: `read_wav_file::<T, _>(path)` opens a file and reads everything into a
