@@ -1,6 +1,6 @@
 //! Writing audio data to a wav file.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Cursor, Seek, SeekFrom, Write};
 
 use audioadapter::Adapter;
 use audioadapter_sample::readwrite::WriteSamples;
@@ -55,6 +55,64 @@ impl WriterSpec {
             // so the sample-frame count carries no defined meaning.
             WriterSpec::Raw(spec) => Ok((header::write_fmt_chunk_raw(dest, spec)?, false)),
         }
+    }
+}
+
+/// An output stream that can be shortened.
+///
+/// The [`Write`] and [`Seek`] traits can grow a stream but never shrink one, so
+/// trimming a file needs this extra capability.
+/// [`WavWriter::truncate`] and [`WavWriter::truncate_to_frame`] are available
+/// only when the inner writer implements it.
+///
+/// It is implemented for [`File`](std::fs::File) (which is where it matters),
+/// for [`Cursor<Vec<u8>>`](std::io::Cursor), and for the
+/// [`BufWriter`](std::io::BufWriter) and `&mut` wrappers that usually sit
+/// between the two and a [`WavWriter`]. Implement it for a custom output to
+/// enable trimming there too.
+pub trait Truncate {
+    /// Shorten the stream to `len` bytes.
+    ///
+    /// `len` is never larger than the current length when called by
+    /// [`WavWriter`]. The stream position is not required to change; the writer
+    /// seeks to where it needs to be afterwards.
+    fn truncate_to(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl Truncate for std::fs::File {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+// A `File` is also writable through a shared reference, so a writer built on
+// `&File` can be trimmed as well.
+impl Truncate for &std::fs::File {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+impl Truncate for Cursor<Vec<u8>> {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        let len = usize::try_from(len).map_err(|_| io::Error::other("length overflows usize"))?;
+        self.get_mut().truncate(len);
+        Ok(())
+    }
+}
+
+impl<W: Truncate + Write> Truncate for BufWriter<W> {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        // Buffered bytes may belong past the cut, so they have to reach the
+        // inner writer before it is shortened.
+        self.flush()?;
+        self.get_mut().truncate_to(len)
+    }
+}
+
+impl<W: Truncate + ?Sized> Truncate for &mut W {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        (**self).truncate_to(len)
     }
 }
 
@@ -362,7 +420,8 @@ impl<W: Write> WavWriter<W> {
     /// The number of frames written, counted to the furthest extent reached.
     ///
     /// After a backwards [`seek_to_frame`](WavWriter::seek_to_frame) this stays at
-    /// the high-water mark, since overwriting does not shrink the file. A partial
+    /// the high-water mark, since overwriting does not shrink the file, until
+    /// [`truncate`](WavWriter::truncate) moves it down. A partial
     /// trailing frame, only possible through
     /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved), is not counted.
     /// Zero if the frame size is unknown (a [`RawSpec`] with a zero block
@@ -670,7 +729,8 @@ impl<W: Write + Seek> WavWriter<W> {
     /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved) overwrites the
     /// audio from there. Seeking backwards and overwriting does not shrink the
     /// file: the declared `data` size still covers the furthest point reached, so
-    /// data beyond the rewritten region is preserved.
+    /// data beyond the rewritten region is preserved. Use
+    /// [`truncate`](WavWriter::truncate) to drop it instead.
     ///
     /// Seeking past the current end fills the gap with zeros, so skipping ahead
     /// leaves silence rather than undefined bytes. The zeros are written straight
@@ -806,6 +866,68 @@ impl<W: Write + Seek> WavWriter<W> {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl<W: Write + Seek + Truncate> WavWriter<W> {
+    /// Discard the audio data after the current write position.
+    ///
+    /// The escape hatch from the never-shrink rule: after a backwards
+    /// [`seek_to_frame`](WavWriter::seek_to_frame) the declared size still covers
+    /// the furthest point reached, and this drops everything past the cursor
+    /// instead. Equivalent to
+    /// `truncate_to_frame(self.position())`.
+    pub fn truncate(&mut self) -> Result<()> {
+        let frame = self.position();
+        self.truncate_to_frame(frame)
+    }
+
+    /// Discard the audio data after frame `frame`, keeping frames `0..frame`.
+    ///
+    /// The file is shortened on the spot and the declared sizes follow when
+    /// [`finalize`](WavWriter::finalize) or
+    /// [`update_header`](WavWriter::update_header) next writes them. The write
+    /// cursor stays where it is, unless it was inside the discarded region, in
+    /// which case it moves to the new end.
+    ///
+    /// A `frame` at or past the current end does nothing: this only ever shrinks.
+    /// Use [`seek_to_frame`](WavWriter::seek_to_frame) to extend a file, which
+    /// fills the gap with silence.
+    ///
+    /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
+    /// trailing chunk has already been written, since trimming the audio would
+    /// leave it stranded, if the writer is streaming (its sizes are never
+    /// patched), or if the frame size is unknown (a [`RawSpec`] with a zero block
+    /// alignment).
+    pub fn truncate_to_frame(&mut self, frame: usize) -> Result<()> {
+        self.ensure_data_open()?;
+        if !self.seekable {
+            return Err(WavError::InvalidSpec(
+                "cannot truncate a streaming writer".to_string(),
+            ));
+        }
+        let frame_bytes = self.spec.frame_bytes() as u64;
+        if frame_bytes == 0 {
+            return Err(WavError::InvalidSpec(
+                "cannot truncate: frame size is zero".to_string(),
+            ));
+        }
+        let offset = frame_bytes.saturating_mul(frame as u64);
+        if offset >= self.data_bytes {
+            return Ok(());
+        }
+
+        // Buffered bytes past the cut have to reach the stream before it is
+        // shortened, or they would land after it and undo the trim.
+        self.inner.flush()?;
+        self.inner.truncate_to(self.layout.header_len + offset)?;
+        self.data_bytes = offset;
+        // Shortening the stream does not move the cursor, so put it somewhere
+        // valid: where it was, or the new end if that is now past it.
+        self.data_pos = self.data_pos.min(offset);
+        self.inner
+            .seek(SeekFrom::Start(self.layout.header_len + self.data_pos))?;
         Ok(())
     }
 }

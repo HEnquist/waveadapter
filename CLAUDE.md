@@ -119,6 +119,16 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   right there, rather than leaving it to whatever the inner writer does with a seek past the end, so
   skipping ahead means silence and the file grows to the target even if nothing follows.
 
+  `WavWriter::truncate` / `truncate_to_frame` are the escape hatch from the never-shrink rule,
+  lowering `data_bytes` and physically shortening the stream (clamping `data_pos` to the new end).
+  `Write + Seek` cannot shrink a stream, so they live in a third impl block bounded on the crate's
+  own `Truncate` trait (`fn truncate_to(&mut self, len: u64)`), implemented for `File`, `&File`,
+  `Cursor<Vec<u8>>`, `BufWriter<W: Truncate>` (which flushes first) and `&mut W`. They cut eagerly
+  rather than on finalize, so `patch_sizes` needs no changes: the declared sizes, the `fact` count
+  and the `ds64` sample count all derive from `data_bytes` anyway. Trimming is rejected for a
+  streaming writer (its sizes are never patched), once a trailing chunk would be stranded, and when
+  the frame size is unknown; a target at or past the extent is a no-op, since trimming never grows.
+
   Both numbers are exposed in frames, mirroring the reader: `frames_written` (extent) and `position`
   (cursor), alongside the byte-level `data_bytes` and `data_offset` (where the audio starts, the
   write-side `WavParams::data_offset`). `remaining_frames` reports the room left before the 4 GB

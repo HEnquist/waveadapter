@@ -127,7 +127,10 @@ has no such marker, so for long recordings call `update_header` now and then: it
 in place and returns to the write position, leaving a valid file behind at every step.
 
 A seekable writer also supports random access via `seek_to_frame`, to overwrite already-written
-audio without shrinking the file.
+audio without shrinking the file. To drop the audio past the cursor instead, call `truncate`
+(or `truncate_to_frame` for an explicit point). Shortening a stream is beyond what `Write + Seek`
+can do, so these need the inner writer to implement the `Truncate` trait, which `File`,
+`Cursor<Vec<u8>>` and `BufWriter` around either of them already do.
 
 ```rust no_run
 use std::fs::File;

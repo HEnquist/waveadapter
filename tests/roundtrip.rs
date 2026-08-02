@@ -5,7 +5,7 @@ use std::io::Cursor;
 use audioadapter::{Adapter, AdapterMut};
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::header::read_wav_header;
-use waveadapter::{Chunk, RawSpec, SampleFormat, WavReader, WavSpec, WavWriter};
+use waveadapter::{Chunk, RawSpec, SampleFormat, WavError, WavReader, WavSpec, WavWriter};
 
 fn make_buffer(channels: usize, frames: usize) -> InterleavedOwned<f32> {
     let mut buf = InterleavedOwned::<f32>::new(0.0, channels, frames);
@@ -1195,6 +1195,208 @@ fn writer_forward_seek_fills_with_silence() {
             "frame {frame}: {expected} vs {got}"
         );
     }
+}
+
+#[test]
+fn writer_truncate_drops_data_past_the_cursor() {
+    let channels = 2;
+    let frames = 32;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+    let frame_bytes = channels * 2;
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+
+    // Seek back and cut: the extent follows the cursor down instead of staying
+    // at the high-water mark.
+    writer.seek_to_frame(10).unwrap();
+    assert_eq!(writer.frames_written(), frames);
+    writer.truncate().unwrap();
+    assert_eq!(writer.frames_written(), 10);
+    assert_eq!(writer.position(), 10);
+    assert_eq!(writer.data_bytes(), (10 * frame_bytes) as u64);
+
+    // Writing continues from the new end.
+    writer
+        .write_float_buffer(&make_buffer(channels, 4))
+        .unwrap();
+    assert_eq!(writer.frames_written(), 14);
+    let data_offset = writer.data_offset();
+    writer.finalize().unwrap();
+
+    // The bytes are really gone, not just excluded by the declared size.
+    assert_eq!(
+        cursor.get_ref().len() as u64,
+        data_offset + (14 * frame_bytes) as u64
+    );
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 14);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    let second = make_buffer(channels, 4);
+    for frame in 0..14 {
+        for ch in 0..channels {
+            let expected = if frame < 10 {
+                source.read_sample(ch, frame).unwrap()
+            } else {
+                second.read_sample(ch, frame - 10).unwrap()
+            };
+            let got = restored.read_sample(ch, frame).unwrap();
+            assert!(
+                (expected - got).abs() <= 1e-4,
+                "frame {frame} ch {ch}: {expected} vs {got}"
+            );
+        }
+    }
+}
+
+#[test]
+fn writer_truncate_to_frame_moves_a_stranded_cursor() {
+    let channels = 1;
+    let frames = 16;
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer
+        .write_float_buffer(&make_buffer(channels, frames))
+        .unwrap();
+
+    // Cutting below the cursor drags it back to the new end, so the next write
+    // appends there rather than leaving a hole.
+    writer.truncate_to_frame(4).unwrap();
+    assert_eq!(writer.position(), 4);
+    assert_eq!(writer.frames_written(), 4);
+
+    // A cut at or past the end is a no-op, and truncating never grows the file.
+    writer.truncate_to_frame(4).unwrap();
+    writer.truncate_to_frame(100).unwrap();
+    assert_eq!(writer.frames_written(), 4);
+
+    writer
+        .write_float_buffer(&make_buffer(channels, 2))
+        .unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 6);
+}
+
+#[test]
+fn writer_truncate_rejects_streaming_and_trailing_chunks() {
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    // A streaming writer never patches its size fields, so a trim could not be
+    // described even though the underlying stream could be shortened.
+    let mut streaming = WavWriter::new_streaming(Cursor::new(Vec::new()), spec).unwrap();
+    streaming.write_raw_interleaved(&[0; 16]).unwrap();
+    assert!(matches!(
+        streaming.truncate_to_frame(1),
+        Err(WavError::InvalidSpec(_))
+    ));
+
+    // Trimming the audio under a trailing chunk would strand it.
+    let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[0; 16]).unwrap();
+    writer.write_chunk(*b"JUNK", &[0; 4]).unwrap();
+    assert!(matches!(
+        writer.truncate_to_frame(1),
+        Err(WavError::InvalidSpec(_))
+    ));
+
+    // A raw writer with no block alignment has no frame size to cut on.
+    let raw = RawSpec {
+        format_code: 6,
+        channels: 1,
+        sample_rate: 8000,
+        bits_per_sample: 8,
+        block_align: 0,
+    };
+    let mut raw_writer = WavWriter::new_raw(Cursor::new(Vec::new()), raw).unwrap();
+    raw_writer.write_raw_interleaved(&[0; 16]).unwrap();
+    assert!(matches!(
+        raw_writer.truncate_to_frame(1),
+        Err(WavError::InvalidSpec(_))
+    ));
+}
+
+#[test]
+fn rf64_truncate_updates_the_ds64_sizes() {
+    let channels = 2;
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+    writer
+        .write_float_buffer(&make_buffer(channels, 32))
+        .unwrap();
+    writer.truncate_to_frame(12).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 12);
+    assert_eq!(reader.params().data_length, 12 * channels * 2);
+}
+
+#[test]
+fn writer_truncate_on_a_buffered_file() {
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    let channels = 2;
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("waveadapter_truncate_{}.wav", std::process::id()));
+
+    let file = BufWriter::new(File::create(&path).unwrap());
+    let mut writer = WavWriter::new(file, spec).unwrap();
+    writer
+        .write_float_buffer(&make_buffer(channels, 64))
+        .unwrap();
+    // Nothing has been flushed yet, so this exercises the BufWriter impl
+    // flushing before the file is shortened.
+    writer.truncate_to_frame(20).unwrap();
+    let data_offset = writer.data_offset();
+    writer.finalize().unwrap();
+
+    let on_disk = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(on_disk, data_offset + (20 * channels * 2) as u64);
+
+    let audio: waveadapter::WavData<f32> = waveadapter::read_wav_file(&path).unwrap();
+    assert_eq!(audio.frames(), 20);
+
+    std::fs::remove_file(&path).unwrap();
 }
 
 #[test]
