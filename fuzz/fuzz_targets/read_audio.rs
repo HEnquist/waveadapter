@@ -22,13 +22,13 @@ const MAX_RAW_FRAMES: usize = 4096;
 fuzz_target!(|data: &[u8]| {
     // Float path. Reading stops cleanly at end of data, so a header that
     // over-declares its length must not run away or panic.
-    if let Ok(mut reader) = WavReader::new(Cursor::new(data)) {
-        if reader.read_all_to_float::<f32>().is_ok() {
-            assert!(
-                reader.position() <= reader.frames(),
-                "reading past the declared frame count"
-            );
-        }
+    if let Ok(mut reader) = WavReader::new(Cursor::new(data))
+        && reader.read_all_to_float::<f32>().is_ok()
+    {
+        assert!(
+            reader.position() <= reader.frames(),
+            "reading past the declared frame count"
+        );
     }
 
     // Raw path. This one also accepts formats the float path rejects, so it sees

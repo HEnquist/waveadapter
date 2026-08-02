@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bytes.len()
     );
 
-    // A file in a format this crate does not model (8-bit PCM, A-law, ...) hands
+    // A file in a format this crate does not model (A-law, mu-law, ADPCM, ...) hands
     // back its bytes just the same, but there is no audioadapter sample type to
     // decode them with, so stop here.
     let Some(format) = format else {
@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut slice = &bytes[..];
     for ch in 0..channels {
         let value: f32 = match format {
+            SampleFormat::U8 => slice.read_converted::<U8, f32>()?,
             SampleFormat::I16 => slice.read_converted::<I16_LE, f32>()?,
             SampleFormat::I24_3 => slice.read_converted::<I24_LE, f32>()?,
             SampleFormat::I24_4 => slice.read_converted::<I24_4LJ_LE, f32>()?,

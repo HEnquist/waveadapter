@@ -132,7 +132,7 @@ pub struct Chunk {
 pub struct WavParams {
     /// The binary sample format of the audio data, if it is one this crate can
     /// interpret. `None` means the `fmt ` chunk described a valid but
-    /// unsupported format (for example 8-bit PCM or A-law); the audio can still
+    /// unsupported format (for example A-law or ADPCM); the audio can still
     /// be read as raw bytes via
     /// [`WavReader::read_raw_interleaved`](crate::WavReader::read_raw_interleaved),
     /// using the raw `fmt ` fields below to make sense of it. The float read path
@@ -486,6 +486,7 @@ fn look_up_format(
     chunk_length: u32,
 ) -> Result<SampleFormat> {
     match (formatcode, bits, bytes_per_sample) {
+        (1, 8, 1) => Ok(SampleFormat::U8),
         (1, 16, 2) => Ok(SampleFormat::I16),
         (1, 24, 3) => Ok(SampleFormat::I24_3),
         (1, 24, 4) => Ok(SampleFormat::I24_4),
@@ -519,6 +520,7 @@ fn look_up_extended_format(
         bytes_per_sample,
         valid_bits_per_sample,
     ) {
+        (SUBTYPE_PCM, 8, 1, 8) => Ok(SampleFormat::U8),
         (SUBTYPE_PCM, 16, 2, 16) => Ok(SampleFormat::I16),
         (SUBTYPE_PCM, 24, 3, 24) => Ok(SampleFormat::I24_3),
         // 24-in-4-byte: the lenient form (wBitsPerSample = 24) and the
@@ -636,7 +638,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                     .bytes_per_sample()
                     .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
                 // A valid but unsupported format (no matching audioadapter sample
-                // type, e.g. 8-bit PCM) is not an error here: it is recorded as
+                // type, e.g. A-law) is not an error here: it is recorded as
                 // `None` so the file can still be read as raw bytes. A genuinely
                 // malformed fmt chunk still errors.
                 sample_format = match look_up_format(
