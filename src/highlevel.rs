@@ -59,7 +59,7 @@ impl<T: Clone> WavData<T> {
 ///
 /// This is the "I don't care, just give me the data" path. It does not expose
 /// metadata chunks and returns [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat)
-/// for formats the float path cannot decode (such as 8-bit PCM or A-law); use
+/// for formats the float path cannot decode (such as A-law or mu-law); use
 /// [`WavReader`] directly for those.
 pub fn read_wav_file<T, P>(path: P) -> Result<WavData<T>>
 where
@@ -90,9 +90,11 @@ where
 /// # Ok::<(), waveadapter::WavError>(())
 /// ```
 ///
-/// Returns the number of samples that were clipped during conversion. This is
-/// the "I have this audio, just write it" path: a plain RIFF file with no extra
-/// chunks. Use [`WavWriter`] for metadata, RF64, raw formats or streaming output.
+/// Returns the number of samples that were clipped during conversion, which is
+/// always zero for the float formats (see
+/// [`WavWriter::write_float_buffer`]). This is the "I have this audio, just
+/// write it" path: a plain RIFF file with no extra chunks. Use [`WavWriter`]
+/// for metadata, RF64, raw formats or streaming output.
 pub fn write_wav_file<T, P>(
     path: P,
     samples: &dyn Adapter<T>,

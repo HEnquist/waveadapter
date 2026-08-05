@@ -15,25 +15,27 @@ audioadapter adapters directly.
   need streaming, chunks or random access.
 - **audioadapter integration**: read into and write from any `Adapter` / `AdapterMut` buffer
   (interleaved or planar, owned or borrowed), with on-the-fly conversion to and from `f32`/`f64`
-  scaled to -1.0..1.0. The write path reports how many samples were clipped.
+  scaled to -1.0..1.0. The write path reports how many samples were clipped by the integer
+  formats (the float formats keep their headroom and never clip).
 - **Raw byte passthrough**: move the interleaved sample bytes untouched, to wrap with the
   audioadapter byte/number adapters yourself, or to handle formats this crate does not model.
-- **Wide format coverage**: 16-, 24- (both 3-byte packed and 4-byte left-justified), and 32-bit
-  integer PCM, plus 32- and 64-bit IEEE float.
-- **Any container, even unmodeled formats**: 8-bit PCM, A-law/µ-law, ADPCM and exotic
+- **Wide format coverage**: 8- (unsigned), 16-, 24- (both 3-byte packed and 4-byte left-justified),
+  and 32-bit integer PCM, plus 32- and 64-bit IEEE float.
+- **Any container, even unmodeled formats**: A-law/µ-law, ADPCM and exotic
   `WAVEFORMATEXTENSIBLE` subtypes round-trip as raw bytes, so the crate is a complete WAV container
   library, not just the formats it can decode.
 - **Plain and extensible headers**: reads and writes both `WAVEFORMAT`/`WAVEFORMATEX` and
   `WAVEFORMATEXTENSIBLE`, picking the minimal form automatically. The `dwChannelMask` speaker layout
   is read and written.
 - **Streaming or seekable**: write to a seekable file (sizes patched on finalize) or straight to a
-  pipe with no seeking (`u32::MAX` sizes). Reading handles unknown-length streams, stopping cleanly
-  at end of file.
+  pipe with no seeking. Reading handles unknown-length streams, stopping cleanly at end of file.
+- **Crash tolerant writing**: an interrupted file stays readable, and `update_header` keeps the
+  sizes current during a long recording.
 - **Random access**: seek to any frame for reading or writing on a seekable stream.
 - **RF64 / BW64 (>4 GB)**: reads both forms, writes RF64, for files past the 4 GB RIFF limit.
 - **Chunk passthrough with typed metadata**: every non-audio chunk round-trips verbatim (leading or
   trailing), with a thin typed layer for `LIST`/`INFO` tags, the `bext` Broadcast Audio Extension,
-  and `cue ` markers with their `LIST`/`adtl` labels.
+  `cue ` markers with their `LIST`/`adtl` labels, and `smpl` sampler loop points.
 - **Robust parsing**: tolerates junk, padding and out-of-order chunks.
 
 ## Supported sample formats
@@ -43,12 +45,16 @@ audioadapter byte-wrapper sample types.
 
 | `SampleFormat` | Wav format | Bits | Bytes |
 | -------------- | ---------- | ---- | ----- |
+| `U8`           | PCM (unsigned) | 8 | 1  |
 | `I16`          | PCM        | 16   | 2     |
 | `I24_3`        | PCM        | 24   | 3 (packed) |
 | `I24_4`        | PCM        | 24   | 4 (left justified) |
 | `I32`          | PCM        | 32   | 4     |
 | `F32`          | IEEE float | 32   | 4     |
 | `F64`          | IEEE float | 64   | 8     |
+
+`U8` is the odd one out: wav 8-bit PCM is unsigned and centered at 128, while every deeper integer
+depth is signed. The conversion handles that, so `0` reads back as -1.0 and `255` as +1.0.
 
 Both plain `WAVEFORMAT`/`WAVEFORMATEX` and extended `WAVEFORMATEXTENSIBLE` headers are parsed.
 
@@ -112,11 +118,19 @@ Two modes are available:
 
 - **Seekable** (`WavWriter::new`): the size fields start as placeholders and are patched with the
   real values by `finalize`, producing a standard-compliant file.
-- **Streaming** (`WavWriter::new_streaming`): the size fields are set to `u32::MAX` up front and
-  never updated, for pipes and other non-seekable outputs. Finish with `into_inner`.
+- **Streaming** (`WavWriter::new_streaming`): the size fields are never updated, for pipes and other
+  non-seekable outputs. Finish with `into_inner`.
+
+Both write the placeholder as `u32::MAX`, the "runs to the end of the file" marker, so a plain RIFF
+file whose writer never reached `finalize` still reads back as the audio that made it to disk. RF64
+has no such marker, so for long recordings call `update_header` now and then: it patches the sizes
+in place and returns to the write position, leaving a valid file behind at every step.
 
 A seekable writer also supports random access via `seek_to_frame`, to overwrite already-written
-audio without shrinking the file.
+audio without shrinking the file. To drop the audio past the cursor instead, call `truncate`
+(or `truncate_to_frame` for an explicit point). Shortening a stream is beyond what `Write + Seek`
+can do, so these need the inner writer to implement the `Truncate` trait, which `File`,
+`Cursor<Vec<u8>>` and `BufWriter` around either of them already do.
 
 ```rust no_run
 use std::fs::File;

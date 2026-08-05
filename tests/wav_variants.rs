@@ -3,8 +3,8 @@
 //!
 //! The fixtures cover the range of variation a wav parser has to handle, one
 //! variation each. Every file we support must parse and decode to the expected
-//! shape; the deliberately unsupported ones (8-bit audio, which audioadapter has
-//! no sample type for, and a header with no data chunk) must be rejected with an
+//! shape; the deliberately unsupported ones (mu-law, which audioadapter has no
+//! sample type for, and a header with no data chunk) must be rejected with an
 //! error rather than panicking.
 
 use std::path::PathBuf;
@@ -284,13 +284,48 @@ const READABLE: &[(&str, Expect)] = &[
             frames: 20,
         },
     ),
+    (
+        "mono_8bit_unsigned",
+        Expect {
+            format: SampleFormat::U8,
+            channels: 1,
+            frames: 20,
+        },
+    ),
+    (
+        "extensible_8bit",
+        Expect {
+            format: SampleFormat::U8,
+            channels: 2,
+            frames: 20,
+        },
+    ),
+    // Odd-length data, with and without the RIFF pad byte. Both are 8-bit mono
+    // with an odd frame count, which is what makes the payload odd-sized.
+    (
+        "odd_sized_data_with_pad",
+        Expect {
+            format: SampleFormat::U8,
+            channels: 1,
+            frames: 21,
+        },
+    ),
+    (
+        "odd_sized_data_missing_pad",
+        Expect {
+            format: SampleFormat::U8,
+            channels: 1,
+            frames: 21,
+        },
+    ),
 ];
 
 /// Files our reader is expected to reject, with the reason they are unsupported.
 const REJECTED: &[(&str, &str)] = &[
-    ("mono_8bit_unsigned", "8-bit audio is not supported"),
-    ("odd_sized_data_with_pad", "8-bit audio is not supported"),
-    ("odd_sized_data_missing_pad", "8-bit audio is not supported"),
+    (
+        "mulaw_mono",
+        "mu-law is not decodable, only readable as raw",
+    ),
     ("empty_riff_no_data_chunk", "no data chunk present"),
 ];
 
@@ -338,15 +373,16 @@ fn rejects_unsupported_variants() {
 
 #[test]
 fn unsupported_format_reads_as_raw() {
-    // An 8-bit file has no audioadapter sample type, so the float path rejects
-    // it, but it still parses and its audio is readable as raw bytes.
-    let file = std::fs::File::open(fixture("mono_8bit_unsigned")).unwrap();
-    let mut reader = WavReader::new(file).expect("8-bit file should parse");
+    // Mu-law has no audioadapter sample type, so the float path rejects it, but
+    // it still parses and its audio is readable as raw bytes.
+    let file = std::fs::File::open(fixture("mulaw_mono")).unwrap();
+    let mut reader = WavReader::new(file).expect("mu-law file should parse");
     assert_eq!(
         reader.sample_format(),
         None,
-        "8-bit should be uninterpreted"
+        "mu-law should be uninterpreted"
     );
+    assert_eq!(reader.params().format_code, 7);
     assert_eq!(reader.params().bits_per_sample, 8);
     assert!(reader.params().block_align >= 1);
 

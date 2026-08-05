@@ -26,9 +26,14 @@ const DS64: &[u8] = b"ds64";
 pub(crate) const RIFF_SIZE_OFFSET: u64 = 4;
 
 /// The marker written into a 32-bit size field when the real size lives in the
-/// `ds64` chunk (RF64), and also the streaming "length unknown" placeholder for
-/// plain RIFF. The two uses are told apart by the file's form id.
+/// `ds64` chunk (RF64), and also the "length unknown" placeholder for plain
+/// RIFF. The two uses are told apart by the file's form id.
 const SIZE_IN_DS64: u32 = u32::MAX;
+
+/// The value a plain RIFF size field carries while the real length is not yet
+/// known: the data runs to the end of the file. Written by both the streaming
+/// and the seekable writer, the latter patching it in `finalize`.
+pub(crate) const UNKNOWN_SIZE: u32 = SIZE_IN_DS64;
 
 /// Body size of a `ds64` chunk with no oversized-chunk table: three 64-bit sizes
 /// plus the 32-bit table length.
@@ -127,7 +132,7 @@ pub struct Chunk {
 pub struct WavParams {
     /// The binary sample format of the audio data, if it is one this crate can
     /// interpret. `None` means the `fmt ` chunk described a valid but
-    /// unsupported format (for example 8-bit PCM or A-law); the audio can still
+    /// unsupported format (for example A-law or ADPCM); the audio can still
     /// be read as raw bytes via
     /// [`WavReader::read_raw_interleaved`](crate::WavReader::read_raw_interleaved),
     /// using the raw `fmt ` fields below to make sense of it. The float read path
@@ -481,6 +486,7 @@ fn look_up_format(
     chunk_length: u32,
 ) -> Result<SampleFormat> {
     match (formatcode, bits, bytes_per_sample) {
+        (1, 8, 1) => Ok(SampleFormat::U8),
         (1, 16, 2) => Ok(SampleFormat::I16),
         (1, 24, 3) => Ok(SampleFormat::I24_3),
         (1, 24, 4) => Ok(SampleFormat::I24_4),
@@ -514,6 +520,7 @@ fn look_up_extended_format(
         bytes_per_sample,
         valid_bits_per_sample,
     ) {
+        (SUBTYPE_PCM, 8, 1, 8) => Ok(SampleFormat::U8),
         (SUBTYPE_PCM, 16, 2, 16) => Ok(SampleFormat::I16),
         (SUBTYPE_PCM, 24, 3, 24) => Ok(SampleFormat::I24_3),
         // 24-in-4-byte: the lenient form (wBitsPerSample = 24) and the
@@ -550,7 +557,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         ));
     }
 
-    let mut next_chunk_location = 12;
+    let mut next_chunk_location: u64 = 12;
     let mut found_fmt = false;
     let mut found_data = false;
     let mut buffer = [0; 8];
@@ -577,7 +584,13 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     // Walk every chunk to the end of the file, so that metadata chunks placed
     // after the data chunk are captured too. A chunk is padded to an even length
     // with a trailing byte that is not counted in its declared size.
-    while next_chunk_location + 8 <= filesize {
+    //
+    // Every offset computed from a declared length uses saturating arithmetic.
+    // For RF64 the length comes from the ds64 table as an unvalidated 64-bit
+    // value, so a hostile or corrupt file can name a size near `u64::MAX`.
+    // Saturating turns that into an offset past `filesize`, which the existing
+    // overrun checks already treat as "stop scanning".
+    while next_chunk_location.saturating_add(8) <= filesize {
         file.seek(SeekFrom::Start(next_chunk_location))?;
         file.read_exact(&mut buffer)?;
         let chunk_length = read_u32(&buffer, 4);
@@ -594,13 +607,14 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         if is_ds64 {
             // The ds64 chunk is container metadata, not exposed as a raw chunk.
             // Honor the first one and parse its 64-bit sizes for later chunks.
-            let body_end = next_chunk_location + 8 + chunk_length as u64;
+            let body_end = next_chunk_location.saturating_add(8 + chunk_length as u64);
             if body_end <= filesize {
                 let mut body = vec![0; chunk_length as usize];
                 file.read_exact(&mut body)?;
                 ds64 = Ds64::parse(&body);
             }
-            next_chunk_location += 8 + chunk_length as u64 + (chunk_length as u64 & 1);
+            next_chunk_location = next_chunk_location
+                .saturating_add(8 + chunk_length as u64 + (chunk_length as u64 & 1));
             continue;
         }
         if is_fmt {
@@ -624,7 +638,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                     .bytes_per_sample()
                     .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
                 // A valid but unsupported format (no matching audioadapter sample
-                // type, e.g. 8-bit PCM) is not an error here: it is recorded as
+                // type, e.g. A-law) is not an error here: it is recorded as
                 // `None` so the file can still be read as raw bytes. A genuinely
                 // malformed fmt chunk still errors.
                 sample_format = match look_up_format(
@@ -656,7 +670,9 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         } else {
             // Any other chunk is captured verbatim, tolerating a bogus length
             // that would overrun the file by stopping the scan instead of erroring.
-            let body_end = next_chunk_location + 8 + body_len;
+            let body_end = next_chunk_location
+                .saturating_add(8)
+                .saturating_add(body_len);
             if body_end > filesize {
                 break;
             }
@@ -669,7 +685,10 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             id.copy_from_slice(&buffer[0..4]);
             chunks.push(Chunk { id, data: body });
         }
-        next_chunk_location += 8 + body_len + (body_len & 1);
+        next_chunk_location = next_chunk_location
+            .saturating_add(8)
+            .saturating_add(body_len)
+            .saturating_add(body_len & 1);
     }
     if found_data && found_fmt {
         return Ok(WavParams {

@@ -1,6 +1,6 @@
 //! Writing audio data to a wav file.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Cursor, Seek, SeekFrom, Write};
 
 use audioadapter::Adapter;
 use audioadapter_sample::readwrite::WriteSamples;
@@ -58,6 +58,64 @@ impl WriterSpec {
     }
 }
 
+/// An output stream that can be shortened.
+///
+/// The [`Write`] and [`Seek`] traits can grow a stream but never shrink one, so
+/// trimming a file needs this extra capability.
+/// [`WavWriter::truncate`] and [`WavWriter::truncate_to_frame`] are available
+/// only when the inner writer implements it.
+///
+/// It is implemented for [`File`](std::fs::File) (which is where it matters),
+/// for [`Cursor<Vec<u8>>`](std::io::Cursor), and for the
+/// [`BufWriter`](std::io::BufWriter) and `&mut` wrappers that usually sit
+/// between the two and a [`WavWriter`]. Implement it for a custom output to
+/// enable trimming there too.
+pub trait Truncate {
+    /// Shorten the stream to `len` bytes.
+    ///
+    /// `len` is never larger than the current length when called by
+    /// [`WavWriter`]. The stream position is not required to change; the writer
+    /// seeks to where it needs to be afterwards.
+    fn truncate_to(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl Truncate for std::fs::File {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+// A `File` is also writable through a shared reference, so a writer built on
+// `&File` can be trimmed as well.
+impl Truncate for &std::fs::File {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+impl Truncate for Cursor<Vec<u8>> {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        let len = usize::try_from(len).map_err(|_| io::Error::other("length overflows usize"))?;
+        self.get_mut().truncate(len);
+        Ok(())
+    }
+}
+
+impl<W: Truncate + Write> Truncate for BufWriter<W> {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        // Buffered bytes may belong past the cut, so they have to reach the
+        // inner writer before it is shortened.
+        self.flush()?;
+        self.get_mut().truncate_to(len)
+    }
+}
+
+impl<W: Truncate + ?Sized> Truncate for &mut W {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        (**self).truncate_to(len)
+    }
+}
+
 /// Chunk ids this crate manages itself, which callers may not supply as extra
 /// metadata chunks.
 const RESERVED_IDS: [&[u8; 4]; 4] = [b"RIFF", b"fmt ", b"data", b"fact"];
@@ -82,10 +140,10 @@ fn check_extra_chunk(id: &[u8; 4], body_len: usize) -> Result<()> {
 
 /// The container form to write: plain RIFF, or the 64-bit RF64 form.
 enum Container {
-    /// Plain RIFF/WAVE. `placeholder` is written into the size fields that are
-    /// not yet known: `0` for a seekable writer (patched on finalize) or
-    /// [`u32::MAX`] for a streaming writer (left as-is).
-    Riff { placeholder: u32 },
+    /// Plain RIFF/WAVE. The not-yet-known size fields get the
+    /// [`UNKNOWN_SIZE`](header::UNKNOWN_SIZE) placeholder, which a seekable
+    /// writer patches on finalize and a streaming writer leaves as-is.
+    Riff,
     /// RF64: 32-bit size fields carry the `0xFFFFFFFF` marker and the real sizes
     /// live in a leading `ds64` chunk, patched on finalize (always seekable).
     Rf64,
@@ -137,8 +195,8 @@ fn write_header(
 
     let mut pos: u64 = 12;
     let sizes = match container {
-        Container::Riff { placeholder } => {
-            header::write_riff_wave(inner, placeholder)?;
+        Container::Riff => {
+            header::write_riff_wave(inner, header::UNKNOWN_SIZE)?;
 
             let (fmt_body, needs_fact) = spec.write_fmt(inner)?;
             pos += 8 + fmt_body as u64;
@@ -148,7 +206,8 @@ fn write_header(
             // 4-byte body sits right after the 8-byte chunk header.
             let fact_offset = if needs_fact {
                 let offset = pos + 8;
-                pos += header::write_named_chunk(inner, b"fact", &placeholder.to_le_bytes())?;
+                pos +=
+                    header::write_named_chunk(inner, b"fact", &header::UNKNOWN_SIZE.to_le_bytes())?;
                 Some(offset)
             } else {
                 None
@@ -159,7 +218,7 @@ fn write_header(
             }
 
             let data_size_offset = pos + 4;
-            header::write_data_header(inner, placeholder)?;
+            header::write_data_header(inner, header::UNKNOWN_SIZE)?;
             pos += 8;
 
             SizeFields::Riff {
@@ -214,8 +273,14 @@ fn write_header(
 ///   placeholders and patched with the real values by [`WavWriter::finalize`],
 ///   producing a standard-compliant file.
 /// * Streaming, created with [`WavWriter::new_streaming`]. The size fields are
-///   set to [`u32::MAX`] up front and never updated, which is useful for pipes
-///   and other non-seekable outputs. Call [`WavWriter::into_inner`] when done.
+///   never updated, which is useful for pipes and other non-seekable outputs.
+///   Call [`WavWriter::into_inner`] when done.
+///
+/// Both write the placeholder as [`u32::MAX`], the "runs to the end of the file"
+/// convention players expect from a stream of unknown length. So a seekable file
+/// whose writer never got to [`finalize`](WavWriter::finalize), because the
+/// process was interrupted or crashed, still reads back as the audio that made
+/// it to disk rather than as an empty file.
 ///
 /// For files that may exceed the 4 GB size limit of plain RIFF, use
 /// [`WavWriter::new_rf64`], which writes the 64-bit RF64 form (with a `ds64`
@@ -231,6 +296,61 @@ fn write_header(
 /// [`WavWriter::new_with_chunks`] / [`WavWriter::new_streaming_with_chunks`]) or
 /// after it (trailing chunks, via [`WavWriter::write_chunk`]), so a higher-level
 /// library can attach metadata such as `LIST`/`INFO`.
+///
+/// # Picking a constructor
+///
+/// The constructors vary along two independent axes: how the output is written
+/// (seekable RIFF, seekable RF64, or streaming), and whether the sample format
+/// is interpreted, a [`WavSpec`] giving both write paths, or passed through
+/// verbatim, a [`RawSpec`] giving only the raw byte path.
+///
+/// | Output | [`WavSpec`]: float and raw | [`RawSpec`]: raw only |
+/// |---|---|---|
+/// | Seekable, plain RIFF, up to 4 GB | [`new`](WavWriter::new) | [`new_raw`](WavWriter::new_raw) |
+/// | Seekable, RF64, no size limit | [`new_rf64`](WavWriter::new_rf64) | not available |
+/// | Streaming, no seeking needed | [`new_streaming`](WavWriter::new_streaming) | [`new_streaming_raw`](WavWriter::new_streaming_raw) |
+///
+/// Each of the five has a `_with_chunks` twin taking a `&[Chunk]` of metadata
+/// chunks to write ahead of the audio, for example
+/// [`new_with_chunks`](WavWriter::new_with_chunks). Finish a seekable writer
+/// with [`finalize`](WavWriter::finalize), which patches the size fields and
+/// hands back the inner writer, and a streaming one with
+/// [`into_inner`](WavWriter::into_inner).
+///
+/// # Examples
+///
+/// The common case, a seekable output written from a float buffer:
+///
+/// ```
+/// use std::io::Cursor;
+/// use audioadapter_buffers::owned::InterleavedOwned;
+/// use waveadapter::{SampleFormat, WavSpec, WavWriter};
+///
+/// let audio = InterleavedOwned::<f32>::new(0.0, 2, 128);
+/// let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+///
+/// let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec)?;
+/// let clipped = writer.write_float_buffer(&audio)?;
+/// let file = writer.finalize()?.into_inner();
+/// assert_eq!(&file[0..4], b"RIFF");
+/// # Ok::<(), waveadapter::WavError>(())
+/// ```
+///
+/// The same audio to an output that cannot seek, a pipe or a plain
+/// [`Vec<u8>`], where nothing can be patched afterwards, so the sizes keep
+/// their [`u32::MAX`] placeholders:
+///
+/// ```
+/// # use audioadapter_buffers::owned::InterleavedOwned;
+/// # use waveadapter::{SampleFormat, WavSpec, WavWriter};
+/// # let audio = InterleavedOwned::<f32>::new(0.0f32, 2, 128);
+/// # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+/// let mut writer = WavWriter::new_streaming(Vec::new(), spec)?;
+/// writer.write_float_buffer(&audio)?;
+/// let file = writer.into_inner()?;
+/// assert_eq!(file[4..8], u32::MAX.to_le_bytes());
+/// # Ok::<(), waveadapter::WavError>(())
+/// ```
 pub struct WavWriter<W: Write> {
     inner: W,
     spec: WriterSpec,
@@ -272,14 +392,7 @@ impl<W: Write> WavWriter<W> {
         leading: &[Chunk],
     ) -> Result<Self> {
         let spec = WriterSpec::Typed(spec);
-        let layout = write_header(
-            &mut inner,
-            &spec,
-            leading,
-            Container::Riff {
-                placeholder: u32::MAX,
-            },
-        )?;
+        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
         Ok(Self {
             inner,
             spec,
@@ -310,14 +423,7 @@ impl<W: Write> WavWriter<W> {
         leading: &[Chunk],
     ) -> Result<Self> {
         let spec = WriterSpec::Raw(spec);
-        let layout = write_header(
-            &mut inner,
-            &spec,
-            leading,
-            Container::Riff {
-                placeholder: u32::MAX,
-            },
-        )?;
+        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
         Ok(Self {
             inner,
             spec,
@@ -347,16 +453,99 @@ impl<W: Write> WavWriter<W> {
     }
 
     /// The number of audio data bytes written so far.
+    ///
+    /// This is the furthest extent reached, the value that becomes the declared
+    /// `data` chunk size. See [`frames_written`](WavWriter::frames_written) for
+    /// the same number in frames, and [`position`](WavWriter::position) for where
+    /// the write cursor currently is.
     pub fn data_bytes(&self) -> u64 {
         self.data_bytes
+    }
+
+    /// The absolute byte offset in the output where the audio data starts.
+    ///
+    /// This is the size of everything written before the audio: the RIFF/RF64
+    /// header, the `fmt ` chunk, any `fact` or `ds64` chunk, the leading metadata
+    /// chunks and the `data` chunk header. It mirrors
+    /// [`WavParams::data_offset`](crate::WavParams::data_offset) on the read side.
+    pub fn data_offset(&self) -> u64 {
+        self.layout.header_len
+    }
+
+    /// The number of frames written, counted to the furthest extent reached.
+    ///
+    /// After a backwards [`seek_to_frame`](WavWriter::seek_to_frame) this stays at
+    /// the high-water mark, since overwriting does not shrink the file, until
+    /// [`truncate`](WavWriter::truncate) moves it down. A partial
+    /// trailing frame, only possible through
+    /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved), is not counted.
+    /// Zero if the frame size is unknown (a [`RawSpec`] with a zero block
+    /// alignment).
+    pub fn frames_written(&self) -> usize {
+        self.frames_at(self.data_bytes)
+    }
+
+    /// The current write position, in frames from the start of the audio data.
+    ///
+    /// Equal to [`frames_written`](WavWriter::frames_written) for append-only
+    /// writing; the two differ once [`seek_to_frame`](WavWriter::seek_to_frame) has
+    /// moved the cursor back. Mirrors [`WavReader::position`](crate::WavReader::position).
+    pub fn position(&self) -> usize {
+        self.frames_at(self.data_pos)
+    }
+
+    /// The number of frames that can still be written before the 4 GB size limit
+    /// of plain RIFF, or `None` when no limit applies.
+    ///
+    /// The limit only exists for a seekable RIFF writer, the one case where
+    /// [`finalize`](WavWriter::finalize) has to fit the real lengths into the
+    /// 32-bit size fields. A streaming writer never patches them and RF64 has
+    /// 64-bit fields, so both return `None`, as does a [`RawSpec`] writer with a
+    /// zero block alignment, where frames have no size.
+    ///
+    /// The room left is counted from the current write position, and assumes no
+    /// further trailing chunks: every byte a later
+    /// [`write_chunk`](WavWriter::write_chunk) adds comes out of this budget.
+    /// Once a trailing chunk has been written the answer is `Some(0)`, since no
+    /// more audio can follow it.
+    pub fn remaining_frames(&self) -> Option<usize> {
+        if !self.seekable || !matches!(self.layout.sizes, SizeFields::Riff { .. }) {
+            return None;
+        }
+        let frame_bytes = self.spec.frame_bytes() as u64;
+        if frame_bytes == 0 {
+            return None;
+        }
+        if self.trailing_bytes != 0 {
+            return Some(0);
+        }
+        // The largest data extent that still fits, the same budget `check_capacity`
+        // enforces, counted from the cursor since that is where a write lands.
+        let ceiling =
+            (u32::MAX as u64 + 8).saturating_sub(self.layout.header_len + self.trailing_bytes);
+        let bytes = ceiling.saturating_sub(self.data_pos);
+        Some(usize::try_from(bytes / frame_bytes).unwrap_or(usize::MAX))
+    }
+
+    /// Whole frames covered by `bytes` of audio data, zero if the frame size is
+    /// unknown.
+    fn frames_at(&self, bytes: u64) -> usize {
+        let frames = bytes
+            .checked_div(self.spec.frame_bytes() as u64)
+            .unwrap_or(0);
+        usize::try_from(frames).unwrap_or(usize::MAX)
     }
 
     /// Write all frames of a floating point buffer, converting to the file's
     /// sample format.
     ///
-    /// Each sample is scaled from the range -1.0..1.0 and clipped if it falls
-    /// outside the range representable by the target format. Returns the number
-    /// of samples that were clipped.
+    /// Each sample is scaled from the range -1.0..1.0. For the integer formats,
+    /// values outside that range are clipped to the nearest limit, and the
+    /// return value counts how many samples were clipped. The float formats
+    /// ([`SampleFormat::F32`](crate::SampleFormat::F32) and
+    /// [`SampleFormat::F64`](crate::SampleFormat::F64)) are not range limited:
+    /// values outside -1.0..1.0 are valid headroom and pass through unchanged,
+    /// so writing to them always returns zero.
     ///
     /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
     /// trailing chunk has already been written, since audio data must precede
@@ -417,6 +606,22 @@ impl<W: Write> WavWriter<W> {
         self.data_bytes = self.data_bytes.max(self.data_pos);
     }
 
+    /// Write `count` zero bytes at the current position, as audio data.
+    ///
+    /// Used to fill the gap left by a forward seek. Callers must have checked the
+    /// capacity first.
+    fn write_zeros(&mut self, count: u64) -> Result<()> {
+        const ZEROS: [u8; 8192] = [0; 8192];
+        let mut left = count;
+        while left > 0 {
+            let chunk = left.min(ZEROS.len() as u64) as usize;
+            self.inner.write_all(&ZEROS[..chunk])?;
+            left -= chunk as u64;
+        }
+        self.advance(count);
+        Ok(())
+    }
+
     /// Write a metadata chunk after the audio data.
     ///
     /// Call this once all audio data has been written; afterwards no more audio
@@ -453,10 +658,14 @@ impl<W: Write> WavWriter<W> {
     /// This only applies to seekable RIFF output: streaming RIFF deliberately
     /// leaves the size fields at [`u32::MAX`], and RF64 has no such limit.
     fn check_capacity(&self, additional: u64) -> Result<()> {
+        // The write may land before the current end (after a backwards seek),
+        // so size against whichever extent is larger.
+        self.check_extent(self.data_bytes.max(self.data_pos + additional))
+    }
+
+    /// Reject a data extent that a seekable RIFF file could not describe.
+    fn check_extent(&self, extent: u64) -> Result<()> {
         if self.seekable && matches!(self.layout.sizes, SizeFields::Riff { .. }) {
-            // The write may land before the current end (after a backwards seek),
-            // so size against whichever extent is larger.
-            let extent = self.data_bytes.max(self.data_pos + additional);
             let projected = self.layout.header_len + extent + self.trailing_bytes;
             if projected.saturating_sub(8) > u32::MAX as u64 {
                 return Err(WavError::InvalidSpec(
@@ -497,12 +706,7 @@ impl<W: Write + Seek> WavWriter<W> {
     /// with [`WavError::InvalidSpec`](crate::WavError::InvalidSpec).
     pub fn new_with_chunks(mut inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
         let spec = WriterSpec::Typed(spec);
-        let layout = write_header(
-            &mut inner,
-            &spec,
-            leading,
-            Container::Riff { placeholder: 0 },
-        )?;
+        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
         Ok(Self {
             inner,
             spec,
@@ -529,12 +733,7 @@ impl<W: Write + Seek> WavWriter<W> {
     /// between the `fmt ` chunk and the audio data.
     pub fn new_raw_with_chunks(mut inner: W, spec: RawSpec, leading: &[Chunk]) -> Result<Self> {
         let spec = WriterSpec::Raw(spec);
-        let layout = write_header(
-            &mut inner,
-            &spec,
-            leading,
-            Container::Riff { placeholder: 0 },
-        )?;
+        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
         Ok(Self {
             inner,
             spec,
@@ -585,13 +784,18 @@ impl<W: Write + Seek> WavWriter<W> {
     /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved) overwrites the
     /// audio from there. Seeking backwards and overwriting does not shrink the
     /// file: the declared `data` size still covers the furthest point reached, so
-    /// data beyond the rewritten region is preserved. Seeking past the current end
-    /// and writing leaves the bytes in between undefined (whatever the underlying
-    /// stream produces for the gap).
+    /// data beyond the rewritten region is preserved. Use
+    /// [`truncate`](WavWriter::truncate) to drop it instead.
+    ///
+    /// Seeking past the current end fills the gap with zeros, so skipping ahead
+    /// leaves silence rather than undefined bytes. The zeros are written straight
+    /// away and count as audio data, so the file grows to the seek target even if
+    /// nothing is written afterwards.
     ///
     /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
     /// trailing chunk has already been written, since audio data must precede
-    /// trailing chunks.
+    /// trailing chunks, or if the target lies beyond the 4 GB limit of a seekable
+    /// RIFF file.
     pub fn seek_to_frame(&mut self, frame: usize) -> Result<()> {
         self.ensure_data_open()?;
         let frame_bytes = self.spec.frame_bytes() as u64;
@@ -600,10 +804,23 @@ impl<W: Write + Seek> WavWriter<W> {
                 "cannot seek: frame size is zero".to_string(),
             ));
         }
-        let offset = frame_bytes * frame as u64;
-        self.inner
-            .seek(SeekFrom::Start(self.layout.header_len + offset))?;
-        self.data_pos = offset;
+        let offset = frame_bytes
+            .checked_mul(frame as u64)
+            .ok_or_else(|| WavError::InvalidSpec("seek target overflows".to_string()))?;
+        if offset > self.data_bytes {
+            // Past the end: fill the gap with silence from the current extent, so
+            // the skipped region has defined contents whatever the inner writer
+            // does with a seek beyond the end of the stream.
+            self.check_extent(offset)?;
+            self.inner
+                .seek(SeekFrom::Start(self.layout.header_len + self.data_bytes))?;
+            self.data_pos = self.data_bytes;
+            self.write_zeros(offset - self.data_bytes)?;
+        } else {
+            self.inner
+                .seek(SeekFrom::Start(self.layout.header_len + offset))?;
+            self.data_pos = offset;
+        }
         Ok(())
     }
 
@@ -617,7 +834,44 @@ impl<W: Write + Seek> WavWriter<W> {
         if !self.seekable {
             return Ok(self.inner);
         }
+        self.patch_sizes()?;
+        self.inner.seek(SeekFrom::End(0))?;
+        Ok(self.inner)
+    }
 
+    /// Update the size fields in the header to cover the audio written so far,
+    /// then return to the current write position.
+    ///
+    /// Call this periodically during a long recording so that the file on disk
+    /// stays valid: if the process is interrupted before
+    /// [`finalize`](WavWriter::finalize), the file describes everything up to the
+    /// last update instead of being unusable. It flushes the inner writer before
+    /// patching, so the header never claims more audio than has been handed to
+    /// the underlying stream.
+    ///
+    /// This matters most for [RF64](WavWriter::new_rf64), where the `ds64` sizes
+    /// start at zero and an interrupted file would otherwise declare no audio at
+    /// all. A plain RIFF file degrades more gracefully on its own, since its
+    /// placeholder is the [`u32::MAX`] "runs to the end of the file" marker, but
+    /// updating still turns it into a properly sized file.
+    ///
+    /// Writing continues normally afterwards, and the sizes are written again by
+    /// [`finalize`](WavWriter::finalize). For a streaming writer this does
+    /// nothing but flush, since its sizes stay at [`u32::MAX`] by design.
+    pub fn update_header(&mut self) -> Result<()> {
+        self.inner.flush()?;
+        if !self.seekable {
+            return Ok(());
+        }
+        let resume = self.inner.stream_position()?;
+        self.patch_sizes()?;
+        self.inner.seek(SeekFrom::Start(resume))?;
+        Ok(())
+    }
+
+    /// Write the current lengths into the header size fields. Leaves the stream
+    /// positioned at the last field written, so callers must reposition after.
+    fn patch_sizes(&mut self) -> Result<()> {
         // Everything after the 8-byte RIFF/RF64 id/size: the header body, the
         // audio data and any trailing chunks (with the data pad byte).
         let riff_size = self.layout.header_len + self.data_bytes + self.trailing_bytes - 8;
@@ -667,7 +921,68 @@ impl<W: Write + Seek> WavWriter<W> {
             }
         }
 
-        self.inner.seek(SeekFrom::End(0))?;
-        Ok(self.inner)
+        Ok(())
+    }
+}
+
+impl<W: Write + Seek + Truncate> WavWriter<W> {
+    /// Discard the audio data after the current write position.
+    ///
+    /// The escape hatch from the never-shrink rule: after a backwards
+    /// [`seek_to_frame`](WavWriter::seek_to_frame) the declared size still covers
+    /// the furthest point reached, and this drops everything past the cursor
+    /// instead. Equivalent to
+    /// `truncate_to_frame(self.position())`.
+    pub fn truncate(&mut self) -> Result<()> {
+        let frame = self.position();
+        self.truncate_to_frame(frame)
+    }
+
+    /// Discard the audio data after frame `frame`, keeping frames `0..frame`.
+    ///
+    /// The file is shortened on the spot and the declared sizes follow when
+    /// [`finalize`](WavWriter::finalize) or
+    /// [`update_header`](WavWriter::update_header) next writes them. The write
+    /// cursor stays where it is, unless it was inside the discarded region, in
+    /// which case it moves to the new end.
+    ///
+    /// A `frame` at or past the current end does nothing: this only ever shrinks.
+    /// Use [`seek_to_frame`](WavWriter::seek_to_frame) to extend a file, which
+    /// fills the gap with silence.
+    ///
+    /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
+    /// trailing chunk has already been written, since trimming the audio would
+    /// leave it stranded, if the writer is streaming (its sizes are never
+    /// patched), or if the frame size is unknown (a [`RawSpec`] with a zero block
+    /// alignment).
+    pub fn truncate_to_frame(&mut self, frame: usize) -> Result<()> {
+        self.ensure_data_open()?;
+        if !self.seekable {
+            return Err(WavError::InvalidSpec(
+                "cannot truncate a streaming writer".to_string(),
+            ));
+        }
+        let frame_bytes = self.spec.frame_bytes() as u64;
+        if frame_bytes == 0 {
+            return Err(WavError::InvalidSpec(
+                "cannot truncate: frame size is zero".to_string(),
+            ));
+        }
+        let offset = frame_bytes.saturating_mul(frame as u64);
+        if offset >= self.data_bytes {
+            return Ok(());
+        }
+
+        // Buffered bytes past the cut have to reach the stream before it is
+        // shortened, or they would land after it and undo the trim.
+        self.inner.flush()?;
+        self.inner.truncate_to(self.layout.header_len + offset)?;
+        self.data_bytes = offset;
+        // Shortening the stream does not move the cursor, so put it somewhere
+        // valid: where it was, or the new end if that is now past it.
+        self.data_pos = self.data_pos.min(offset);
+        self.inner
+            .seek(SeekFrom::Start(self.layout.header_len + self.data_pos))?;
+        Ok(())
     }
 }

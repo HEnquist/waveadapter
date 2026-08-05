@@ -5,7 +5,7 @@ use std::io::Cursor;
 use audioadapter::{Adapter, AdapterMut};
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::header::read_wav_header;
-use waveadapter::{Chunk, RawSpec, SampleFormat, WavReader, WavSpec, WavWriter};
+use waveadapter::{Chunk, RawSpec, SampleFormat, WavError, WavReader, WavSpec, WavWriter};
 
 fn make_buffer(channels: usize, frames: usize) -> InterleavedOwned<f32> {
     let mut buf = InterleavedOwned::<f32>::new(0.0, channels, frames);
@@ -62,6 +62,7 @@ fn roundtrip(format: SampleFormat, tolerance: f32) {
 #[test]
 fn roundtrip_all_formats() {
     // Integer formats lose precision according to their bit depth.
+    roundtrip(SampleFormat::U8, 1.0 / 127.0 * 2.0);
     roundtrip(SampleFormat::I16, 1.0 / 32767.0 * 2.0);
     roundtrip(SampleFormat::I24_3, 1.0 / 8_388_607.0 * 2.0);
     roundtrip(SampleFormat::I24_4, 1.0 / 8_388_607.0 * 2.0);
@@ -262,6 +263,97 @@ fn writes_multichannel_as_extensible() {
     let restored = reader.read_all_to_float::<f32>().unwrap();
     assert_eq!(restored.frames(), frames);
     let tolerance = 1.0 / 32_767.0 * 2.0;
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert!(
+                (a - b).abs() <= tolerance,
+                "frame {frame} ch {ch}: {a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn writes_8bit_as_unsigned_centered_at_128() {
+    // Wav 8-bit PCM is unsigned, unlike every deeper depth, so check the bytes
+    // that land on disk rather than only the float roundtrip.
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 8000,
+        sample_format: SampleFormat::U8,
+        channel_mask: None,
+    };
+    let mut source = InterleavedOwned::<f32>::new(0.0, 1, 3);
+    source.write_sample(0, 0, &-1.0);
+    source.write_sample(0, 1, &0.0);
+    source.write_sample(0, 2, &1.0);
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    // +1.0 clips to 255, the same asymmetry the signed formats have at +1.0.
+    assert_eq!(
+        writer.write_float_buffer(&source).unwrap(),
+        1,
+        "the +1.0 sample clips"
+    );
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    // Plain 16-byte fmt, no fact chunk: 8-bit PCM is unambiguous.
+    assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 1, "format tag");
+    assert_eq!(u16::from_le_bytes([bytes[32], bytes[33]]), 1, "block align");
+    assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 8, "bit depth");
+    assert_eq!(&bytes[36..40], b"data");
+    assert_eq!(&bytes[44..47], &[0, 128, 255], "unsigned, centered at 128");
+
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), Some(SampleFormat::U8));
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.read_sample(0, 0).unwrap(), -1.0);
+    assert_eq!(restored.read_sample(0, 1).unwrap(), 0.0);
+    assert_eq!(restored.read_sample(0, 2).unwrap(), 127.0 / 128.0);
+}
+
+#[test]
+fn writes_multichannel_8bit_as_extensible() {
+    // More than two channels forces the extensible form, so the 8-bit subformat
+    // has to survive the GUID round trip too.
+    let channels = 4;
+    let frames = 8;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 22050,
+        sample_format: SampleFormat::U8,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+
+    assert_eq!(
+        u16::from_le_bytes([bytes[20], bytes[21]]),
+        0xFFFE,
+        "format tag is WAVE_FORMAT_EXTENSIBLE"
+    );
+    assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 8, "bit depth");
+    assert_eq!(
+        u16::from_le_bytes([bytes[38], bytes[39]]),
+        8,
+        "wValidBitsPerSample"
+    );
+
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.sample_format(), Some(SampleFormat::U8));
+    assert_eq!(reader.channels(), channels);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    let tolerance = 1.0 / 127.0 * 2.0;
     for frame in 0..frames {
         for ch in 0..channels {
             let a = source.read_sample(ch, frame).unwrap();
@@ -519,10 +611,10 @@ fn bw64_is_read_like_rf64() {
 
 #[test]
 fn raw_writer_roundtrips_an_unmodeled_format() {
-    // 8-bit unsigned PCM: a valid format this crate does not model. Two channels,
-    // so one frame is two bytes.
+    // Mu-law: a valid format this crate does not model. Two channels, so one
+    // frame is two bytes.
     let spec = RawSpec {
-        format_code: 1,
+        format_code: 7,
         channels: 2,
         sample_rate: 22050,
         bits_per_sample: 8,
@@ -541,7 +633,7 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
     assert_eq!(reader.sample_format(), None);
     assert_eq!(reader.channels(), 2);
     assert_eq!(reader.sample_rate(), 22050);
-    assert_eq!(reader.params().format_code, 1);
+    assert_eq!(reader.params().format_code, 7);
     assert_eq!(reader.params().bits_per_sample, 8);
     assert_eq!(reader.params().block_align, 2);
     assert_eq!(reader.frames(), 16);
@@ -559,7 +651,7 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
 #[test]
 fn float_read_on_raw_format_errors() {
     let spec = RawSpec {
-        format_code: 1,
+        format_code: 7,
         channels: 1,
         sample_rate: 8000,
         bits_per_sample: 8,
@@ -583,7 +675,7 @@ fn float_read_on_raw_format_errors() {
 #[test]
 fn float_write_on_raw_writer_errors() {
     let spec = RawSpec {
-        format_code: 1,
+        format_code: 7,
         channels: 1,
         sample_rate: 8000,
         bits_per_sample: 8,
@@ -810,4 +902,523 @@ fn convenience_file_roundtrip() {
     }
 
     std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn abandoned_riff_writer_is_still_readable() {
+    let channels = 2;
+    let frames = 48;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 44100,
+        sample_format: SampleFormat::F32,
+        channel_mask: None,
+    };
+
+    // Write audio but never call finalize, standing in for a process that was
+    // interrupted mid-recording.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+        writer.write_float_buffer(&source).unwrap();
+    }
+    let bytes = cursor.into_inner();
+
+    // The unpatched size fields carry the "runs to end of file" marker, not zero.
+    let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    assert_eq!(rd32(4), u32::MAX, "RIFF size is the unknown-length marker");
+
+    // So the audio that reached the file reads back intact.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), frames);
+    for frame in 0..frames {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert_eq!(a, b, "frame {frame} ch {ch}");
+        }
+    }
+}
+
+#[test]
+fn update_header_makes_an_abandoned_rf64_readable() {
+    let channels = 2;
+    let half = 32;
+    let source = make_buffer(channels, half);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::F32,
+        channel_mask: None,
+    };
+
+    // Write a block, update the header, write a second block, then never
+    // finalize. RF64 has no unknown-length marker, so only the updated ds64
+    // sizes make the file readable.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+        writer.write_float_buffer(&source).unwrap();
+        writer.update_header().unwrap();
+        writer.write_float_buffer(&source).unwrap();
+    }
+    let bytes = cursor.into_inner();
+
+    // Both blocks are on disk, but the header only declares the first.
+    let expected_bytes = (half * channels * 4) as u64;
+    assert_eq!(
+        bytes.len() as u64,
+        72 + 8 + 2 * expected_bytes,
+        "both blocks were written"
+    );
+    let rd64 = |o: usize| {
+        u64::from_le_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+            bytes[o + 4],
+            bytes[o + 5],
+            bytes[o + 6],
+            bytes[o + 7],
+        ])
+    };
+    assert_eq!(rd64(28), expected_bytes, "ds64 dataSize from the update");
+    assert_eq!(rd64(36), half as u64, "ds64 sampleCount from the update");
+
+    // The declared audio reads back intact.
+    let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.frames(), half);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    assert_eq!(restored.frames(), half);
+    for frame in 0..half {
+        for ch in 0..channels {
+            let a = source.read_sample(ch, frame).unwrap();
+            let b = restored.read_sample(ch, frame).unwrap();
+            assert_eq!(a, b, "frame {frame} ch {ch}");
+        }
+    }
+}
+
+#[test]
+fn update_header_resumes_writing_at_the_right_place() {
+    let channels = 1;
+    let frames = 16;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 44100,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    // Interleaving updates with writes must not disturb the write cursor: the
+    // finalized file has to match one written without any updates.
+    let mut updated = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut updated, spec).unwrap();
+    writer.update_header().unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.update_header().unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.update_header().unwrap();
+    writer.finalize().unwrap();
+
+    let mut plain = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut plain, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+    writer.finalize().unwrap();
+
+    assert_eq!(
+        updated.into_inner(),
+        plain.into_inner(),
+        "updating the header must not change the finished file"
+    );
+}
+
+#[test]
+fn rf64_chunk_size_from_ds64_cannot_overflow_the_scan() {
+    // Found by the parse_header fuzz target. For RF64 the real chunk size comes
+    // from the ds64 table as an unvalidated 64-bit value, so a file can name a
+    // size near u64::MAX. The offset arithmetic that checks whether a chunk
+    // overruns the file used to overflow before it could reject it: a panic in
+    // debug, and in release a wrapped offset that passed the overrun check and
+    // went on to request a multi-exabyte allocation.
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RF64");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+    file.extend_from_slice(b"WAVE");
+
+    // ds64 with a one-entry table claiming a JUNK chunk of u64::MAX bytes.
+    file.extend_from_slice(b"ds64");
+    file.extend_from_slice(&40u32.to_le_bytes());
+    file.extend_from_slice(&0u64.to_le_bytes()); // riffSize
+    file.extend_from_slice(&0u64.to_le_bytes()); // dataSize
+    file.extend_from_slice(&0u64.to_le_bytes()); // sampleCount
+    file.extend_from_slice(&1u32.to_le_bytes()); // tableLength
+    file.extend_from_slice(b"JUNK");
+    file.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    // A perfectly good 16-bit stereo fmt and a short data chunk.
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&16u32.to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    file.extend_from_slice(&2u16.to_le_bytes()); // channels
+    file.extend_from_slice(&44100u32.to_le_bytes());
+    file.extend_from_slice(&176400u32.to_le_bytes()); // byte rate
+    file.extend_from_slice(&4u16.to_le_bytes()); // block align
+    file.extend_from_slice(&16u16.to_le_bytes()); // bits
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&4u32.to_le_bytes());
+    file.extend_from_slice(&[0u8; 4]);
+
+    // The oversized chunk, whose 0xFFFFFFFF size resolves through the table.
+    file.extend_from_slice(b"JUNK");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+
+    // The bogus length must stop the scan, not blow up, and the chunks found
+    // before it must survive.
+    let params = read_wav_header(Cursor::new(file)).expect("header should still parse");
+    assert_eq!(params.channels, 2);
+    assert_eq!(params.sample_rate, 44100);
+    assert_eq!(params.sample_format, Some(SampleFormat::I16));
+    assert_eq!(params.data_length, 4);
+}
+
+#[test]
+fn writer_position_and_extent() {
+    let channels = 2;
+    let frames = 32;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+    let frame_bytes = channels * 2;
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+
+    // A plain 16-bit stereo header: RIFF + fmt + data headers, no fact chunk.
+    assert_eq!(writer.data_offset(), 44);
+    assert_eq!(writer.frames_written(), 0);
+    assert_eq!(writer.position(), 0);
+
+    writer.write_float_buffer(&source).unwrap();
+    assert_eq!(writer.frames_written(), frames);
+    assert_eq!(writer.position(), frames);
+    assert_eq!(writer.data_bytes(), (frames * frame_bytes) as u64);
+
+    // After seeking back, the cursor and the extent are different numbers.
+    writer.seek_to_frame(10).unwrap();
+    assert_eq!(writer.position(), 10);
+    assert_eq!(writer.frames_written(), frames);
+
+    // Overwriting in place moves the cursor but not the extent.
+    writer
+        .write_float_buffer(&make_buffer(channels, 4))
+        .unwrap();
+    assert_eq!(writer.position(), 14);
+    assert_eq!(writer.frames_written(), frames);
+
+    // The room left is counted from the cursor, up to the 4 GB RIFF ceiling.
+    let ceiling = u32::MAX as u64 + 8 - writer.data_offset();
+    assert_eq!(
+        writer.remaining_frames(),
+        Some(((ceiling - (14 * frame_bytes) as u64) / frame_bytes as u64) as usize)
+    );
+
+    // A trailing chunk closes the audio, so nothing more can be written.
+    writer.write_chunk(*b"JUNK", &[0; 4]).unwrap();
+    assert_eq!(writer.remaining_frames(), Some(0));
+}
+
+#[test]
+fn remaining_frames_is_none_without_a_limit() {
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    // Streaming never patches the size fields, and RF64 has 64-bit ones.
+    let streaming = WavWriter::new_streaming(Cursor::new(Vec::new()), spec).unwrap();
+    assert_eq!(streaming.remaining_frames(), None);
+
+    let rf64 = WavWriter::new_rf64(Cursor::new(Vec::new()), spec).unwrap();
+    assert_eq!(rf64.remaining_frames(), None);
+}
+
+#[test]
+fn writer_forward_seek_fills_with_silence() {
+    let channels = 1;
+    let frames = 8;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+
+    // Skip a gap and write a second block. The gap is silence, and the file has
+    // already grown to the seek target before anything is written there.
+    writer.seek_to_frame(20).unwrap();
+    assert_eq!(writer.frames_written(), 20);
+    assert_eq!(writer.position(), 20);
+    writer.write_float_buffer(&source).unwrap();
+    assert_eq!(writer.frames_written(), 28);
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 28);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    for frame in 0..28 {
+        let expected = match frame {
+            0..8 => source.read_sample(0, frame).unwrap(),
+            8..20 => 0.0,
+            _ => source.read_sample(0, frame - 20).unwrap(),
+        };
+        let got = restored.read_sample(0, frame).unwrap();
+        assert!(
+            (expected - got).abs() <= 1e-4,
+            "frame {frame}: {expected} vs {got}"
+        );
+    }
+}
+
+#[test]
+fn writer_truncate_drops_data_past_the_cursor() {
+    let channels = 2;
+    let frames = 32;
+    let source = make_buffer(channels, frames);
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+    let frame_bytes = channels * 2;
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&source).unwrap();
+
+    // Seek back and cut: the extent follows the cursor down instead of staying
+    // at the high-water mark.
+    writer.seek_to_frame(10).unwrap();
+    assert_eq!(writer.frames_written(), frames);
+    writer.truncate().unwrap();
+    assert_eq!(writer.frames_written(), 10);
+    assert_eq!(writer.position(), 10);
+    assert_eq!(writer.data_bytes(), (10 * frame_bytes) as u64);
+
+    // Writing continues from the new end.
+    writer
+        .write_float_buffer(&make_buffer(channels, 4))
+        .unwrap();
+    assert_eq!(writer.frames_written(), 14);
+    let data_offset = writer.data_offset();
+    writer.finalize().unwrap();
+
+    // The bytes are really gone, not just excluded by the declared size.
+    assert_eq!(
+        cursor.get_ref().len() as u64,
+        data_offset + (14 * frame_bytes) as u64
+    );
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 14);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    let second = make_buffer(channels, 4);
+    for frame in 0..14 {
+        for ch in 0..channels {
+            let expected = if frame < 10 {
+                source.read_sample(ch, frame).unwrap()
+            } else {
+                second.read_sample(ch, frame - 10).unwrap()
+            };
+            let got = restored.read_sample(ch, frame).unwrap();
+            assert!(
+                (expected - got).abs() <= 1e-4,
+                "frame {frame} ch {ch}: {expected} vs {got}"
+            );
+        }
+    }
+}
+
+#[test]
+fn writer_truncate_to_frame_moves_a_stranded_cursor() {
+    let channels = 1;
+    let frames = 16;
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer
+        .write_float_buffer(&make_buffer(channels, frames))
+        .unwrap();
+
+    // Cutting below the cursor drags it back to the new end, so the next write
+    // appends there rather than leaving a hole.
+    writer.truncate_to_frame(4).unwrap();
+    assert_eq!(writer.position(), 4);
+    assert_eq!(writer.frames_written(), 4);
+
+    // A cut at or past the end is a no-op, and truncating never grows the file.
+    writer.truncate_to_frame(4).unwrap();
+    writer.truncate_to_frame(100).unwrap();
+    assert_eq!(writer.frames_written(), 4);
+
+    writer
+        .write_float_buffer(&make_buffer(channels, 2))
+        .unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 6);
+}
+
+#[test]
+fn writer_truncate_rejects_streaming_and_trailing_chunks() {
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    // A streaming writer never patches its size fields, so a trim could not be
+    // described even though the underlying stream could be shortened.
+    let mut streaming = WavWriter::new_streaming(Cursor::new(Vec::new()), spec).unwrap();
+    streaming.write_raw_interleaved(&[0; 16]).unwrap();
+    assert!(matches!(
+        streaming.truncate_to_frame(1),
+        Err(WavError::InvalidSpec(_))
+    ));
+
+    // Trimming the audio under a trailing chunk would strand it.
+    let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[0; 16]).unwrap();
+    writer.write_chunk(*b"JUNK", &[0; 4]).unwrap();
+    assert!(matches!(
+        writer.truncate_to_frame(1),
+        Err(WavError::InvalidSpec(_))
+    ));
+
+    // A raw writer with no block alignment has no frame size to cut on.
+    let raw = RawSpec {
+        format_code: 6,
+        channels: 1,
+        sample_rate: 8000,
+        bits_per_sample: 8,
+        block_align: 0,
+    };
+    let mut raw_writer = WavWriter::new_raw(Cursor::new(Vec::new()), raw).unwrap();
+    raw_writer.write_raw_interleaved(&[0; 16]).unwrap();
+    assert!(matches!(
+        raw_writer.truncate_to_frame(1),
+        Err(WavError::InvalidSpec(_))
+    ));
+}
+
+#[test]
+fn rf64_truncate_updates_the_ds64_sizes() {
+    let channels = 2;
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+    writer
+        .write_float_buffer(&make_buffer(channels, 32))
+        .unwrap();
+    writer.truncate_to_frame(12).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 12);
+    assert_eq!(reader.params().data_length, 12 * channels * 2);
+}
+
+#[test]
+fn writer_truncate_on_a_buffered_file() {
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    let channels = 2;
+    let spec = WavSpec {
+        channels,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("waveadapter_truncate_{}.wav", std::process::id()));
+
+    let file = BufWriter::new(File::create(&path).unwrap());
+    let mut writer = WavWriter::new(file, spec).unwrap();
+    writer
+        .write_float_buffer(&make_buffer(channels, 64))
+        .unwrap();
+    // Nothing has been flushed yet, so this exercises the BufWriter impl
+    // flushing before the file is shortened.
+    writer.truncate_to_frame(20).unwrap();
+    let data_offset = writer.data_offset();
+    writer.finalize().unwrap();
+
+    let on_disk = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(on_disk, data_offset + (20 * channels * 2) as u64);
+
+    let audio: waveadapter::WavData<f32> = waveadapter::read_wav_file(&path).unwrap();
+    assert_eq!(audio.frames(), 20);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn writer_forward_seek_alone_extends_the_file() {
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.seek_to_frame(16).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.frames(), 16);
+    let restored = reader.read_all_to_float::<f32>().unwrap();
+    for frame in 0..16 {
+        for ch in 0..2 {
+            assert_eq!(restored.read_sample(ch, frame).unwrap(), 0.0f32);
+        }
+    }
 }

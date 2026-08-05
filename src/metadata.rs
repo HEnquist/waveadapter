@@ -3,8 +3,9 @@
 //! waveadapter passes every non-audio chunk through as a raw [`Chunk`] blob.
 //! This module is a thin typed layer over those blobs for the common cases:
 //! [`InfoList`] (the `LIST`/`INFO` tag list), [`Bext`] (the Broadcast Audio
-//! Extension), and the marker pair [`Cue`] (the `cue ` chunk) plus
-//! [`AdtlList`] (the `LIST`/`adtl` labels that name those markers). Each offers
+//! Extension), the marker pair [`Cue`] (the `cue ` chunk) plus
+//! [`AdtlList`] (the `LIST`/`adtl` labels that name those markers), and
+//! [`Smpl`] (the `smpl` sampler chunk with its loop points). Each offers
 //! `from_chunk`/`from_bytes` to decode and `to_chunk`/`to_bytes` to build one
 //! ready for [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) or a
 //! leading-chunk constructor. Anything else stays a raw blob for a caller to
@@ -30,6 +31,60 @@
 //! let parsed = InfoList::from_chunk(&chunk).unwrap();
 //! assert_eq!(parsed.get(metadata::TITLE), Some("Demo Tone"));
 //! ```
+//!
+//! # Editing the metadata of a file
+//!
+//! The full loop ties three APIs together. Chunks come off the reader as raw
+//! blobs in [`WavParams::chunks`](crate::WavParams::chunks), get decoded and
+//! edited here, and go back through a leading-chunk constructor such as
+//! [`WavWriter::new_with_chunks`](crate::WavWriter::new_with_chunks). Chunks
+//! that are not recognized are passed along untouched, which is what keeps the
+//! metadata this crate has no types for from being dropped on the way:
+//!
+//! ```
+//! # use audioadapter_buffers::owned::InterleavedOwned;
+//! use std::io::Cursor;
+//! use waveadapter::metadata::{self, InfoList};
+//! use waveadapter::{Chunk, SampleFormat, WavReader, WavSpec, WavWriter};
+//!
+//! # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+//! # let mut demo = InfoList::new();
+//! # demo.set(metadata::TITLE, "Demo Tone");
+//! # let mut w = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &[demo.to_chunk()])?;
+//! # w.write_float_buffer(&InterleavedOwned::<f32>::new(0.0, 2, 128))?;
+//! # let wav_bytes = w.finalize()?.into_inner();
+//! // A whole wav file held in memory; a File works the same on both ends.
+//! let mut reader = WavReader::new(Cursor::new(wav_bytes))?;
+//! let audio = reader.read_all_to_float::<f32>()?;
+//!
+//! // Decode the chunk we want to edit, and keep every other one as it is.
+//! let mut info = InfoList::new();
+//! let mut chunks: Vec<Chunk> = Vec::new();
+//! for chunk in &reader.params().chunks {
+//!     match InfoList::from_chunk(chunk) {
+//!         Some(list) => info = list,
+//!         None => chunks.push(chunk.clone()),
+//!     }
+//! }
+//! info.set(metadata::SOFTWARE, "waveadapter");
+//! chunks.push(info.to_chunk());
+//!
+//! let spec = WavSpec::new(reader.channels(), reader.sample_rate(), SampleFormat::I16);
+//! let mut writer = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &chunks)?;
+//! writer.write_float_buffer(&audio)?;
+//! let output = writer.finalize()?.into_inner();
+//! # let edited = WavReader::new(Cursor::new(output))?;
+//! # let list = InfoList::from_chunk(&edited.params().chunks[0]).unwrap();
+//! # assert_eq!(list.get(metadata::TITLE), Some("Demo Tone"));
+//! # assert_eq!(list.get(metadata::SOFTWARE), Some("waveadapter"));
+//! # Ok::<(), waveadapter::WavError>(())
+//! ```
+//!
+//! Chunks can also go *after* the audio, written one at a time with
+//! [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) once all the audio
+//! is written. That is the only option for anything that depends on the final
+//! length, and the usual place for an [`AdtlList`] naming markers that were
+//! decided while recording.
 
 use crate::header::Chunk;
 
@@ -116,7 +171,8 @@ impl InfoList {
         let mut body = Vec::new();
         body.extend_from_slice(&INFO);
         for (id, text) in &self.tags {
-            let mut value = text.as_bytes().to_vec();
+            let mut value = Vec::new();
+            encode_text(&mut value, text, usize::MAX);
             value.push(0); // NUL terminator
             body.extend_from_slice(id);
             body.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -181,22 +237,59 @@ impl InfoList {
     }
 }
 
-/// Decode a NUL-terminated, fixed-width or trailing text field: take the bytes
-/// up to the first NUL (the rest is padding) and interpret them as text,
-/// replacing invalid sequences. Used for both `INFO` values and the fixed-width
-/// `bext` string fields.
+/// Decode a NUL-terminated text field: take the bytes up to the first NUL (the
+/// rest is padding) and interpret them as text. Used for `INFO` values, the
+/// `adtl` label text and the `bext` string fields.
+///
+/// The bytes are read as UTF-8 when they are valid UTF-8, and as Latin-1
+/// (ISO-8859-1, one byte per character) otherwise. EBU Tech 3285 and the RIFF
+/// spec both call for ASCII, which the two readings agree on, but files in the
+/// wild carry Latin-1 and UTF-8 alike.
+///
+/// This is the inverse of [`encode_text`]. Decoding with `from_utf8_lossy`
+/// instead would be lossy in a way that cannot be undone: every invalid byte
+/// becomes a 3-byte replacement character, so a field would grow on decode and
+/// then get truncated back on encode, losing content on every read/write cycle.
 fn decode_text(raw: &[u8]) -> String {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    String::from_utf8_lossy(&raw[..end]).into_owned()
+    let field = &raw[..end];
+    match str::from_utf8(field) {
+        Ok(text) => text.to_string(),
+        // Latin-1 maps every byte to a code point, so this cannot fail.
+        Err(_) => field.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Append `s` in the encoding [`decode_text`] reads back, writing at most
+/// `max_bytes` and cutting on a character boundary rather than mid-sequence.
+/// Returns the number of bytes written.
+///
+/// Latin-1 is used whenever every character fits in one byte. That is what
+/// `decode_text` produces for non-UTF-8 input, so such fields survive a
+/// read/write cycle byte for byte, and it also guarantees a decoded field always
+/// fits back into the field it came from. Text containing anything above U+00FF
+/// cannot be Latin-1 and is written as UTF-8.
+fn encode_text(out: &mut Vec<u8>, s: &str, max_bytes: usize) -> usize {
+    let start = out.len();
+    if s.chars().all(|c| (c as u32) <= 0xFF) {
+        out.extend(s.chars().take(max_bytes).map(|c| c as u8));
+    } else {
+        let mut buf = [0u8; 4];
+        for (offset, c) in s.char_indices() {
+            if offset + c.len_utf8() > max_bytes {
+                break;
+            }
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out.len() - start
 }
 
 /// Append `s` as a fixed-width NUL-padded field of `width` bytes, truncating the
 /// text if it is longer than the field.
 fn encode_fixed(out: &mut Vec<u8>, s: &str, width: usize) {
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(width);
-    out.extend_from_slice(&bytes[..n]);
-    out.resize(out.len() + (width - n), 0);
+    let written = encode_text(out, s, width);
+    out.resize(out.len() + (width - written), 0);
 }
 
 /// The four-character id of the Broadcast Audio Extension chunk.
@@ -346,7 +439,7 @@ impl Bext {
         out.extend_from_slice(&self.max_short_term_loudness.to_le_bytes());
         // Reserved field: pad the fixed part out to its full 602 bytes.
         out.resize(BEXT_FIXED_LEN, 0);
-        out.extend_from_slice(self.coding_history.as_bytes());
+        encode_text(&mut out, &self.coding_history, usize::MAX);
         out
     }
 
@@ -631,13 +724,13 @@ impl AdtlList {
             match entry {
                 AdtlEntry::Label { cue_id, text } => {
                     let mut sub = cue_id.to_le_bytes().to_vec();
-                    sub.extend_from_slice(text.as_bytes());
+                    encode_text(&mut sub, text, usize::MAX);
                     sub.push(0); // NUL terminator
                     push_subchunk(&mut body, &LABL_ID, &sub);
                 }
                 AdtlEntry::Note { cue_id, text } => {
                     let mut sub = cue_id.to_le_bytes().to_vec();
-                    sub.extend_from_slice(text.as_bytes());
+                    encode_text(&mut sub, text, usize::MAX);
                     sub.push(0); // NUL terminator
                     push_subchunk(&mut body, &NOTE_ID, &sub);
                 }
@@ -659,7 +752,7 @@ impl AdtlList {
                     sub.extend_from_slice(&language.to_le_bytes());
                     sub.extend_from_slice(&dialect.to_le_bytes());
                     sub.extend_from_slice(&code_page.to_le_bytes());
-                    sub.extend_from_slice(text.as_bytes());
+                    encode_text(&mut sub, text, usize::MAX);
                     sub.push(0); // NUL terminator
                     push_subchunk(&mut body, &LTXT_ID, &sub);
                 }
@@ -672,6 +765,218 @@ impl AdtlList {
     pub fn to_chunk(&self) -> Chunk {
         Chunk {
             id: LIST_ID,
+            data: self.to_bytes(),
+        }
+    }
+}
+
+/// The four-character id of the sampler chunk.
+pub const SMPL_ID: [u8; 4] = *b"smpl";
+
+/// Loop type: play forward from start to end, then jump back to start.
+pub const LOOP_FORWARD: u32 = 0;
+/// Loop type: alternate between forward and backward playback (ping-pong).
+pub const LOOP_ALTERNATING: u32 = 1;
+/// Loop type: play backward from end to start.
+pub const LOOP_BACKWARD: u32 = 2;
+
+/// The size of the fixed part of a `smpl` chunk, before the loops.
+const SMPL_FIXED_LEN: usize = 36;
+
+/// The number of bytes a single sample loop occupies on disk.
+const SAMPLE_LOOP_LEN: usize = 24;
+
+/// One loop region in a [`Smpl`] chunk.
+///
+/// The loop runs from [`start`](SampleLoop::start) to [`end`](SampleLoop::end),
+/// both frame positions in the `data` chunk, with `end` being the last frame
+/// played before jumping back. Use [`SampleLoop::forward`] for the common case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleLoop {
+    /// Identifier, tying the loop to a [`CuePoint::id`] when one names it.
+    pub cue_id: u32,
+    /// How the loop plays: [`LOOP_FORWARD`], [`LOOP_ALTERNATING`],
+    /// [`LOOP_BACKWARD`], or a value of 32 and up for a sampler-specific type.
+    pub loop_type: u32,
+    /// First frame of the loop.
+    pub start: u32,
+    /// Last frame of the loop, played before jumping back to `start`.
+    pub end: u32,
+    /// Fractional adjustment of the loop end, in 1/2^32 of a frame (`0` if
+    /// unused).
+    pub fraction: u32,
+    /// How many times to play the loop, `0` meaning forever.
+    pub play_count: u32,
+}
+
+impl SampleLoop {
+    /// Build a forward loop over the frames `start..=end`, repeating forever,
+    /// with the given `cue_id`.
+    pub fn forward(cue_id: u32, start: u32, end: u32) -> Self {
+        Self {
+            cue_id,
+            loop_type: LOOP_FORWARD,
+            start,
+            end,
+            fraction: 0,
+            play_count: 0,
+        }
+    }
+}
+
+/// A parsed `smpl` chunk: the sampler information, above all the loop points and
+/// the note the recording sounds at.
+///
+/// This is what a sampler or software instrument reads to play a one-shot
+/// recording as a pitched, sustaining instrument: [`midi_unity_note`](Smpl::midi_unity_note)
+/// says which note it was recorded at, and [`loops`](Smpl::loops) says which part
+/// to repeat while the key is held.
+///
+/// The fields are public so they can be read and modified directly. The manufacturer
+/// and product codes, the SMPTE fields and [`sampler_data`](Smpl::sampler_data)
+/// are stored, not interpreted, so a file round-trips without loss.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Smpl {
+    /// MMA manufacturer code of the target sampler (`0` if unspecified).
+    pub manufacturer: u32,
+    /// Manufacturer-defined product code of the target sampler (`0` if
+    /// unspecified).
+    pub product: u32,
+    /// Duration of one frame in nanoseconds, conventionally
+    /// `1_000_000_000 / sample_rate`.
+    pub sample_period: u32,
+    /// MIDI note number the recording sounds at, 0-127 (60 is middle C).
+    pub midi_unity_note: u32,
+    /// Fraction of a semitone to detune by, in 1/2^32 of a semitone (`0` if
+    /// unused).
+    pub midi_pitch_fraction: u32,
+    /// SMPTE format of [`smpte_offset`](Smpl::smpte_offset): 0 (none), 24, 25,
+    /// 29 or 30 frames per second.
+    pub smpte_format: u32,
+    /// SMPTE time offset of the first frame, as packed hours/minutes/seconds/
+    /// frames bytes (`0` if unused).
+    pub smpte_offset: u32,
+    /// The loop regions, in file order.
+    pub loops: Vec<SampleLoop>,
+    /// Sampler-specific trailing bytes, passed through untouched.
+    pub sampler_data: Vec<u8>,
+}
+
+impl Smpl {
+    /// Create a `smpl` with all fields zeroed and no loops.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a `smpl` for a recording at `sample_rate`, filling in the matching
+    /// [`sample_period`](Smpl::sample_period) and a unity note of 60 (middle C).
+    pub fn at_rate(sample_rate: u32) -> Self {
+        Self {
+            sample_period: if sample_rate == 0 {
+                0
+            } else {
+                (1_000_000_000u64 / sample_rate as u64) as u32
+            },
+            midi_unity_note: 60,
+            ..Self::default()
+        }
+    }
+
+    /// Decode a `smpl` chunk body: the fixed 36-byte structure, that many
+    /// 24-byte loops, and the sampler-specific trailing bytes.
+    ///
+    /// Returns `None` if the body is shorter than the fixed structure. Parsing is
+    /// otherwise lenient: loops and sampler data beyond what the body actually
+    /// holds are dropped rather than erroring.
+    pub fn from_bytes(body: &[u8]) -> Option<Self> {
+        if body.len() < SMPL_FIXED_LEN {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+
+        let loop_count = u32_at(28) as usize;
+        let sampler_data_len = u32_at(32) as usize;
+        let mut loops = Vec::new();
+        let mut pos = SMPL_FIXED_LEN;
+        for _ in 0..loop_count {
+            if pos + SAMPLE_LOOP_LEN > body.len() {
+                break; // truncated, stop rather than read past the end
+            }
+            loops.push(SampleLoop {
+                cue_id: u32_at(pos),
+                loop_type: u32_at(pos + 4),
+                start: u32_at(pos + 8),
+                end: u32_at(pos + 12),
+                fraction: u32_at(pos + 16),
+                play_count: u32_at(pos + 20),
+            });
+            pos += SAMPLE_LOOP_LEN;
+        }
+        // Take as much of the declared sampler data as is actually there.
+        let available = body.len() - pos;
+        let sampler_data = body[pos..pos + sampler_data_len.min(available)].to_vec();
+
+        Some(Self {
+            manufacturer: u32_at(0),
+            product: u32_at(4),
+            sample_period: u32_at(8),
+            midi_unity_note: u32_at(12),
+            midi_pitch_fraction: u32_at(16),
+            smpte_format: u32_at(20),
+            smpte_offset: u32_at(24),
+            loops,
+            sampler_data,
+        })
+    }
+
+    /// Decode a `smpl` from a parsed [`Chunk`]. Returns `None` if the chunk is
+    /// not a `smpl` chunk.
+    pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
+        if chunk.id != SMPL_ID {
+            return None;
+        }
+        Self::from_bytes(&chunk.data)
+    }
+
+    /// Encode the `smpl` chunk body: the fixed structure, the loops, and the
+    /// sampler-specific bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(
+            SMPL_FIXED_LEN + self.loops.len() * SAMPLE_LOOP_LEN + self.sampler_data.len(),
+        );
+        for field in [
+            self.manufacturer,
+            self.product,
+            self.sample_period,
+            self.midi_unity_note,
+            self.midi_pitch_fraction,
+            self.smpte_format,
+            self.smpte_offset,
+            self.loops.len() as u32,
+            self.sampler_data.len() as u32,
+        ] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        for l in &self.loops {
+            for field in [
+                l.cue_id,
+                l.loop_type,
+                l.start,
+                l.end,
+                l.fraction,
+                l.play_count,
+            ] {
+                body.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        body.extend_from_slice(&self.sampler_data);
+        body
+    }
+
+    /// Build a `smpl` [`Chunk`] ready to hand to the writer.
+    pub fn to_chunk(&self) -> Chunk {
+        Chunk {
+            id: SMPL_ID,
             data: self.to_bytes(),
         }
     }
@@ -821,6 +1126,73 @@ mod tests {
     }
 
     #[test]
+    fn latin1_text_fields_survive_a_read_write_cycle() {
+        // A bext whose fixed fields are full of non-UTF-8 bytes, the case that
+        // used to lose content: decoding turned each byte into a 3-byte U+FFFD,
+        // and encoding truncated back to the field width.
+        let mut body = vec![0u8; 602];
+        body[256..288].fill(0xFF); // originator, the full 32 bytes
+        body[288..320].copy_from_slice(&[0xE9; 32]); // originator_reference
+
+        let bext = Bext::from_bytes(&body).unwrap();
+        assert_eq!(bext.originator.chars().count(), 32);
+        assert_eq!(bext.originator_reference.chars().count(), 32);
+
+        // Byte-exact, not merely stable: the field comes back as it went in.
+        let encoded = bext.to_bytes();
+        assert_eq!(&encoded[256..288], &body[256..288]);
+        assert_eq!(&encoded[288..320], &body[288..320]);
+        assert_eq!(Bext::from_bytes(&encoded).unwrap(), bext);
+    }
+
+    #[test]
+    fn utf8_text_fields_are_decoded_as_utf8() {
+        // Valid UTF-8 is read as UTF-8 rather than as Latin-1 mojibake.
+        let mut body = vec![0u8; 602];
+        let text = "Grabación";
+        body[256..256 + text.len()].copy_from_slice(text.as_bytes());
+
+        let bext = Bext::from_bytes(&body).unwrap();
+        assert_eq!(bext.originator, text);
+        // Every character here is below U+00FF, so it is written back in the
+        // shorter Latin-1 form. That is a different byte sequence, but it
+        // decodes to the same string and can no longer overflow the field.
+        assert_eq!(Bext::from_bytes(&bext.to_bytes()).unwrap(), bext);
+    }
+
+    #[test]
+    fn text_above_latin1_stays_utf8_and_cuts_on_a_char_boundary() {
+        // Characters above U+00FF cannot be Latin-1, so the field keeps UTF-8.
+        let bext = Bext {
+            // 8 three-byte characters is 24 bytes; the date field holds 10, so
+            // only three fit. The cut must not split the fourth.
+            origination_date: "\u{20AC}".repeat(8),
+            ..Bext::new()
+        };
+        let encoded = bext.to_bytes();
+        assert_eq!(&encoded[320..329], "\u{20AC}".repeat(3).as_bytes());
+        assert_eq!(encoded[329], 0, "the odd byte left over is NUL padding");
+
+        let parsed = Bext::from_bytes(&encoded).unwrap();
+        assert_eq!(parsed.origination_date, "\u{20AC}".repeat(3));
+    }
+
+    #[test]
+    fn latin1_survives_the_variable_length_fields_too() {
+        // The same encoding is used for every text field, not just the fixed
+        // ones: INFO tags, adtl labels and the bext coding history.
+        let raw = b"caf\xe9 sessions";
+        let mut list = InfoList::new();
+        list.push(TITLE, decode_text(raw));
+        let body = list.to_bytes();
+        assert!(
+            body.windows(raw.len()).any(|w| w == raw),
+            "the original bytes should appear verbatim in the encoded chunk"
+        );
+        assert_eq!(InfoList::from_bytes(&body).unwrap(), list);
+    }
+
+    #[test]
     fn cue_roundtrips_through_chunk() {
         let cue = Cue {
             points: vec![
@@ -929,5 +1301,74 @@ mod tests {
         });
         let adtl = AdtlList::from_bytes(&body).unwrap();
         assert_eq!(adtl.entries.len(), 2);
+    }
+
+    #[test]
+    fn smpl_roundtrips_through_chunk() {
+        let smpl = Smpl {
+            manufacturer: 0x4B,
+            product: 7,
+            midi_pitch_fraction: 0x8000_0000,
+            smpte_format: 25,
+            smpte_offset: 0x01_02_03_04,
+            loops: vec![
+                SampleLoop::forward(1, 0, 47_999),
+                // A non-default loop exercises every field.
+                SampleLoop {
+                    cue_id: 2,
+                    loop_type: LOOP_ALTERNATING,
+                    start: 100,
+                    end: 200,
+                    fraction: 42,
+                    play_count: 3,
+                },
+            ],
+            sampler_data: vec![0xAA, 0xBB, 0xCC],
+            ..Smpl::at_rate(48_000)
+        };
+        assert_eq!(smpl.sample_period, 20833);
+        assert_eq!(smpl.midi_unity_note, 60);
+
+        let chunk = smpl.to_chunk();
+        assert_eq!(&chunk.id, b"smpl");
+        // The loop count and sampler-data length close the fixed part.
+        assert_eq!(&chunk.data[28..32], &2u32.to_le_bytes());
+        assert_eq!(&chunk.data[32..36], &3u32.to_le_bytes());
+        assert_eq!(chunk.data.len(), SMPL_FIXED_LEN + 2 * SAMPLE_LOOP_LEN + 3);
+        assert_eq!(Smpl::from_chunk(&chunk), Some(smpl));
+    }
+
+    #[test]
+    fn smpl_drops_truncated_loops_and_sampler_data() {
+        // Claims 4 loops and 16 bytes of sampler data, but holds one loop and
+        // 2 trailing bytes.
+        let mut body = vec![0u8; SMPL_FIXED_LEN];
+        body[28..32].copy_from_slice(&4u32.to_le_bytes());
+        body[32..36].copy_from_slice(&16u32.to_le_bytes());
+        body.resize(SMPL_FIXED_LEN + SAMPLE_LOOP_LEN, 0);
+        body[SMPL_FIXED_LEN..SMPL_FIXED_LEN + 4].copy_from_slice(&9u32.to_le_bytes());
+        body.extend_from_slice(&[1, 2]);
+
+        let smpl = Smpl::from_bytes(&body).unwrap();
+        assert_eq!(smpl.loops.len(), 1);
+        assert_eq!(smpl.loops[0].cue_id, 9);
+        assert_eq!(smpl.sampler_data, vec![1, 2]);
+        // The counts are rewritten from what survived, so a second pass is stable.
+        assert_eq!(Smpl::from_bytes(&smpl.to_bytes()), Some(smpl));
+    }
+
+    #[test]
+    fn smpl_rejects_short_and_wrong_chunk() {
+        assert!(Smpl::from_bytes(&[0u8; SMPL_FIXED_LEN - 1]).is_none());
+        let not_smpl = Chunk {
+            id: *b"cue ",
+            data: vec![0u8; SMPL_FIXED_LEN],
+        };
+        assert!(Smpl::from_chunk(&not_smpl).is_none());
+    }
+
+    #[test]
+    fn smpl_at_rate_handles_zero() {
+        assert_eq!(Smpl::at_rate(0).sample_period, 0);
     }
 }
