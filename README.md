@@ -23,8 +23,9 @@ audioadapter adapters directly.
   and 32-bit integer PCM, 32- and 64-bit IEEE float, and the G.711 companded telephony formats
   A-law and mu-law.
 - **Any container, even unmodeled formats**: ADPCM, GSM and exotic `WAVEFORMATEXTENSIBLE` subtypes
-  round-trip as raw bytes, so the crate is a complete WAV container library, not just the formats
-  it can decode.
+  round-trip *byte for byte*, `fmt ` extension and `fact` count included, so the crate is a
+  complete WAV container library, not just the formats it can decode. See
+  [building a codec on top](#building-a-codec-on-top).
 - **Plain and extensible headers**: reads and writes both `WAVEFORMAT`/`WAVEFORMATEX` and
   `WAVEFORMATEXTENSIBLE`, picking the minimal form automatically. The `dwChannelMask` speaker layout
   is read and written.
@@ -157,6 +158,49 @@ let clipped = writer.write_float_buffer(&data)?;
 writer.finalize()?;
 # Ok::<(), waveadapter::WavError>(())
 ```
+
+## Building a codec on top
+
+waveadapter models the container, not every codec that can live inside one. For a format it has no
+`SampleFormat` for (ADPCM, GSM, an exotic extensible subtype) it hands you the `fmt ` chunk and the
+audio bytes, and takes them back unchanged, so you can put the codec on top without reimplementing
+the container.
+
+The `fmt ` chunk is a `FmtChunk`: the six core fields plus `extension`, the format-specific bytes
+after `cbSize` that only the codec understands (MS ADPCM keeps its predictor coefficients there,
+GSM its `wSamplesPerBlock`). Nothing is recomputed. `byte_rate` in particular is carried rather
+than derived, because outside linear PCM it is not `block_align * sample_rate`: GSM 6.10 declares
+1625, not 520000.
+
+```rust no_run
+use std::fs::File;
+use waveadapter::{Fact, WavReader, WavWriter};
+
+let mut reader = WavReader::new(File::open("in.wav")?)?;
+if reader.sample_format().is_none() {
+    println!("format {:#06x}, decode it yourself", reader.params().fmt.format_code);
+}
+
+// `frames()` counts whatever nBlockAlign describes, which for a block-compressed
+// format is compressed blocks. The real frame count is in the fact chunk.
+let mut audio = Vec::new();
+reader.read_raw_interleaved(reader.frames(), &mut audio)?;
+let frames = reader.params().sample_count();
+
+// Write it back: same fmt chunk, same fact count, byte for byte.
+let fact = reader.params().fact_samples().map_or(Fact::None, Fact::Samples);
+let mut writer = WavWriter::builder(reader.params().fmt.clone())?
+    .fact(fact)
+    .open(File::create("out.wav")?)?;
+writer.write_raw_interleaved(&audio)?;
+writer.finalize()?;
+# Ok::<(), waveadapter::WavError>(())
+```
+
+Metadata chunks come back split by which side of the audio they were on, `chunks_before` and
+`chunks_after`, so re-writing a file does not move a trailing `cue ` or `id3 ` to the front. The
+chunks waveadapter writes itself (`fmt `, `data`, `fact`, `ds64`) are not in either list, so
+passing them straight back is always safe.
 
 ## Examples
 

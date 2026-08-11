@@ -70,31 +70,56 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   macro, so they stay in sync automatically.
 
 - **`header.rs`** parses and writes the RIFF/WAVE container. The parser walks *all* chunks to the
-  end of the file, picking out the first `fmt ` and `data` (tolerating junk/extra chunks and
-  out-of-order chunks) and capturing every other chunk verbatim into `WavParams::chunks` as raw
-  `Chunk { id, data }` blobs. This crate gives meaning only to `fmt ` and `data`; everything else
-  (`LIST`/`INFO`, `bext`, `cue `, `fact`, `iXML`, ...) is passed through untouched so a higher-level
-  metadata library can sit on top. It supports both plain `WAVEFORMAT` (16/18-byte fmt) and
-  `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype), and tolerates anything longer.
-  `FmtChunk` is the single byte-layout definition shared by parser and writer, with `FmtTail`
-  naming the three forms the body can take: bare 16-byte core, 18-byte `WAVEFORMATEX` (a zero
-  `cbSize`), and 40-byte `WAVEFORMATEXTENSIBLE`. Writing picks the core for plain integer PCM, the
-  `WAVEFORMATEX` form for every non-PCM format (float, A-law, mu-law, which the spec says must
-  carry `cbSize`), and the extensible form when the format requires it (`I24_4`), there are more
-  than two channels, or the spec carries a non-zero channel mask (see `writes_as_extensible`). The
-  subformat GUID in the extensible form mirrors the plain format code, so every code the crate can
-  write needs an arm in that match (`SUBTYPE_PCM`/`_FLOAT`/`_ALAW`/`_MULAW`); getting it wrong
-  produces a file that silently claims the wrong format. The `dwChannelMask` is stored, not
-  interpreted:
-  `WavSpec::channel_mask` is written verbatim into the extensible header (validated to have one bit
-  set per channel, or be zero) and surfaced on read as `WavParams::channel_mask` (`None` when the
-  header is not extensible). It also
-  emits a `fact` chunk (sample-frame count) after `fmt ` for every format the spec treats as
-  non-PCM: float, A-law, mu-law, and the `WAVEFORMATEXTENSIBLE` form (format tag `0xFFFE`) even
-  when its subformat is PCM. Only plain integer PCM omits it (`SampleFormat::is_pcm`). The granular
-  `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/
-  `write_data_header` helpers let the writer compose a header with `fact` and caller-supplied
-  chunks; `write_wav_header` is the plain RIFF+fmt+data convenience built on them.
+  end of the file, consuming the first `fmt `, `data`, `fact` and (for RF64) `ds64`, and capturing
+  every other chunk verbatim into `WavParams::chunks_before` / `chunks_after` as raw
+  `Chunk { id, data }` blobs, split by which side of the audio they sat on. That split matters
+  because it maps onto the writer's two mechanisms, so a rewrite does not move a trailing `cue `
+  or `id3 ` to the front. Everything the crate does not model (`LIST`/`INFO`, `bext`, `iXML`, ...)
+  is passed through untouched so a higher-level metadata library can sit on top. **The four
+  consumed ids are exactly `RESERVED_IDS` in `writer.rs`**: the writer produces them, so the reader
+  owns them, and a caller feeding `chunks_*` back can never hand over something the writer refuses.
+  A *second* `fmt `, `data` or `fact` chunk is dropped rather than captured, for the same reason
+  (and none of them is valid in a WAVE file anyway).
+
+  **`FmtChunk` is public and is the write-side input as well as the read-side output.** It is the
+  typed view of the chunk in the same shape as the `metadata.rs` types (`from_bytes`/`to_bytes`/
+  `from_chunk`/`to_chunk`), with the bytes as the source of truth. `extension: Option<Vec<u8>>`
+  distinguishes the three forms: `None` is the bare 16-byte `WAVEFORMAT`, `Some(&[])` the 18-byte
+  `WAVEFORMATEX` (a zero `cbSize`), `Some(bytes)` anything longer. **`cbSize` is derived, never
+  stored**, so it cannot disagree with the body; the one knowing deviation from byte-exactness is
+  that a file storing a wrong `cbSize` comes back corrected. The extensible fields (valid bits,
+  channel mask, subformat GUID) are *accessors* over those bytes rather than parallel fields, all
+  routed through `extensible_extension()` so they are gated on the format tag: a 50-byte MS ADPCM
+  chunk reaches offset 20 without being extensible, and reading `dwChannelMask` on length alone
+  reports `wNumCoef` as a speaker layout.
+
+  Writing picks the core for plain integer PCM, the `WAVEFORMATEX` form for every non-PCM format
+  (float, A-law, mu-law, which the spec says must carry `cbSize`), and the extensible form when the
+  format requires it (`I24_4`), there are more than two channels, or the spec carries a non-zero
+  channel mask (see `writes_as_extensible`). The subformat GUID mirrors the plain format code, so
+  every code the crate can write needs an arm in that match (`SUBTYPE_PCM`/`_FLOAT`/`_ALAW`/
+  `_MULAW`); getting it wrong produces a file that silently claims the wrong format. The
+  `dwChannelMask` is stored, not interpreted: `WavSpec::channel_mask` is written verbatim into the
+  extensible header (validated to have one bit set per channel, or be zero) and surfaced on read as
+  `WavParams::channel_mask()`.
+
+  The `fmt ` chunk is written through `write_named_chunk`, **not** by emitting the body directly,
+  because a caller-supplied extension can be an odd number of bytes and RIFF requires the pad. The
+  parser advances past every chunk assuming that pad exists, so skipping it shifts the `data` chunk
+  and every later offset by one. `tests/wav_variants.rs::odd_length_fmt_extension_keeps_the_file_aligned`
+  is the guard.
+
+  A `fact` chunk (sample-frame count) is emitted for every format the spec treats as non-PCM:
+  float, A-law, mu-law, and the `WAVEFORMATEXTENSIBLE` form (format tag `0xFFFE`) even when its
+  subformat is PCM. Only plain integer PCM omits it. What goes in it is the `Fact` enum: `Auto`
+  counts the frames written and patches the field on finalize, but *only for a format the crate
+  models*, since `data_bytes / block_align` is a block count for a compressed format and would be a
+  plausible-looking lie; `Samples(n)` is how a codec supplies the count the container cannot
+  derive; `None` suppresses it. On read the body is kept verbatim in `WavParams::fact`, with
+  `fact_samples()` over its first four bytes and `sample_count()` reading whichever of `fact` (RIFF)
+  or `ds64` (RF64) the file has. The granular
+  `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/`write_data_header` helpers let the
+  writer compose a header with `fact` and caller-supplied chunks.
 
   **RF64/BW64 (64-bit container).** The parser also accepts the `RF64` and `BW64` form ids (the
   latter is ITU-R BS.2088, structurally identical). For these, the real sizes live in a leading
@@ -113,13 +138,21 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
     Writing returns the number of clipped samples.
   - *Raw path* (`read_raw_interleaved` / `write_raw_interleaved`): moves untouched interleaved bytes
     so the caller can wrap them with audioadapter's byte/number adapters directly. The raw path also
-    handles formats this crate does not model at all (ADPCM, GSM, exotic
-    extensible subtypes): the parser records such a file with `WavParams::sample_format == None`
-    (keeping the raw `format_code`/`bits_per_sample`/`block_align` fields), and `read_raw_interleaved`
-    frames the bytes off `WavParams::frame_bytes()` (which falls back to `block_align` when the format
-    is uninterpreted). The float path returns `UnsupportedFormat` for these. The write side mirrors
-    this with `RawSpec` + `WavWriter::new_raw` / `new_streaming_raw` (and `_with_chunks` variants),
-    which writes the `fmt ` chunk verbatim, emits no `fact` chunk, and rejects `write_float_buffer`.
+    handles formats this crate does not model at all (ADPCM, GSM, exotic extensible subtypes): the
+    parser records such a file with `WavParams::sample_format() == None` (keeping the whole `fmt `
+    chunk in `WavParams::fmt`), and `read_raw_interleaved` frames the bytes off
+    `WavParams::frame_bytes()` (which falls back to `block_align` when the format is
+    uninterpreted). The float path returns `UnsupportedFormat` for these.
+
+    **There is no separate "raw writer" mode.** Whether the float path works is a property of the
+    `fmt ` bytes, not of which constructor was called: `write_float_buffer` runs
+    `FmtChunk::sample_format()` on the chunk it holds, so a hand-built `FmtChunk` describing a
+    modelled format can be written from floats. Writing an unmodelled format means handing the
+    writer a `FmtChunk` instead of a `WavSpec` (`IntoFmtChunk` accepts either), which is what makes
+    a byte-exact rewrite possible: `WavWriter::builder(params.fmt.clone())`. This is *the* reason
+    `FmtChunk` carries `byte_rate` and the extension rather than recomputing them; the old
+    `RawSpec` assumed the PCM identities `byte_rate == block_align * sample_rate` and "no
+    extension", both false for GSM and ADPCM.
 
   Both sides support random access when the stream is seekable. `WavReader::seek_to_frame` (the
   reader already requires `Read + Seek`) repositions to any frame, clamped to the frame count.
@@ -207,20 +240,38 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   silently truncating at `finalize` (streaming RIFF skips the check since it never patches; RF64 has
   no limit).
 
+  **Constructors.** `WavWriterBuilder` is the general form, reached by `WavWriter::builder(source)`
+  where `source` is anything implementing `IntoFmtChunk` (a `WavSpec` or a `FmtChunk`). The
+  container is a *type parameter*, `Riff` or `Rf64`, so that the one impossible combination,
+  streaming RF64, does not compile: `open_streaming` exists only on the `Riff` form. `.rf64()`
+  moves between them, and `.chunks()` / `.fact()` set the rest. `new`, `new_with_chunks`,
+  `new_streaming`, `new_streaming_with_chunks`, `new_rf64` and `new_rf64_with_chunks` remain as
+  thin front doors over the builder for the common `WavSpec` cases.
+
 ## Key invariants
 
 - WAV data is always little-endian; only LE sample types are wired up. Don't add big-endian
   variants without a matching audioadapter sample type.
 - The reader stops at the last whole frame: a partial trailing frame is dropped, not errored.
 - Unsupported-but-valid files (e.g. IMA ADPCM, which audioadapter has no sample type for) must never
-  panic. They parse with `sample_format == None` and are readable through the raw path; only the
+  panic. They parse with `sample_format() == None` and are readable through the raw path; only the
   *float* path rejects them with a `WavError::UnsupportedFormat`. The `wav_variants` test enforces
-  both: that the float path errors and that the raw path still yields the bytes. `ima_adpcm_mono` is
-  the fixture guarding this; it used to be `mulaw_mono`, until G.711 became a supported format.
-- The `fmt ` chunk is accepted at any length from 16 bytes up, not just the three standard sizes.
-  A non-PCM format may carry any amount of format-specific data after `cbSize` (IMA ADPCM has two
-  bytes, MS ADPCM a coefficient table), and those files still have to reach the raw path. Only the
-  first 40 bytes are ever read, which is also what bounds the allocation.
+  both: that the float path errors and that the raw path still yields the bytes. `ima_adpcm_mono`,
+  `ms_adpcm_stereo`, `gsm610_mono`, `odd_length_fmt_extension` and `extensible_too_short` all guard
+  this; it used to be `mulaw_mono`, until G.711 became a supported format. "Cannot interpret" never
+  means "cannot parse": a `0xFFFE` tag with no room for its subformat GUID degrades to `None`
+  rather than failing the whole parse.
+- **Everything the crate does not model round-trips byte for byte.** That is the point of the
+  raw path and the thing most easily broken by a convenience. Concretely: read a file, hand
+  `params.fmt` and `params.fact_samples()` back to the writer, and the output's `fmt ` and `fact`
+  chunks must be identical to the input's. `unmodeled_formats_rewrite_byte_for_byte` enforces it
+  over GSM, MS ADPCM and IMA ADPCM. Never recompute a `fmt ` field the file already stated;
+  `byte_rate` in particular is *not* `block_align * sample_rate` outside linear PCM.
+- The `fmt ` chunk is accepted at any length from 16 bytes up, not just the three standard sizes,
+  and the whole body is kept. The read is bounded by the body having to fit inside the file, the
+  same guard the catch-all chunk branch uses; there is no longer a fixed byte cap doing that job.
+- Chunk *position* is part of the file's shape: what was after the audio must be written back after
+  the audio, hence `chunks_before` / `chunks_after` rather than one list.
 
 ## Conventions
 

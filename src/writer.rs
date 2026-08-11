@@ -93,8 +93,6 @@ impl<W: Truncate + ?Sized> Truncate for &mut W {
     }
 }
 
-/// Chunk ids this crate manages itself, which callers may not supply as extra
-/// metadata chunks.
 /// The chunks the writer produces itself, which a caller may not also supply.
 ///
 /// `ds64` belongs here and was missing: a caller could inject a second one into
@@ -453,33 +451,36 @@ impl<'a> WavWriterBuilder<'a, Rf64> {
 /// 4 GB.
 ///
 /// A `fact` chunk (sample-frame count) is written automatically for every
-/// format the spec considers non-PCM: float, and the `WAVEFORMATEXTENSIBLE`
-/// form (`I24_4` or more than two channels). Only plain integer PCM omits it.
-/// Arbitrary extra
-/// chunks can be written before the audio (leading chunks, via
+/// format the spec considers non-PCM: float, A-law, mu-law, and the
+/// `WAVEFORMATEXTENSIBLE` form. Only plain integer PCM omits it. See [`Fact`]
+/// to control it, which a codec has to do for a compressed format because the
+/// container cannot count frames it does not understand. Arbitrary extra chunks
+/// can be written before the audio (leading chunks, via
 /// [`WavWriter::new_with_chunks`] / [`WavWriter::new_streaming_with_chunks`]) or
 /// after it (trailing chunks, via [`WavWriter::write_chunk`]), so a higher-level
 /// library can attach metadata such as `LIST`/`INFO`.
 ///
 /// # Picking a constructor
 ///
-/// The constructors vary along two independent axes: how the output is written
-/// (seekable RIFF, seekable RF64, or streaming), and whether the sample format
-/// is interpreted, a [`WavSpec`] giving both write paths, or passed through
-/// verbatim, a [`RawSpec`] giving only the raw byte path.
+/// | Output | Constructor |
+/// |---|---|
+/// | Seekable, plain RIFF, up to 4 GB | [`new`](WavWriter::new) |
+/// | Seekable, RF64, no size limit | [`new_rf64`](WavWriter::new_rf64) |
+/// | Streaming, no seeking needed | [`new_streaming`](WavWriter::new_streaming) |
 ///
-/// | Output | [`WavSpec`]: float and raw | [`RawSpec`]: raw only |
-/// |---|---|---|
-/// | Seekable, plain RIFF, up to 4 GB | [`new`](WavWriter::new) | [`new_raw`](WavWriter::new_raw) |
-/// | Seekable, RF64, no size limit | [`new_rf64`](WavWriter::new_rf64) | not available |
-/// | Streaming, no seeking needed | [`new_streaming`](WavWriter::new_streaming) | [`new_streaming_raw`](WavWriter::new_streaming_raw) |
-///
-/// Each of the five has a `_with_chunks` twin taking a `&[Chunk]` of metadata
-/// chunks to write ahead of the audio, for example
-/// [`new_with_chunks`](WavWriter::new_with_chunks). Finish a seekable writer
-/// with [`finalize`](WavWriter::finalize), which patches the size fields and
-/// hands back the inner writer, and a streaming one with
+/// Each has a `_with_chunks` twin taking a `&[Chunk]` of metadata chunks to
+/// write ahead of the audio. Finish a seekable writer with
+/// [`finalize`](WavWriter::finalize), which patches the size fields and hands
+/// back the inner writer, and a streaming one with
 /// [`into_inner`](WavWriter::into_inner).
+///
+/// All six take a [`WavSpec`]. For anything else, including a format this crate
+/// does not model, go through [`WavWriter::builder`], which accepts a
+/// [`FmtChunk`] as readily as a `WavSpec` and adds the [`Fact`] choice. There is
+/// no separate raw mode: [`write_float_buffer`](WavWriter::write_float_buffer)
+/// works whenever the `fmt ` chunk describes a format the crate can convert,
+/// however that chunk was built, and
+/// [`write_raw_interleaved`](WavWriter::write_raw_interleaved) always works.
 ///
 /// # Examples
 ///
@@ -633,7 +634,7 @@ impl<W: Write> WavWriter<W> {
     /// [`truncate`](WavWriter::truncate) moves it down. A partial
     /// trailing frame, only possible through
     /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved), is not counted.
-    /// Zero if the frame size is unknown (a [`RawSpec`] with a zero block
+    /// Zero if the frame size is unknown (a [`FmtChunk`] with a zero block
     /// alignment).
     pub fn frames_written(&self) -> usize {
         self.frames_at(self.data_bytes)
@@ -654,7 +655,7 @@ impl<W: Write> WavWriter<W> {
     /// The limit only exists for a seekable RIFF writer, the one case where
     /// [`finalize`](WavWriter::finalize) has to fit the real lengths into the
     /// 32-bit size fields. A streaming writer never patches them and RF64 has
-    /// 64-bit fields, so both return `None`, as does a [`RawSpec`] writer with a
+    /// 64-bit fields, so both return `None`, as does a [`FmtChunk`] with a
     /// zero block alignment, where frames have no size.
     ///
     /// The room left is counted from the current write position, and assumes no
@@ -1063,7 +1064,7 @@ impl<W: Write + Seek + Truncate> WavWriter<W> {
     /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
     /// trailing chunk has already been written, since trimming the audio would
     /// leave it stranded, if the writer is streaming (its sizes are never
-    /// patched), or if the frame size is unknown (a [`RawSpec`] with a zero block
+    /// patched), or if the frame size is unknown (a [`FmtChunk`] with a zero block
     /// alignment).
     pub fn truncate_to_frame(&mut self, frame: usize) -> Result<()> {
         self.ensure_data_open()?;
