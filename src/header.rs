@@ -174,13 +174,18 @@ pub struct WavParams {
     /// caller passing `chunks` straight back would otherwise be handing over a
     /// chunk the writer is about to write again.
     pub fact: Option<Vec<u8>>,
+    /// The sample-frame count from the `ds64` chunk of an RF64/BW64 file, which
+    /// is where that form keeps what `fact` carries in a plain RIFF file.
+    /// `None` for plain RIFF. Prefer [`sample_count`](WavParams::sample_count),
+    /// which reads whichever of the two the file actually has.
+    pub ds64_sample_count: Option<u64>,
     /// Byte offset from the start of the file to the first audio sample.
-    pub data_offset: usize,
+    pub data_offset: u64,
     /// The length of the audio data in bytes, as declared in the header.
     ///
     /// Files written in streaming mode declare this as [`u32::MAX`] because the
     /// final length is not known up front, so do not rely on it to be accurate.
-    pub data_length: usize,
+    pub data_length: u64,
     /// The non-audio chunks stored *before* the audio, in the order encountered.
     ///
     /// These go back through a leading-chunk constructor such as
@@ -246,6 +251,17 @@ impl WavParams {
     pub fn fact_samples(&self) -> Option<u32> {
         let body = self.fact.as_deref()?;
         (body.len() >= 4).then(|| read_u32(body, 0))
+    }
+
+    /// The declared sample-frame count, from wherever this container keeps it:
+    /// the `fact` chunk for RIFF, the `ds64` chunk for RF64/BW64.
+    ///
+    /// The two forms carry the same number in different places, so this is the
+    /// one to reach for when the container form is not the point.
+    pub fn sample_count(&self) -> Option<u64> {
+        self.fact_samples()
+            .map(u64::from)
+            .or(self.ds64_sample_count)
     }
 
     /// The spec that would reproduce this file's format through the typed write
@@ -315,6 +331,7 @@ fn read_u64(buffer: &[u8], start_index: usize) -> u64 {
 /// 32-bit size is `0xFFFFFFFF` is looked up by id in `table`.
 struct Ds64 {
     data_size: u64,
+    sample_count: u64,
     table: Vec<([u8; 4], u64)>,
 }
 
@@ -328,7 +345,13 @@ impl Ds64 {
         } else {
             0
         };
-        // sampleCount (16..24) is surfaced via the fact chunk path, not here.
+        // sampleCount is what `fact` carries in a plain RIFF file, so it is
+        // surfaced the same way (see `WavParams::sample_count`).
+        let sample_count = if body.len() >= 24 {
+            read_u64(body, 16)
+        } else {
+            0
+        };
         let table_length = if body.len() >= 28 {
             read_u32(body, 24) as usize
         } else {
@@ -345,7 +368,11 @@ impl Ds64 {
             table.push((id, read_u64(body, offset + 4)));
             offset += 12;
         }
-        Ds64 { data_size, table }
+        Ds64 {
+            data_size,
+            sample_count,
+            table,
+        }
     }
 
     /// The real body length of a chunk whose 32-bit size field is the
@@ -802,11 +829,13 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     // reached (it is required to come first). Stays zeroed for plain RIFF.
     let mut ds64 = Ds64 {
         data_size: 0,
+        sample_count: 0,
         table: Vec::new(),
     };
 
     let mut fmt: Option<FmtChunk> = None;
     let mut fact: Option<Vec<u8>> = None;
+    let mut ds64_sample_count: Option<u64> = None;
     let mut data_offset = 0;
     let mut data_length: u64 = 0;
     let mut chunks_before: Vec<Chunk> = Vec::new();
@@ -844,6 +873,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 let mut body = vec![0; chunk_length as usize];
                 file.read_exact(&mut body)?;
                 ds64 = Ds64::parse(&body);
+                ds64_sample_count = Some(ds64.sample_count);
             }
             next_chunk_location = next_chunk_location
                 .saturating_add(8 + chunk_length as u64 + (chunk_length as u64 & 1));
@@ -902,8 +932,16 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 fmt = Some(parsed);
             }
         }
-        if consumed {
-            // Already read above; fall through to the offset advance.
+        if consumed || is_fmt || is_fact {
+            // Either read above, or a duplicate of a chunk this crate owns.
+            //
+            // A second `fmt `, `data` or `fact` chunk is dropped rather than
+            // captured. Capturing would be worse than useless: those ids are
+            // reserved on the write side precisely because the writer produces
+            // them, so a caller feeding the chunks back would be handed
+            // something the writer then refuses. For `data` there is the
+            // additional problem that its body is audio, and reading a second
+            // one into memory to hand back is unbounded.
         } else if is_data {
             // Honor the first data chunk; ignore any later one.
             if !found_data {
@@ -952,10 +990,9 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         return Ok(WavParams {
             fmt,
             fact,
-            data_length: usize::try_from(data_length).map_err(|_| {
-                WavError::InvalidHeader("data length does not fit in memory".to_string())
-            })?,
-            data_offset: data_offset as usize,
+            ds64_sample_count,
+            data_length,
+            data_offset,
             chunks_before,
             chunks_after,
         });

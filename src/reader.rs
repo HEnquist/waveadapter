@@ -35,7 +35,14 @@ impl<R: Read + Seek> WavReader<R> {
         let params = read_wav_header(&mut inner)?;
         inner.seek(SeekFrom::Start(params.data_offset as u64))?;
         let frame_bytes = params.frame_bytes();
-        let total_frames = params.data_length.checked_div(frame_bytes).unwrap_or(0);
+        // The frame count stays a `usize`: it indexes buffers in memory, so a
+        // declared length past what this target can address is clamped rather
+        // than overflowing.
+        let total_frames = params
+            .data_length
+            .checked_div(frame_bytes as u64)
+            .and_then(|frames| usize::try_from(frames).ok())
+            .unwrap_or(usize::MAX);
         Ok(Self {
             inner,
             params,
@@ -108,8 +115,8 @@ impl<R: Read + Seek> WavReader<R> {
             ));
         }
         let frame = frame.min(self.total_frames);
-        let offset = self.params.data_offset + frame * frame_bytes;
-        self.inner.seek(SeekFrom::Start(offset as u64))?;
+        let offset = self.params.data_offset + (frame * frame_bytes) as u64;
+        self.inner.seek(SeekFrom::Start(offset))?;
         self.frames_pos = frame;
         Ok(())
     }

@@ -688,7 +688,7 @@ fn rf64_roundtrip() {
     assert_eq!(reader.sample_format(), Some(SampleFormat::F32));
     assert_eq!(reader.channels(), channels);
     assert_eq!(reader.frames(), frames);
-    assert_eq!(reader.params().data_length, data_bytes as usize);
+    assert_eq!(reader.params().data_length, data_bytes);
     let restored = reader.read_all_to_float::<f32>().unwrap();
     assert_eq!(restored.frames(), frames);
     for frame in 0..frames {
@@ -1518,7 +1518,7 @@ fn rf64_truncate_updates_the_ds64_sizes() {
     cursor.set_position(0);
     let reader = WavReader::new(cursor).unwrap();
     assert_eq!(reader.frames(), 12);
-    assert_eq!(reader.params().data_length, 12 * channels * 2);
+    assert_eq!(reader.params().data_length, (12 * channels * 2) as u64);
 }
 
 #[test]
