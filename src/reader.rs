@@ -54,17 +54,17 @@ impl<R: Read + Seek> WavReader<R> {
     /// [`read_raw_interleaved`](WavReader::read_raw_interleaved); the float read
     /// methods return [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat).
     pub fn sample_format(&self) -> Option<SampleFormat> {
-        self.params.sample_format
+        self.params.sample_format()
     }
 
     /// The number of channels.
     pub fn channels(&self) -> usize {
-        self.params.channels
+        self.params.channels()
     }
 
     /// The sample rate in Hz.
     pub fn sample_rate(&self) -> usize {
-        self.params.sample_rate
+        self.params.sample_rate()
     }
 
     /// The total number of frames declared in the header.
@@ -128,7 +128,7 @@ impl<R: Read + Seek> WavReader<R> {
         T: FloatCore + ToPrimitive,
     {
         let format = self.require_sample_format()?;
-        let file_channels = self.params.channels;
+        let file_channels = self.params.channels();
         let want = target.frames().min(self.remaining());
         let mut produced = 0;
         with_sample_type!(format, S, {
@@ -161,7 +161,7 @@ impl<R: Read + Seek> WavReader<R> {
         T: FloatCore + ToPrimitive + Zero,
     {
         let format = self.require_sample_format()?;
-        let channels = self.params.channels;
+        let channels = self.params.channels();
         let want = self.remaining();
         let mut data: Vec<T> = Vec::new();
         with_sample_type!(format, S, {
@@ -270,11 +270,11 @@ impl<R: Read + Seek> WavReader<R> {
     ///
     /// [`UnsupportedFormat`]: crate::WavError::UnsupportedFormat
     fn require_sample_format(&self) -> Result<SampleFormat> {
-        self.params.sample_format.ok_or_else(|| {
+        self.params.sample_format().ok_or_else(|| {
             WavError::UnsupportedFormat(format!(
                 "format code {}, {} bits per sample cannot be read as float; \
                  use read_raw_interleaved instead",
-                self.params.format_code, self.params.bits_per_sample
+                self.params.fmt.format_code, self.params.fmt.bits_per_sample
             ))
         })
     }

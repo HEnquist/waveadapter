@@ -1,6 +1,7 @@
 //! Writing audio data to a wav file.
 
 use std::io::{self, BufWriter, Cursor, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 
 use audioadapter::Adapter;
 use audioadapter_sample::readwrite::WriteSamples;
@@ -9,54 +10,29 @@ use num_traits::float::FloatCore;
 
 use crate::dispatch::with_sample_type;
 use crate::error::{Result, WavError};
-use crate::format::{RawSpec, WavSpec};
-use crate::header::{self, Chunk, RIFF_SIZE_OFFSET};
+use crate::format::{SampleFormat, WavSpec};
+use crate::header::{self, Chunk, FmtChunk, RIFF_SIZE_OFFSET};
 
-/// The format a writer was created with: an interpreted [`WavSpec`] (the float
-/// and raw write paths are both available) or raw [`RawSpec`] fmt fields (only
-/// the raw byte path is available).
-enum WriterSpec {
-    Typed(WavSpec),
-    Raw(RawSpec),
-}
-
-impl WriterSpec {
-    /// The number of bytes per frame, used to count frames on finalize.
-    fn frame_bytes(&self) -> usize {
-        match self {
-            WriterSpec::Typed(spec) => spec.frame_bytes(),
-            WriterSpec::Raw(spec) => spec.frame_bytes(),
-        }
-    }
-
-    /// Write the `fmt ` chunk for this format and report whether a `fact` chunk
-    /// is required. Returns `(fmt body size, needs_fact)`.
-    fn write_fmt(&self, dest: &mut impl Write) -> Result<(u32, bool)> {
-        match self {
-            WriterSpec::Typed(spec) => {
-                let body = header::write_fmt_chunk(
-                    dest,
-                    spec.channels,
-                    spec.sample_format,
-                    spec.sample_rate,
-                    spec.channel_mask,
-                )?;
-                // The spec requires a `fact` chunk for every format that is not
-                // plain WAVE_FORMAT_PCM: float, A-law, mu-law, and the
-                // WAVEFORMATEXTENSIBLE form even when its subformat is PCM.
-                let needs_fact = !spec.sample_format.is_pcm()
-                    || header::writes_as_extensible(
-                        spec.channels,
-                        spec.sample_format,
-                        spec.channel_mask,
-                    );
-                Ok((body, needs_fact))
-            }
-            // Raw writers never emit a `fact` chunk: the format is uninterpreted,
-            // so the sample-frame count carries no defined meaning.
-            WriterSpec::Raw(spec) => Ok((header::write_fmt_chunk_raw(dest, spec)?, false)),
-        }
-    }
+/// What to write into the `fact` chunk, which the spec requires for every format
+/// that is not plain integer PCM.
+///
+/// The chunk holds a *sample-frame* count. For a modelled format the writer can
+/// count those itself, but for a block-compressed one it cannot: the data is a
+/// whole number of blocks and only the codec knows how many frames a block
+/// decodes to. The GSM 6.10 fixture is three 65-byte blocks and 960 frames, and
+/// nothing in the container relates those two numbers. So the count is the
+/// caller's to supply whenever the writer cannot derive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fact {
+    /// Write one if the format needs it, counting the frames written. Only
+    /// possible for a format this crate models; a `fact` chunk is omitted for
+    /// anything else, since a guess would be worse than nothing.
+    #[default]
+    Auto,
+    /// Never write one, whatever the format.
+    None,
+    /// Write this exact sample-frame count.
+    Samples(u32),
 }
 
 /// An output stream that can be shortened.
@@ -119,7 +95,12 @@ impl<W: Truncate + ?Sized> Truncate for &mut W {
 
 /// Chunk ids this crate manages itself, which callers may not supply as extra
 /// metadata chunks.
-const RESERVED_IDS: [&[u8; 4]; 4] = [b"RIFF", b"fmt ", b"data", b"fact"];
+/// Structural chunks only: the ones that describe the container itself and whose
+/// contents the writer computes. `fact` is deliberately *not* here. It is
+/// modelled on both sides now ([`WavParams::fact`](crate::WavParams::fact) and
+/// [`Fact`]), so it never reaches `chunks` for a caller to hand back by mistake,
+/// and reserving it would only break the pass-everything-through editing loop.
+const RESERVED_IDS: [&[u8; 4]; 4] = [b"RIFF", b"fmt ", b"data", b"ds64"];
 
 /// Check that an extra chunk supplied by the caller can be written: a non-reserved
 /// id and a body that fits in the 32-bit chunk size field.
@@ -169,6 +150,36 @@ enum SizeFields {
     },
 }
 
+/// What a `fact` chunk should hold, once the format and the caller's [`Fact`]
+/// choice are both taken into account.
+enum FactBody {
+    /// Count the frames as they are written and patch the field on finalize.
+    Counted,
+    /// A count the caller supplied up front.
+    Fixed(u32),
+}
+
+/// Decide whether to write a `fact` chunk, and with what.
+///
+/// The spec wants one for every format that is not plain integer PCM. `Auto` can
+/// only honor that for a format this crate models, since counting frames means
+/// knowing how many bytes one takes. For anything else `Auto` writes nothing:
+/// `data_bytes / block_align` is a count of compressed blocks, and putting that
+/// in a field defined as sample frames would be a plausible-looking lie. Callers
+/// who know the real number say so with [`Fact::Samples`].
+fn fact_body(fmt: &FmtChunk, fact: Fact) -> Option<FactBody> {
+    match fact {
+        Fact::None => None,
+        Fact::Samples(samples) => Some(FactBody::Fixed(samples)),
+        // The extensible form counts as non-PCM even when its subformat is PCM.
+        Fact::Auto => match fmt.sample_format() {
+            Some(format) if format.is_pcm() && !fmt.is_extensible() => None,
+            Some(_) => Some(FactBody::Counted),
+            None => None,
+        },
+    }
+}
+
 /// The byte offsets recorded while writing the header, needed to patch the size
 /// fields on finalize.
 struct Layout {
@@ -186,7 +197,8 @@ struct Layout {
 /// chunk header with a `0xFFFFFFFF` size marker.
 fn write_header(
     inner: &mut impl Write,
-    spec: &WriterSpec,
+    fmt: &FmtChunk,
+    fact: Fact,
     leading: &[Chunk],
     container: Container,
 ) -> Result<Layout> {
@@ -199,20 +211,24 @@ fn write_header(
         Container::Riff => {
             header::write_riff_wave(inner, header::UNKNOWN_SIZE)?;
 
-            let (fmt_body, needs_fact) = spec.write_fmt(inner)?;
-            pos += 8 + fmt_body as u64;
+            pos += header::write_fmt_chunk(inner, fmt)?;
 
-            // A `fact` chunk (sample-frame count) follows for every format that
-            // is not plain WAVE_FORMAT_PCM (see `WriterSpec::write_fmt`). The
-            // 4-byte body sits right after the 8-byte chunk header.
-            let fact_offset = if needs_fact {
+            // A `fact` chunk (sample-frame count) is required for every format
+            // that is not plain WAVE_FORMAT_PCM. The 4-byte body sits right
+            // after the 8-byte chunk header, and `Auto` leaves it as a
+            // placeholder for `finalize` to patch with the frames written.
+            let mut fact_offset = None;
+            if let Some(body) = fact_body(fmt, fact) {
                 let offset = pos + 8;
-                pos +=
-                    header::write_named_chunk(inner, b"fact", &header::UNKNOWN_SIZE.to_le_bytes())?;
-                Some(offset)
-            } else {
-                None
-            };
+                let count = match body {
+                    FactBody::Counted => header::UNKNOWN_SIZE,
+                    FactBody::Fixed(samples) => samples,
+                };
+                pos += header::write_named_chunk(inner, b"fact", &count.to_le_bytes())?;
+                if matches!(body, FactBody::Counted) {
+                    fact_offset = Some(offset);
+                }
+            }
 
             for chunk in leading {
                 pos += header::write_named_chunk(inner, &chunk.id, &chunk.data)?;
@@ -237,8 +253,7 @@ fn write_header(
             header::write_ds64_chunk(inner)?;
             pos += 8 + header::DS64_BODY_SIZE as u64;
 
-            let (fmt_body, _needs_fact) = spec.write_fmt(inner)?;
-            pos += 8 + fmt_body as u64;
+            pos += header::write_fmt_chunk(inner, fmt)?;
 
             // No `fact` chunk: RF64 carries the sample count in the ds64 chunk.
             for chunk in leading {
@@ -260,6 +275,150 @@ fn write_header(
         header_len: pos,
         sizes,
     })
+}
+
+/// Anything that can describe the format for a [`WavWriter`].
+///
+/// A [`WavSpec`] means "I have audio in a format you model, build me a correct
+/// header"; a [`FmtChunk`] means "I am the codec, write exactly these bytes".
+/// Both are accepted wherever a writer is created.
+pub trait IntoFmtChunk {
+    /// Produce the `fmt ` chunk to write.
+    fn into_fmt_chunk(self) -> Result<FmtChunk>;
+}
+
+impl IntoFmtChunk for FmtChunk {
+    fn into_fmt_chunk(self) -> Result<FmtChunk> {
+        Ok(self)
+    }
+}
+
+impl IntoFmtChunk for &FmtChunk {
+    fn into_fmt_chunk(self) -> Result<FmtChunk> {
+        Ok(self.clone())
+    }
+}
+
+impl IntoFmtChunk for WavSpec {
+    fn into_fmt_chunk(self) -> Result<FmtChunk> {
+        FmtChunk::for_spec(&self)
+    }
+}
+
+impl IntoFmtChunk for &WavSpec {
+    fn into_fmt_chunk(self) -> Result<FmtChunk> {
+        FmtChunk::for_spec(self)
+    }
+}
+
+/// Marks a builder that will write a plain RIFF file.
+pub struct Riff;
+/// Marks a builder that will write an RF64 file, which needs a seekable output.
+pub struct Rf64;
+
+/// Assembles a [`WavWriter`], for the cases the plain constructors do not cover:
+/// a hand-built [`FmtChunk`], an explicit [`Fact`] count, or a combination of
+/// RF64 and leading chunks.
+///
+/// The container form is a type parameter so that the one impossible
+/// combination, streaming RF64, does not compile: `open_streaming` exists only
+/// on the [`Riff`] form. RF64 records its sizes in a `ds64` chunk that has to be
+/// patched afterwards, which a stream cannot do.
+///
+/// # Examples
+///
+/// Re-writing a file whose format this crate does not model, keeping the `fmt `
+/// chunk and the sample count the original declared:
+///
+/// ```no_run
+/// use std::fs::File;
+/// use waveadapter::{Fact, WavReader, WavWriter};
+///
+/// let mut reader = WavReader::new(File::open("in.wav")?)?;
+/// let mut audio = Vec::new();
+/// reader.read_raw_interleaved(reader.frames(), &mut audio)?;
+///
+/// let fact = reader.params().fact_samples().map_or(Fact::None, Fact::Samples);
+/// let mut writer = WavWriter::builder(reader.params().fmt.clone())?
+///     .fact(fact)
+///     .open(File::create("out.wav")?)?;
+/// writer.write_raw_interleaved(&audio)?;
+/// writer.finalize()?;
+/// # Ok::<(), waveadapter::WavError>(())
+/// ```
+pub struct WavWriterBuilder<'a, C = Riff> {
+    fmt: FmtChunk,
+    fact: Fact,
+    leading: &'a [Chunk],
+    container: PhantomData<C>,
+}
+
+impl<'a, C> WavWriterBuilder<'a, C> {
+    /// Set the metadata chunks to write between the `fmt ` chunk and the audio.
+    pub fn chunks(mut self, leading: &'a [Chunk]) -> Self {
+        self.leading = leading;
+        self
+    }
+
+    /// Choose what goes in the `fact` chunk. See [`Fact`]; the default is
+    /// [`Fact::Auto`].
+    pub fn fact(mut self, fact: Fact) -> Self {
+        self.fact = fact;
+        self
+    }
+
+    fn build<W: Write>(
+        self,
+        mut inner: W,
+        container: Container,
+        seekable: bool,
+    ) -> Result<WavWriter<W>> {
+        let layout = write_header(&mut inner, &self.fmt, self.fact, self.leading, container)?;
+        Ok(WavWriter {
+            inner,
+            fmt: self.fmt,
+            data_bytes: 0,
+            data_pos: 0,
+            trailing_bytes: 0,
+            seekable,
+            layout,
+        })
+    }
+}
+
+impl<'a> WavWriterBuilder<'a, Riff> {
+    /// Write the 64-bit RF64 form instead of plain RIFF, lifting the 4 GB limit.
+    ///
+    /// This drops `open_streaming`: RF64 sizes live in a `ds64` chunk that is
+    /// only filled in on finalize, so the output has to be seekable.
+    pub fn rf64(self) -> WavWriterBuilder<'a, Rf64> {
+        WavWriterBuilder {
+            fmt: self.fmt,
+            fact: self.fact,
+            leading: self.leading,
+            container: PhantomData,
+        }
+    }
+
+    /// Create a seekable writer, its size fields patched by
+    /// [`finalize`](WavWriter::finalize).
+    pub fn open<W: Write + Seek>(self, inner: W) -> Result<WavWriter<W>> {
+        self.build(inner, Container::Riff, true)
+    }
+
+    /// Create a streaming writer, leaving the size fields at [`u32::MAX`].
+    /// Finish with [`into_inner`](WavWriter::into_inner).
+    pub fn open_streaming<W: Write>(self, inner: W) -> Result<WavWriter<W>> {
+        self.build(inner, Container::Riff, false)
+    }
+}
+
+impl<'a> WavWriterBuilder<'a, Rf64> {
+    /// Create the RF64 writer, its `ds64` sizes patched by
+    /// [`finalize`](WavWriter::finalize).
+    pub fn open<W: Write + Seek>(self, inner: W) -> Result<WavWriter<W>> {
+        self.build(inner, Container::Rf64, true)
+    }
 }
 
 /// A writer for wav files.
@@ -354,7 +513,10 @@ fn write_header(
 /// ```
 pub struct WavWriter<W: Write> {
     inner: W,
-    spec: WriterSpec,
+    /// The `fmt ` chunk this writer emitted. Everything about the format is read
+    /// back off it, including whether the float write path is available, so the
+    /// writer has no notion of being in a "typed" or "raw" mode.
+    fmt: FmtChunk,
     /// The highest extent of the data chunk reached so far, in bytes. This is the
     /// declared `data` size and may be larger than [`data_pos`](Self::data_pos)
     /// after a backwards [`seek_to_frame`](WavWriter::seek_to_frame).
@@ -370,6 +532,27 @@ pub struct WavWriter<W: Write> {
     layout: Layout,
 }
 
+impl WavWriter<Cursor<Vec<u8>>> {
+    /// Start building a writer from either a [`WavSpec`] or a [`FmtChunk`].
+    ///
+    /// A `WavSpec` says "I have audio in a format you model, build me a correct
+    /// header" and the crate picks the header form, the subformat GUID and the
+    /// `fact` chunk. A `FmtChunk` says "I am the codec, write these bytes", and
+    /// is how a format waveadapter does not model gets written; pair it with
+    /// [`WavParams::fmt`](crate::WavParams::fmt) to re-write a file unchanged.
+    ///
+    /// The output type is only fixed by the terminal `open` / `open_streaming`
+    /// call, so this is not tied to any particular `W`.
+    pub fn builder<'a, T: IntoFmtChunk>(source: T) -> Result<WavWriterBuilder<'a, Riff>> {
+        Ok(WavWriterBuilder {
+            fmt: source.into_fmt_chunk()?,
+            fact: Fact::Auto,
+            leading: &[],
+            container: PhantomData,
+        })
+    }
+}
+
 impl<W: Write> WavWriter<W> {
     /// Create a streaming writer.
     ///
@@ -377,7 +560,7 @@ impl<W: Write> WavWriter<W> {
     /// players expect from a stream of unknown length. The output does not need
     /// to be seekable.
     pub fn new_streaming(inner: W, spec: WavSpec) -> Result<Self> {
-        Self::new_streaming_with_chunks(inner, spec, &[])
+        WavWriter::builder(spec)?.open_streaming(inner)
     }
 
     /// Create a streaming writer that emits `leading` metadata chunks between the
@@ -385,72 +568,38 @@ impl<W: Write> WavWriter<W> {
     ///
     /// Like [`new_streaming`](WavWriter::new_streaming), the size fields are left
     /// at [`u32::MAX`]. See [`Chunk`] for the chunk representation. Reserved ids
-    /// (`fmt `, `data`, `fact`, `RIFF`) are rejected with
+    /// (`RIFF`, `fmt `, `data`, `ds64`) are rejected with
     /// [`WavError::InvalidSpec`](crate::WavError::InvalidSpec).
-    pub fn new_streaming_with_chunks(
-        mut inner: W,
-        spec: WavSpec,
-        leading: &[Chunk],
-    ) -> Result<Self> {
-        let spec = WriterSpec::Typed(spec);
-        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
-        Ok(Self {
-            inner,
-            spec,
-            data_bytes: 0,
-            data_pos: 0,
-            trailing_bytes: 0,
-            seekable: false,
-            layout,
-        })
+    pub fn new_streaming_with_chunks(inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
+        WavWriter::builder(spec)?
+            .chunks(leading)
+            .open_streaming(inner)
     }
 
-    /// Create a streaming raw writer for a format this crate does not interpret.
+    /// The `fmt ` chunk this writer wrote.
     ///
-    /// The `fmt ` chunk is written verbatim from the [`RawSpec`] and no `fact`
-    /// chunk is emitted. Only [`write_raw_interleaved`](WavWriter::write_raw_interleaved)
-    /// is available; [`write_float_buffer`](WavWriter::write_float_buffer) returns
-    /// [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat). Size
-    /// fields are left at [`u32::MAX`]; finish with [`into_inner`](WavWriter::into_inner).
-    pub fn new_streaming_raw(inner: W, spec: RawSpec) -> Result<Self> {
-        Self::new_streaming_raw_with_chunks(inner, spec, &[])
+    /// For a writer created from a [`WavSpec`] this is the chunk the crate built
+    /// for it; for one created from a [`FmtChunk`] it is what the caller supplied.
+    pub fn fmt(&self) -> &FmtChunk {
+        &self.fmt
     }
 
-    /// Like [`new_streaming_raw`](WavWriter::new_streaming_raw) but with leading
-    /// metadata chunks between the `fmt ` chunk and the audio data.
-    pub fn new_streaming_raw_with_chunks(
-        mut inner: W,
-        spec: RawSpec,
-        leading: &[Chunk],
-    ) -> Result<Self> {
-        let spec = WriterSpec::Raw(spec);
-        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
-        Ok(Self {
-            inner,
-            spec,
-            data_bytes: 0,
-            data_pos: 0,
-            trailing_bytes: 0,
-            seekable: false,
-            layout,
-        })
+    /// The sample format the float write path will use, or `None` if the `fmt `
+    /// chunk describes a format this crate does not model. In that case only
+    /// [`write_raw_interleaved`](WavWriter::write_raw_interleaved) is available.
+    pub fn sample_format(&self) -> Option<SampleFormat> {
+        self.fmt.sample_format()
     }
 
-    /// The interpreted spec the writer was created with, or `None` for a raw
-    /// writer (see [`raw_spec`](WavWriter::raw_spec)).
+    /// The spec equivalent to this writer's `fmt ` chunk, or `None` if the format
+    /// is not one this crate models.
     pub fn spec(&self) -> Option<WavSpec> {
-        match self.spec {
-            WriterSpec::Typed(spec) => Some(spec),
-            WriterSpec::Raw(_) => None,
-        }
-    }
-
-    /// The raw spec a raw writer was created with, or `None` for a typed writer.
-    pub fn raw_spec(&self) -> Option<RawSpec> {
-        match self.spec {
-            WriterSpec::Raw(spec) => Some(spec),
-            WriterSpec::Typed(_) => None,
-        }
+        Some(WavSpec {
+            channels: self.fmt.channels as usize,
+            sample_rate: self.fmt.sample_rate as usize,
+            sample_format: self.fmt.sample_format()?,
+            channel_mask: self.fmt.channel_mask(),
+        })
     }
 
     /// The number of audio data bytes written so far.
@@ -513,7 +662,7 @@ impl<W: Write> WavWriter<W> {
         if !self.seekable || !matches!(self.layout.sizes, SizeFields::Riff { .. }) {
             return None;
         }
-        let frame_bytes = self.spec.frame_bytes() as u64;
+        let frame_bytes = self.fmt.frame_bytes() as u64;
         if frame_bytes == 0 {
             return None;
         }
@@ -532,7 +681,7 @@ impl<W: Write> WavWriter<W> {
     /// unknown.
     fn frames_at(&self, bytes: u64) -> usize {
         let frames = bytes
-            .checked_div(self.spec.frame_bytes() as u64)
+            .checked_div(self.fmt.frame_bytes() as u64)
             .unwrap_or(0);
         usize::try_from(frames).unwrap_or(usize::MAX)
     }
@@ -564,22 +713,22 @@ impl<W: Write> WavWriter<W> {
         T: FloatCore + ToPrimitive,
     {
         self.ensure_data_open()?;
-        let spec = match self.spec {
-            WriterSpec::Typed(spec) => spec,
-            WriterSpec::Raw(_) => {
-                return Err(WavError::UnsupportedFormat(
-                    "cannot write a float buffer to a raw writer; \
-                     use write_raw_interleaved instead"
-                        .to_string(),
-                ));
-            }
-        };
+        // Whether the float path works is a property of the `fmt ` chunk, not of
+        // which constructor was used: any chunk describing a format this crate
+        // models can be written from floats, however it was built.
+        let sample_format = self.fmt.sample_format().ok_or_else(|| {
+            WavError::UnsupportedFormat(format!(
+                "format code {} is not one this crate can convert to; \
+                 use write_raw_interleaved instead",
+                self.fmt.format_code
+            ))
+        })?;
         let frames = src.frames();
         let channels = src.channels();
-        let byte_count = (frames * channels * spec.sample_format.bytes_per_sample()) as u64;
+        let byte_count = (frames * channels * sample_format.bytes_per_sample()) as u64;
         self.check_capacity(byte_count)?;
         let mut clipped = 0;
-        with_sample_type!(spec.sample_format, S, {
+        with_sample_type!(sample_format, S, {
             for frame in 0..frames {
                 for ch in 0..channels {
                     let value = src.read_sample(ch, frame).unwrap();
@@ -711,47 +860,10 @@ impl<W: Write + Seek> WavWriter<W> {
     ///
     /// Like [`new`](WavWriter::new), the size fields are placeholders patched by
     /// [`finalize`](WavWriter::finalize). See [`Chunk`] for the chunk
-    /// representation. Reserved ids (`fmt `, `data`, `fact`, `RIFF`) are rejected
+    /// representation. Reserved ids (`RIFF`, `fmt `, `data`, `ds64`) are rejected
     /// with [`WavError::InvalidSpec`](crate::WavError::InvalidSpec).
-    pub fn new_with_chunks(mut inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
-        let spec = WriterSpec::Typed(spec);
-        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
-        Ok(Self {
-            inner,
-            spec,
-            data_bytes: 0,
-            data_pos: 0,
-            trailing_bytes: 0,
-            seekable: true,
-            layout,
-        })
-    }
-
-    /// Create a seekable raw writer for a format this crate does not interpret.
-    ///
-    /// The `fmt ` chunk is written verbatim from the [`RawSpec`] and no `fact`
-    /// chunk is emitted. Only [`write_raw_interleaved`](WavWriter::write_raw_interleaved)
-    /// is available; [`write_float_buffer`](WavWriter::write_float_buffer) returns
-    /// [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat). Size
-    /// fields are patched by [`finalize`](WavWriter::finalize).
-    pub fn new_raw(inner: W, spec: RawSpec) -> Result<Self> {
-        Self::new_raw_with_chunks(inner, spec, &[])
-    }
-
-    /// Like [`new_raw`](WavWriter::new_raw) but with leading metadata chunks
-    /// between the `fmt ` chunk and the audio data.
-    pub fn new_raw_with_chunks(mut inner: W, spec: RawSpec, leading: &[Chunk]) -> Result<Self> {
-        let spec = WriterSpec::Raw(spec);
-        let layout = write_header(&mut inner, &spec, leading, Container::Riff)?;
-        Ok(Self {
-            inner,
-            spec,
-            data_bytes: 0,
-            data_pos: 0,
-            trailing_bytes: 0,
-            seekable: true,
-            layout,
-        })
+    pub fn new_with_chunks(inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
+        WavWriter::builder(spec)?.chunks(leading).open(inner)
     }
 
     /// Create a seekable RF64 writer, for files that may exceed the 4 GB limit of
@@ -762,28 +874,13 @@ impl<W: Write + Seek> WavWriter<W> {
     /// Unlike a plain RIFF writer there is no 4 GB ceiling, so audio writes never
     /// fail on size. RF64 requires a seekable output.
     pub fn new_rf64(inner: W, spec: WavSpec) -> Result<Self> {
-        Self::new_rf64_with_chunks(inner, spec, &[])
+        WavWriter::builder(spec)?.rf64().open(inner)
     }
 
     /// Create a seekable RF64 writer that emits `leading` metadata chunks between
     /// the `fmt ` chunk and the audio data.
-    ///
-    /// Like [`new_rf64`](WavWriter::new_rf64) but with leading chunks. See
-    /// [`Chunk`] for the chunk representation. Reserved ids (`fmt `, `data`,
-    /// `fact`, `RIFF`) are rejected with
-    /// [`WavError::InvalidSpec`](crate::WavError::InvalidSpec).
-    pub fn new_rf64_with_chunks(mut inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
-        let spec = WriterSpec::Typed(spec);
-        let layout = write_header(&mut inner, &spec, leading, Container::Rf64)?;
-        Ok(Self {
-            inner,
-            spec,
-            data_bytes: 0,
-            data_pos: 0,
-            trailing_bytes: 0,
-            seekable: true,
-            layout,
-        })
+    pub fn new_rf64_with_chunks(inner: W, spec: WavSpec, leading: &[Chunk]) -> Result<Self> {
+        WavWriter::builder(spec)?.rf64().chunks(leading).open(inner)
     }
 
     /// Seek to a frame for random-access writing.
@@ -807,7 +904,7 @@ impl<W: Write + Seek> WavWriter<W> {
     /// RIFF file.
     pub fn seek_to_frame(&mut self, frame: usize) -> Result<()> {
         self.ensure_data_open()?;
-        let frame_bytes = self.spec.frame_bytes() as u64;
+        let frame_bytes = self.fmt.frame_bytes() as u64;
         if frame_bytes == 0 {
             return Err(WavError::InvalidSpec(
                 "cannot seek: frame size is zero".to_string(),
@@ -884,7 +981,7 @@ impl<W: Write + Seek> WavWriter<W> {
         // Everything after the 8-byte RIFF/RF64 id/size: the header body, the
         // audio data and any trailing chunks (with the data pad byte).
         let riff_size = self.layout.header_len + self.data_bytes + self.trailing_bytes - 8;
-        let frame_bytes = self.spec.frame_bytes() as u64;
+        let frame_bytes = self.fmt.frame_bytes() as u64;
         let frames = self.data_bytes.checked_div(frame_bytes).unwrap_or(0);
 
         match self.layout.sizes {
@@ -971,7 +1068,7 @@ impl<W: Write + Seek + Truncate> WavWriter<W> {
                 "cannot truncate a streaming writer".to_string(),
             ));
         }
-        let frame_bytes = self.spec.frame_bytes() as u64;
+        let frame_bytes = self.fmt.frame_bytes() as u64;
         if frame_bytes == 0 {
             return Err(WavError::InvalidSpec(
                 "cannot truncate: frame size is zero".to_string(),

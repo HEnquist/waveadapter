@@ -5,7 +5,7 @@ use std::io::Cursor;
 use audioadapter::{Adapter, AdapterMut};
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::header::read_wav_header;
-use waveadapter::{Chunk, RawSpec, SampleFormat, WavError, WavReader, WavSpec, WavWriter};
+use waveadapter::{Chunk, FmtChunk, SampleFormat, WavError, WavReader, WavSpec, WavWriter};
 
 fn make_buffer(channels: usize, frames: usize) -> InterleavedOwned<f32> {
     let mut buf = InterleavedOwned::<f32>::new(0.0, channels, frames);
@@ -277,9 +277,9 @@ fn header_roundtrip_offsets() {
     cursor.set_position(0);
 
     let params = read_wav_header(&mut cursor).unwrap();
-    assert_eq!(params.sample_format, Some(SampleFormat::I32));
-    assert_eq!(params.channels, 2);
-    assert_eq!(params.sample_rate, 44100);
+    assert_eq!(params.sample_format(), Some(SampleFormat::I32));
+    assert_eq!(params.channels(), 2);
+    assert_eq!(params.sample_rate(), 44100);
     assert_eq!(params.data_offset, 44);
     // 5 frames * 2 channels * 4 bytes.
     assert_eq!(params.data_length, 40);
@@ -533,12 +533,15 @@ fn float_write_emits_fact_chunk() {
     assert_eq!(rd32(46), 10, "fact carries the sample-frame count");
     assert_eq!(&bytes[50..54], b"data", "data chunk follows the fact chunk");
 
-    // It reads back cleanly, with the fact chunk surfaced as a raw chunk.
+    // It reads back cleanly, with the fact chunk parsed rather than left among
+    // the opaque chunks: the writer owns `fact`, so the reader does too, and a
+    // caller handing `chunks` straight back cannot end up writing it twice.
     let cursor = Cursor::new(bytes);
     let reader = WavReader::new(cursor).unwrap();
     assert_eq!(reader.sample_format(), Some(SampleFormat::F32));
     assert_eq!(reader.frames(), 10);
-    assert!(reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+    assert_eq!(reader.params().fact_samples(), Some(10));
+    assert!(!reader.params().chunks.iter().any(|c| &c.id == b"fact"));
 }
 
 #[test]
@@ -582,7 +585,7 @@ fn leading_and_trailing_chunks_roundtrip() {
     cursor.set_position(0);
 
     let params = read_wav_header(&mut cursor).unwrap();
-    assert_eq!(params.channels, 1);
+    assert_eq!(params.channels(), 1);
     let ids: Vec<[u8; 4]> = params.chunks.iter().map(|c| c.id).collect();
     assert!(ids.contains(b"bext"), "leading chunk present: {ids:?}");
     assert!(ids.contains(b"LIST"), "trailing chunk present: {ids:?}");
@@ -753,17 +756,19 @@ fn bw64_is_read_like_rf64() {
 fn raw_writer_roundtrips_an_unmodeled_format() {
     // IMA ADPCM: a valid format this crate does not model. Two channels, so
     // one "frame" is the two bytes the block alignment claims.
-    let spec = RawSpec {
+    let spec = FmtChunk {
         format_code: 0x11,
         channels: 2,
         sample_rate: 22050,
-        bits_per_sample: 4,
+        byte_rate: 44100,
         block_align: 2,
+        bits_per_sample: 4,
+        extension: None,
     };
     let samples: Vec<u8> = (0..32u8).collect();
 
     let mut cursor = Cursor::new(Vec::new());
-    let mut writer = WavWriter::new_raw(&mut cursor, spec).unwrap();
+    let mut writer = WavWriter::builder(spec).unwrap().open(&mut cursor).unwrap();
     writer.write_raw_interleaved(&samples).unwrap();
     writer.finalize().unwrap();
 
@@ -773,9 +778,9 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
     assert_eq!(reader.sample_format(), None);
     assert_eq!(reader.channels(), 2);
     assert_eq!(reader.sample_rate(), 22050);
-    assert_eq!(reader.params().format_code, 0x11);
-    assert_eq!(reader.params().bits_per_sample, 4);
-    assert_eq!(reader.params().block_align, 2);
+    assert_eq!(reader.params().fmt.format_code, 0x11);
+    assert_eq!(reader.params().fmt.bits_per_sample, 4);
+    assert_eq!(reader.params().fmt.block_align, 2);
     assert_eq!(reader.frames(), 16);
 
     // No `fact` chunk is written for a raw format.
@@ -790,15 +795,17 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
 
 #[test]
 fn float_read_on_raw_format_errors() {
-    let spec = RawSpec {
+    let spec = FmtChunk {
         format_code: 0x11,
         channels: 1,
         sample_rate: 8000,
-        bits_per_sample: 4,
+        byte_rate: 8000,
         block_align: 1,
+        bits_per_sample: 4,
+        extension: None,
     };
     let mut cursor = Cursor::new(Vec::new());
-    let mut writer = WavWriter::new_raw(&mut cursor, spec).unwrap();
+    let mut writer = WavWriter::builder(spec).unwrap().open(&mut cursor).unwrap();
     writer
         .write_raw_interleaved(&[0, 64, 128, 192, 255])
         .unwrap();
@@ -814,14 +821,19 @@ fn float_read_on_raw_format_errors() {
 
 #[test]
 fn float_write_on_raw_writer_errors() {
-    let spec = RawSpec {
+    let spec = FmtChunk {
         format_code: 0x11,
         channels: 1,
         sample_rate: 8000,
-        bits_per_sample: 4,
+        byte_rate: 8000,
         block_align: 1,
+        bits_per_sample: 4,
+        extension: None,
     };
-    let mut writer = WavWriter::new_raw(Cursor::new(Vec::new()), spec).unwrap();
+    let mut writer = WavWriter::builder(spec)
+        .unwrap()
+        .open(Cursor::new(Vec::new()))
+        .unwrap();
     let buf = InterleavedOwned::<f32>::new(0.0, 1, 4);
     assert!(matches!(
         writer.write_float_buffer(&buf),
@@ -964,8 +976,8 @@ fn channel_mask_roundtrips() {
     cursor.set_position(0);
 
     let params = read_wav_header(&mut cursor).unwrap();
-    assert_eq!(params.channel_mask, Some(0x3));
-    assert_eq!(params.format_code, 0xFFFE);
+    assert_eq!(params.channel_mask(), Some(0x3));
+    assert_eq!(params.fmt.format_code, 0xFFFE);
 }
 
 #[test]
@@ -979,8 +991,8 @@ fn no_channel_mask_leaves_plain_header() {
     cursor.set_position(0);
 
     let params = read_wav_header(&mut cursor).unwrap();
-    assert_eq!(params.channel_mask, None);
-    assert_eq!(params.format_code, 1);
+    assert_eq!(params.channel_mask(), None);
+    assert_eq!(params.fmt.format_code, 1);
 }
 
 #[test]
@@ -1222,9 +1234,9 @@ fn rf64_chunk_size_from_ds64_cannot_overflow_the_scan() {
     // The bogus length must stop the scan, not blow up, and the chunks found
     // before it must survive.
     let params = read_wav_header(Cursor::new(file)).expect("header should still parse");
-    assert_eq!(params.channels, 2);
-    assert_eq!(params.sample_rate, 44100);
-    assert_eq!(params.sample_format, Some(SampleFormat::I16));
+    assert_eq!(params.channels(), 2);
+    assert_eq!(params.sample_rate(), 44100);
+    assert_eq!(params.sample_format(), Some(SampleFormat::I16));
     assert_eq!(params.data_length, 4);
 }
 
@@ -1465,14 +1477,19 @@ fn writer_truncate_rejects_streaming_and_trailing_chunks() {
     ));
 
     // A raw writer with no block alignment has no frame size to cut on.
-    let raw = RawSpec {
+    let raw = FmtChunk {
         format_code: 6,
         channels: 1,
         sample_rate: 8000,
-        bits_per_sample: 8,
+        byte_rate: 0,
         block_align: 0,
+        bits_per_sample: 8,
+        extension: None,
     };
-    let mut raw_writer = WavWriter::new_raw(Cursor::new(Vec::new()), raw).unwrap();
+    let mut raw_writer = WavWriter::builder(raw)
+        .unwrap()
+        .open(Cursor::new(Vec::new()))
+        .unwrap();
     raw_writer.write_raw_interleaved(&[0; 16]).unwrap();
     assert!(matches!(
         raw_writer.truncate_to_frame(1),

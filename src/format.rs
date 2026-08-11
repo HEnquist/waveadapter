@@ -131,36 +131,7 @@ impl WavSpec {
     }
 }
 
-/// The properties needed to write a wav file in *raw* (uninterpreted) mode: the
-/// `fmt ` chunk fields written verbatim, with no attempt to map them to a
-/// [`SampleFormat`].
-///
-/// This is the write-side counterpart to a [`WavParams`](crate::WavParams) whose
-/// `sample_format` is `None`: it lets a caller emit a container for a format this
-/// crate does not model (ADPCM, GSM, an exotic
-/// `WAVEFORMATEXTENSIBLE` subtype, ...) and then push the audio through
-/// [`WavWriter::write_raw_interleaved`](crate::WavWriter::write_raw_interleaved).
-/// The float write path is not available for a raw writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RawSpec {
-    /// The `fmt ` format code (`wFormatTag`), for example `1` for integer PCM or
-    /// `0x11` for IMA ADPCM.
-    pub format_code: u16,
-    /// The number of channels.
-    pub channels: usize,
-    /// The sample rate in Hz.
-    pub sample_rate: usize,
-    /// Bits per single-channel sample (`wBitsPerSample`).
-    pub bits_per_sample: u16,
-    /// Bytes per frame (`nBlockAlign`). This is what the reader and writer use to
-    /// frame the raw byte stream, so the caller must set it to match the audio.
-    pub block_align: u16,
-}
-
-impl RawSpec {
-    /// The number of bytes occupied by one frame, taken directly from
-    /// [`block_align`](RawSpec::block_align).
-    pub fn frame_bytes(&self) -> usize {
-        self.block_align as usize
-    }
-}
+// The write-side counterpart to a `WavParams` whose format is not one this crate
+// models used to be a `RawSpec` of loose fields. It is now `FmtChunk` in
+// `header.rs`: the same struct the reader hands back, so the bytes survive a
+// round trip instead of being rebuilt from a PCM-shaped guess.

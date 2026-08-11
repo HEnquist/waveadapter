@@ -440,9 +440,9 @@ fn unsupported_format_reads_as_raw() {
         None,
         "ADPCM should be uninterpreted"
     );
-    assert_eq!(reader.params().format_code, 0x11);
-    assert_eq!(reader.params().bits_per_sample, 4);
-    assert!(reader.params().block_align >= 1);
+    assert_eq!(reader.params().fmt.format_code, 0x11);
+    assert_eq!(reader.params().fmt.bits_per_sample, 4);
+    assert!(reader.params().fmt.block_align >= 1);
 
     let mut bytes = Vec::new();
     let frames = reader
@@ -463,17 +463,23 @@ fn gsm610_survives_the_raw_path() {
     let mut reader = WavReader::new(file).expect("GSM file should parse");
 
     assert_eq!(reader.sample_format(), None, "GSM is uninterpreted");
-    assert_eq!(reader.params().format_code, 0x31);
-    assert_eq!(reader.params().bits_per_sample, 0, "GSM declares zero bits");
-    assert_eq!(reader.params().block_align, 65, "odd block alignment");
+    assert_eq!(reader.params().fmt.format_code, 0x31);
+    assert_eq!(
+        reader.params().fmt.bits_per_sample,
+        0,
+        "GSM declares zero bits"
+    );
+    assert_eq!(reader.params().fmt.block_align, 65, "odd block alignment");
     assert_eq!(reader.params().frame_bytes(), 65, "framing off block_align");
     assert_eq!(reader.channels(), 1);
     // 195 bytes of data, three 65-byte blocks. The odd size means the data
     // chunk carries a pad byte that must not be counted as audio.
     assert_eq!(reader.params().data_length, 195);
     assert_eq!(reader.frames(), 3);
-    // The fact chunk before the audio comes through as an opaque blob.
-    assert!(reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+    // The fact chunk is parsed, not left opaque, and it is the only place the
+    // real frame count lives: `frames()` counts the three compressed blocks.
+    assert_eq!(reader.params().fact_samples(), Some(960));
+    assert!(!reader.params().chunks.iter().any(|c| &c.id == b"fact"));
 
     let mut bytes = Vec::new();
     let blocks = reader
@@ -484,6 +490,70 @@ fn gsm610_survives_the_raw_path() {
     assert_eq!(bytes[0], 0xD0, "first block starts where it should");
     assert_eq!(bytes[65], 0xD1, "second block is 65 bytes in");
     assert_eq!(bytes[130], 0xD2, "third block is 130 bytes in");
+}
+
+/// Read a fixture, write it back out through the codec-facing path, and return
+/// the two files' `fmt ` chunk bodies plus their `fact` counts.
+fn rewrite_raw(name: &str) -> (Vec<u8>, Vec<u8>, Option<u32>, Option<u32>) {
+    use waveadapter::{Fact, WavWriter};
+
+    let mut reader = WavReader::new(std::fs::File::open(fixture(name)).unwrap()).unwrap();
+    let mut audio = Vec::new();
+    reader
+        .read_raw_interleaved(reader.frames(), &mut audio)
+        .unwrap();
+    let params = reader.params().clone();
+
+    let fact = params.fact_samples().map_or(Fact::None, Fact::Samples);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(params.fmt.clone())
+        .unwrap()
+        .fact(fact)
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+
+    let rewritten = WavReader::new(std::io::Cursor::new(cursor.into_inner())).unwrap();
+    (
+        params.fmt.to_bytes().unwrap(),
+        rewritten.params().fmt.to_bytes().unwrap(),
+        params.fact_samples(),
+        rewritten.params().fact_samples(),
+    )
+}
+
+#[test]
+fn unmodeled_formats_rewrite_byte_for_byte() {
+    // The point of the whole raw path: a codec built on top of this crate has to
+    // be able to read a file, write it back, and have the container come out
+    // identical. That means the format-specific `fmt ` extension and the `fact`
+    // frame count both survive, neither of which the crate interprets.
+    for name in ["gsm610_mono", "ms_adpcm_stereo", "ima_adpcm_mono"] {
+        let (original, rewritten, fact_before, fact_after) = rewrite_raw(name);
+        assert_eq!(original, rewritten, "{name}: fmt chunk changed on rewrite");
+        assert_eq!(fact_before, fact_after, "{name}: fact count changed");
+    }
+}
+
+#[test]
+fn gsm610_rewrite_keeps_the_fields_no_one_can_recompute() {
+    // Spelling out the two GSM fields that a fields-and-guesswork writer gets
+    // wrong: `nAvgBytesPerSec` is 1625, not block_align * sample_rate (520000),
+    // and `wSamplesPerBlock` (320) lives in the extension.
+    let (original, rewritten, ..) = rewrite_raw("gsm610_mono");
+    assert_eq!(original, rewritten);
+
+    let fmt = waveadapter::FmtChunk::from_bytes(&rewritten).unwrap();
+    assert_eq!(fmt.format_code, 0x31);
+    assert_eq!(fmt.byte_rate, 1625, "not block_align * sample_rate");
+    assert_eq!(fmt.block_align, 65);
+    assert_eq!(fmt.bits_per_sample, 0);
+    assert_eq!(
+        fmt.extension.as_deref(),
+        Some(&[0x40, 0x01][..]),
+        "wSamplesPerBlock = 320"
+    );
 }
 
 #[test]
@@ -497,10 +567,10 @@ fn long_fmt_chunk_is_not_mistaken_for_extensible() {
     let reader = WavReader::new(file).expect("MS ADPCM file should parse");
 
     assert_eq!(reader.sample_format(), None, "MS ADPCM is uninterpreted");
-    assert_eq!(reader.params().format_code, 2);
+    assert_eq!(reader.params().fmt.format_code, 2);
     assert_eq!(reader.channels(), 2);
     assert_eq!(
-        reader.params().channel_mask,
+        reader.params().channel_mask(),
         None,
         "a non-extensible header carries no channel mask, however long it is"
     );
