@@ -384,6 +384,14 @@ const REJECTED: &[(&str, &str)] = &[
         "ms_adpcm_stereo",
         "MS ADPCM is not decodable, only readable as raw",
     ),
+    (
+        "odd_length_fmt_extension",
+        "an unassigned format tag is not decodable, only readable as raw",
+    ),
+    (
+        "extensible_too_short",
+        "extensible without its subformat GUID names no format we know",
+    ),
     ("empty_riff_no_data_chunk", "no data chunk present"),
 ];
 
@@ -553,6 +561,58 @@ fn gsm610_rewrite_keeps_the_fields_no_one_can_recompute() {
         fmt.extension.as_deref(),
         Some(&[0x40, 0x01][..]),
         "wSamplesPerBlock = 320"
+    );
+}
+
+#[test]
+fn odd_length_fmt_extension_keeps_the_file_aligned() {
+    // Every standard fmt body is even (16, 18, 40), so the pad byte after an
+    // odd one is never exercised by a normal file. Omit it and the parser, which
+    // advances past every chunk assuming the pad is there, lands one byte off
+    // and misreads everything after the fmt chunk.
+    let file = std::fs::File::open(fixture("odd_length_fmt_extension")).unwrap();
+    let mut reader = WavReader::new(file).expect("odd fmt extension should parse");
+    assert_eq!(reader.params().fmt.format_code, 0x99);
+    assert_eq!(
+        reader.params().fmt.extension.as_deref(),
+        Some(&[0xaa, 0xbb, 0xcc][..])
+    );
+    assert_eq!(reader.frames(), 20, "the data chunk was still found");
+
+    // And it survives a rewrite, pad byte and all.
+    let (original, rewritten, ..) = rewrite_raw("odd_length_fmt_extension");
+    assert_eq!(original.len(), 21, "16-byte core, cbSize, three bytes");
+    assert_eq!(original, rewritten);
+
+    let mut bytes = Vec::new();
+    reader
+        .read_raw_interleaved(reader.frames(), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, (0..20).collect::<Vec<u8>>());
+}
+
+#[test]
+fn extensible_without_its_extension_falls_back_to_raw() {
+    // Format tag 0xFFFE promises a subformat GUID that is not there. That is a
+    // format we cannot interpret, not a broken container, so it degrades to the
+    // raw path like any other unknown format rather than failing the parse.
+    let file = std::fs::File::open(fixture("extensible_too_short")).unwrap();
+    let mut reader = WavReader::new(file).expect("a short extensible header should still parse");
+    assert_eq!(reader.sample_format(), None);
+    assert_eq!(
+        reader.params().channel_mask(),
+        None,
+        "no extension, no mask"
+    );
+    assert!(!reader.params().fmt.is_extensible());
+    assert_eq!(reader.frames(), 20);
+
+    let mut bytes = Vec::new();
+    assert_eq!(
+        reader
+            .read_raw_interleaved(reader.frames(), &mut bytes)
+            .unwrap(),
+        20
     );
 }
 

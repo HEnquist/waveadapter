@@ -658,6 +658,38 @@ def case_ms_adpcm_stereo():
     return riff(b"WAVE", f + d)
 
 
+def case_odd_length_fmt_extension():
+    """A fmt chunk with a 3-byte extension, so the body is 21 bytes and the
+    chunk needs a RIFF pad byte. Every standard fmt body (16, 18, 40) is even,
+    so nothing else exercises the padding, and getting it wrong shifts every
+    later offset in the file by one."""
+    payload = struct.pack(
+        "<HHIIHH",
+        0x99,  # an unassigned tag: uninterpreted, raw path only
+        1,
+        SAMPLE_RATE,
+        SAMPLE_RATE,
+        1,
+        8,
+    )
+    payload += struct.pack("<H", 3) + b"\xaa\xbb\xcc"  # cbSize = 3
+    f = chunk(b"fmt ", payload)
+    d = data_chunk(bytes(range(NUM_FRAMES)))
+    return riff(b"WAVE", f + d)
+
+
+def case_extensible_too_short():
+    """Format tag 0xFFFE but only an 18-byte fmt chunk, so the subformat GUID
+    that names the real format is not there. Used to abort the whole parse;
+    should degrade to the uninterpreted raw path like any other format we
+    cannot make sense of."""
+    payload = struct.pack("<HHIIHH", 0xFFFE, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16)
+    payload += struct.pack("<H", 0)  # cbSize = 0, no extensible fields at all
+    f = chunk(b"fmt ", payload)
+    d = data_chunk(pcm_ramp_data(NUM_FRAMES, 1, 16))
+    return riff(b"WAVE", f + d)
+
+
 def case_gsm610_mono():
     """MS GSM 6.10 (format tag 0x31): zero bits per sample, an odd 65-byte
     block alignment, and a cbSize extension. Uninterpreted, raw path only.
@@ -780,6 +812,8 @@ CASES = {
     "extensible_mulaw": case_extensible_mulaw,
     "ima_adpcm_mono": case_ima_adpcm_mono,
     "gsm610_mono": case_gsm610_mono,
+    "odd_length_fmt_extension": case_odd_length_fmt_extension,
+    "extensible_too_short": case_extensible_too_short,
     "ms_adpcm_stereo": case_ms_adpcm_stereo,
     "huge_channel_count": case_huge_channel_count,
     "empty_riff_no_data_chunk": case_empty_riff_no_data_chunk,
