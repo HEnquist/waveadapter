@@ -109,6 +109,35 @@ def fmt_ima_adpcm(channels=1, sample_rate=SAMPLE_RATE, samples_per_block=505):
     return chunk(b"fmt ", data)
 
 
+def fmt_ms_adpcm(channels=2, sample_rate=SAMPLE_RATE, samples_per_block=244):
+    """MS ADPCM fmt chunk (format tag 2). Its extension is 32 bytes, making the
+    whole chunk 50, which lands it *past* the 40-byte extensible size without
+    being extensible. Offset 20 of the body, where a WAVEFORMATEXTENSIBLE keeps
+    dwChannelMask, is wNumCoef here, so a parser that reads the mask on length
+    alone reports a coefficient count as a speaker layout."""
+    block_align = 256 * channels
+    byte_rate = sample_rate * block_align // samples_per_block
+    data = struct.pack(
+        "<HHIIHH",
+        2,  # WAVE_FORMAT_ADPCM
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        4,
+    )
+    # cbSize = 32: wSamplesPerBlock, wNumCoef, then 7 pairs of int16 coefficients.
+    coefficients = [
+        (256, 0), (512, -256), (0, 0), (192, 64),
+        (240, 0), (460, -208), (392, -232),
+    ]
+    data += struct.pack("<H", 32)
+    data += struct.pack("<HH", samples_per_block, len(coefficients))
+    for coef1, coef2 in coefficients:
+        data += struct.pack("<hh", coef1, coef2)
+    return chunk(b"fmt ", data)
+
+
 def fmt_gsm610(sample_rate=SAMPLE_RATE):
     """MS GSM 6.10 fmt chunk (format tag 0x31), the most hostile fmt chunk in
     common use. Three things are unusual and each one breaks a natural
@@ -621,6 +650,14 @@ def case_ima_adpcm_mono():
     return riff(b"WAVE", f + d)
 
 
+def case_ms_adpcm_stereo():
+    """MS ADPCM (format tag 2): a 50-byte fmt chunk, longer than the 40-byte
+    extensible form without being extensible. Uninterpreted, raw path only."""
+    f = fmt_ms_adpcm(channels=2)
+    d = data_chunk(bytes((i * 11) % 256 for i in range(512)))
+    return riff(b"WAVE", f + d)
+
+
 def case_gsm610_mono():
     """MS GSM 6.10 (format tag 0x31): zero bits per sample, an odd 65-byte
     block alignment, and a cbSize extension. Uninterpreted, raw path only.
@@ -743,6 +780,7 @@ CASES = {
     "extensible_mulaw": case_extensible_mulaw,
     "ima_adpcm_mono": case_ima_adpcm_mono,
     "gsm610_mono": case_gsm610_mono,
+    "ms_adpcm_stereo": case_ms_adpcm_stereo,
     "huge_channel_count": case_huge_channel_count,
     "empty_riff_no_data_chunk": case_empty_riff_no_data_chunk,
     "rf64_16bit_stereo": case_rf64_16bit_stereo,

@@ -22,6 +22,10 @@ const FMT: &[u8] = b"fmt ";
 /// The `ds64` chunk that carries the 64-bit sizes of an RF64/BW64 file.
 const DS64: &[u8] = b"ds64";
 
+/// The `wFormatTag` value that marks a `WAVEFORMATEXTENSIBLE` header, where the
+/// real format is named by the subformat GUID in the extension instead.
+const EXTENSIBLE_FORMAT_CODE: u16 = 0xFFFE;
+
 /// Byte offset of the 32-bit RIFF chunk size field, measured from the start of the file.
 pub(crate) const RIFF_SIZE_OFFSET: u64 = 4;
 
@@ -411,7 +415,7 @@ impl FmtChunk {
                 _ => SUBTYPE_PCM,
             };
             Ok(FmtChunk {
-                format_code: 0xFFFE,
+                format_code: EXTENSIBLE_FORMAT_CODE,
                 channels: channels_u16,
                 sample_rate: sample_rate_u32,
                 byte_rate,
@@ -553,7 +557,9 @@ fn look_up_format(
         (3, 64, 8) => Ok(SampleFormat::F64),
         (6, 8, 1) => Ok(SampleFormat::ALAW),
         (7, 8, 1) => Ok(SampleFormat::MULAW),
-        (0xFFFE, _, _) => look_up_extended_format(data, bits, bytes_per_sample, chunk_length),
+        (EXTENSIBLE_FORMAT_CODE, _, _) => {
+            look_up_extended_format(data, bits, bytes_per_sample, chunk_length)
+        }
         (code, bits, bytes) => Err(WavError::UnsupportedFormat(format!(
             "format code {code}, {bits} bits, {bytes} bytes per sample"
         ))),
@@ -707,8 +713,15 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 bits_per_sample = fmt.bits_per_sample;
                 block_align = fmt.block_align;
                 // The channel mask lives only in the extensible form, at offset
-                // 20 (after cbSize and wValidBitsPerSample).
-                if chunk_length >= FmtChunk::EXTENSIBLE_SIZE {
+                // 20 (after cbSize and wValidBitsPerSample). The format code has
+                // to say so: a long `fmt ` chunk is not necessarily extensible,
+                // and offset 20 means something else entirely in the others. An
+                // MS ADPCM chunk is 50 bytes with `wNumCoef` there, so reading it
+                // unconditionally would report a coefficient count as a speaker
+                // layout.
+                if fmt.format_code == EXTENSIBLE_FORMAT_CODE
+                    && chunk_length >= FmtChunk::EXTENSIBLE_SIZE
+                {
                     channel_mask = Some(read_u32(&data, 20));
                 }
                 let bytes_per_sample = fmt

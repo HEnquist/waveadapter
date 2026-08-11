@@ -380,6 +380,10 @@ const REJECTED: &[(&str, &str)] = &[
         "gsm610_mono",
         "GSM 6.10 is not decodable, only readable as raw",
     ),
+    (
+        "ms_adpcm_stereo",
+        "MS ADPCM is not decodable, only readable as raw",
+    ),
     ("empty_riff_no_data_chunk", "no data chunk present"),
 ];
 
@@ -480,6 +484,26 @@ fn gsm610_survives_the_raw_path() {
     assert_eq!(bytes[0], 0xD0, "first block starts where it should");
     assert_eq!(bytes[65], 0xD1, "second block is 65 bytes in");
     assert_eq!(bytes[130], 0xD2, "third block is 130 bytes in");
+}
+
+#[test]
+fn long_fmt_chunk_is_not_mistaken_for_extensible() {
+    // MS ADPCM has a 50-byte fmt chunk: longer than the 40-byte extensible form,
+    // but not extensible. Body offset 20 holds `wNumCoef` here, where a
+    // WAVEFORMATEXTENSIBLE keeps `dwChannelMask`, so keying the mask off the
+    // chunk length alone reports a coefficient count (7) as a speaker layout.
+    // Only the format code may decide.
+    let file = std::fs::File::open(fixture("ms_adpcm_stereo")).unwrap();
+    let reader = WavReader::new(file).expect("MS ADPCM file should parse");
+
+    assert_eq!(reader.sample_format(), None, "MS ADPCM is uninterpreted");
+    assert_eq!(reader.params().format_code, 2);
+    assert_eq!(reader.channels(), 2);
+    assert_eq!(
+        reader.params().channel_mask,
+        None,
+        "a non-extensible header carries no channel mask, however long it is"
+    );
 }
 
 #[test]
