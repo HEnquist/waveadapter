@@ -541,7 +541,7 @@ fn float_write_emits_fact_chunk() {
     assert_eq!(reader.sample_format(), Some(SampleFormat::F32));
     assert_eq!(reader.frames(), 10);
     assert_eq!(reader.params().fact_samples(), Some(10));
-    assert!(!reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+    assert!(!reader.params().chunks().any(|c| &c.id == b"fact"));
 }
 
 #[test]
@@ -586,12 +586,12 @@ fn leading_and_trailing_chunks_roundtrip() {
 
     let params = read_wav_header(&mut cursor).unwrap();
     assert_eq!(params.channels(), 1);
-    let ids: Vec<[u8; 4]> = params.chunks.iter().map(|c| c.id).collect();
+    let ids: Vec<[u8; 4]> = params.chunks().map(|c| c.id).collect();
     assert!(ids.contains(b"bext"), "leading chunk present: {ids:?}");
     assert!(ids.contains(b"LIST"), "trailing chunk present: {ids:?}");
-    let bext = params.chunks.iter().find(|c| &c.id == b"bext").unwrap();
+    let bext = params.chunks().find(|c| &c.id == b"bext").unwrap();
     assert_eq!(bext.data, vec![1, 2, 3]);
-    let list = params.chunks.iter().find(|c| &c.id == b"LIST").unwrap();
+    let list = params.chunks().find(|c| &c.id == b"LIST").unwrap();
     assert_eq!(list.data, b"INFOIART");
 }
 
@@ -721,10 +721,10 @@ fn rf64_with_leading_chunk_roundtrips() {
 
     let params = read_wav_header(&mut cursor).unwrap();
     assert_eq!(params.data_length, 8);
-    let bext = params.chunks.iter().find(|c| &c.id == b"bext").unwrap();
+    let bext = params.chunks().find(|c| &c.id == b"bext").unwrap();
     assert_eq!(bext.data, vec![7u8; 10]);
     // The ds64 chunk is consumed by the parser, not surfaced as a raw chunk.
-    assert!(!params.chunks.iter().any(|c| &c.id == b"ds64"));
+    assert!(!params.chunks().any(|c| &c.id == b"ds64"));
 }
 
 #[test]
@@ -784,7 +784,7 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
     assert_eq!(reader.frames(), 16);
 
     // No `fact` chunk is written for a raw format.
-    assert!(!reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+    assert!(!reader.params().chunks().any(|c| &c.id == b"fact"));
 
     // The bytes come back untouched through the raw read path.
     let mut out = Vec::new();

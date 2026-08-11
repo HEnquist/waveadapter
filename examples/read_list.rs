@@ -1,7 +1,7 @@
 //! Read and decode a `LIST`/`INFO` metadata chunk.
 //!
 //! waveadapter treats every chunk other than `fmt ` and `data` as an opaque
-//! blob, handing it back in `WavReader::params().chunks`. The `metadata` module
+//! blob, handing it back in `WavReader::params().chunks()`. The `metadata` module
 //! gives the common `LIST`/`INFO` tag list (title, artist, comment, ...) a typed
 //! form: `InfoList::from_chunk` decodes one, `InfoList::to_chunk` builds one.
 //!
@@ -40,9 +40,10 @@ fn synthesize_demo() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 /// Decode and print the tags from every `LIST`/`INFO` chunk among the parsed chunks.
-fn report(chunks: &[Chunk]) {
+fn report<'a>(chunks: impl Iterator<Item = &'a Chunk>) {
+    let chunks: Vec<&Chunk> = chunks.collect();
     let mut found = false;
-    for info in chunks.iter().filter_map(InfoList::from_chunk) {
+    for info in chunks.iter().copied().filter_map(InfoList::from_chunk) {
         found = true;
         println!("LIST/INFO tags:");
         for (id, text) in info.iter() {
@@ -62,12 +63,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => {
             let reader = WavReader::new(std::fs::File::open(&path)?)?;
             println!("{path}:");
-            report(&reader.params().chunks);
+            report(reader.params().chunks());
         }
         None => {
             println!("(no file given, decoding a synthesized demo file)");
             let reader = WavReader::new(Cursor::new(synthesize_demo()?))?;
-            report(&reader.params().chunks);
+            report(reader.params().chunks());
         }
     }
     Ok(())

@@ -95,12 +95,16 @@ impl<W: Truncate + ?Sized> Truncate for &mut W {
 
 /// Chunk ids this crate manages itself, which callers may not supply as extra
 /// metadata chunks.
-/// Structural chunks only: the ones that describe the container itself and whose
-/// contents the writer computes. `fact` is deliberately *not* here. It is
-/// modelled on both sides now ([`WavParams::fact`](crate::WavParams::fact) and
-/// [`Fact`]), so it never reaches `chunks` for a caller to hand back by mistake,
-/// and reserving it would only break the pass-everything-through editing loop.
-const RESERVED_IDS: [&[u8; 4]; 4] = [b"RIFF", b"fmt ", b"data", b"ds64"];
+/// The chunks the writer produces itself, which a caller may not also supply.
+///
+/// `ds64` belongs here and was missing: a caller could inject a second one into
+/// an RF64 file as a leading chunk. `fact` stays because the writer emits and
+/// patches it; the way to control its contents is [`Fact`], not a hand-rolled
+/// chunk. That does not clash with the pass-everything-through editing loop,
+/// because the reader consumes `fact` into
+/// [`WavParams::fact`](crate::WavParams::fact) rather than leaving it among the
+/// chunks for a caller to hand back.
+const RESERVED_IDS: [&[u8; 4]; 5] = [b"RIFF", b"fmt ", b"data", b"fact", b"ds64"];
 
 /// Check that an extra chunk supplied by the caller can be written: a non-reserved
 /// id and a body that fits in the 32-bit chunk size field.

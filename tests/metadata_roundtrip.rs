@@ -8,6 +8,8 @@
 
 use std::io::Cursor;
 
+use audioadapter_buffers::owned::InterleavedOwned;
+
 use waveadapter::metadata::{self, AdtlEntry, AdtlList, Bext, Cue, CuePoint, InfoList, SampleLoop};
 use waveadapter::{Chunk, SampleFormat, Smpl, WavReader, WavSpec, WavWriter};
 
@@ -94,8 +96,8 @@ fn audio() -> Vec<u8> {
 }
 
 /// Every chunk with the given id, in file order.
-fn by_id<'a>(chunks: &'a [Chunk], id: &[u8; 4]) -> Vec<&'a Chunk> {
-    chunks.iter().filter(|c| &c.id == id).collect()
+fn by_id<'a>(chunks: impl Iterator<Item = &'a Chunk>, id: &[u8; 4]) -> Vec<&'a Chunk> {
+    chunks.filter(|c| &c.id == id).collect()
 }
 
 #[test]
@@ -113,9 +115,9 @@ fn every_typed_chunk_roundtrips_through_a_file() {
 
     cursor.set_position(0);
     let mut reader = WavReader::new(cursor).unwrap();
-    let chunks = reader.params().chunks.clone();
+    let chunks: Vec<Chunk> = reader.params().chunks().cloned().collect();
 
-    let lists = by_id(&chunks, b"LIST");
+    let lists = by_id(chunks.iter(), b"LIST");
     assert_eq!(lists.len(), 2, "both LIST chunks survive: {chunks:?}");
     assert_eq!(InfoList::from_chunk(lists[0]), Some(info_list()));
     assert_eq!(AdtlList::from_chunk(lists[1]), Some(adtl()));
@@ -123,9 +125,18 @@ fn every_typed_chunk_roundtrips_through_a_file() {
     assert!(AdtlList::from_chunk(lists[0]).is_none());
     assert!(InfoList::from_chunk(lists[1]).is_none());
 
-    assert_eq!(Bext::from_chunk(by_id(&chunks, b"bext")[0]), Some(bext()));
-    assert_eq!(Cue::from_chunk(by_id(&chunks, b"cue ")[0]), Some(cue()));
-    assert_eq!(Smpl::from_chunk(by_id(&chunks, b"smpl")[0]), Some(smpl()));
+    assert_eq!(
+        Bext::from_chunk(by_id(chunks.iter(), b"bext")[0]),
+        Some(bext())
+    );
+    assert_eq!(
+        Cue::from_chunk(by_id(chunks.iter(), b"cue ")[0]),
+        Some(cue())
+    );
+    assert_eq!(
+        Smpl::from_chunk(by_id(chunks.iter(), b"smpl")[0]),
+        Some(smpl())
+    );
 
     // The metadata around it must not disturb the audio.
     let mut got = Vec::new();
@@ -159,12 +170,17 @@ fn odd_length_chunks_keep_their_exact_bytes() {
 
     cursor.set_position(0);
     let reader = WavReader::new(cursor).unwrap();
-    let chunks = &reader.params().chunks;
 
-    assert_eq!(by_id(chunks, b"bext")[0].data, bext_bytes);
-    assert_eq!(by_id(chunks, b"smpl")[0].data, smpl_bytes);
-    assert_eq!(by_id(chunks, b"cue ")[0].data, cue().to_bytes());
-    assert_eq!(by_id(chunks, b"LIST")[0].data, info_list().to_bytes());
+    assert_eq!(by_id(reader.params().chunks(), b"bext")[0].data, bext_bytes);
+    assert_eq!(by_id(reader.params().chunks(), b"smpl")[0].data, smpl_bytes);
+    assert_eq!(
+        by_id(reader.params().chunks(), b"cue ")[0].data,
+        cue().to_bytes()
+    );
+    assert_eq!(
+        by_id(reader.params().chunks(), b"LIST")[0].data,
+        info_list().to_bytes()
+    );
     // 46 bytes is 23 whole frames; the trailing half frame is dropped, not read
     // as audio and not confused with the pad byte.
     assert_eq!(reader.frames(), 23);
@@ -188,10 +204,10 @@ fn chunk_order_is_preserved() {
 
     cursor.set_position(0);
     let reader = WavReader::new(cursor).unwrap();
-    let ids: Vec<[u8; 4]> = reader.params().chunks.iter().map(|c| c.id).collect();
+    let ids: Vec<[u8; 4]> = reader.params().chunks().map(|c| c.id).collect();
     assert_eq!(ids, vec![*b"LIST", *b"bext", *b"LIST"]);
 
-    let lists = by_id(&reader.params().chunks, b"LIST");
+    let lists = by_id(reader.params().chunks(), b"LIST");
     assert_eq!(
         InfoList::from_chunk(lists[0]).unwrap().get(metadata::TITLE),
         Some("First")
@@ -214,12 +230,15 @@ fn metadata_survives_a_streaming_write() {
 
     cursor.set_position(0);
     let mut reader = WavReader::new(cursor).unwrap();
-    let chunks = reader.params().chunks.clone();
+    let chunks: Vec<Chunk> = reader.params().chunks().cloned().collect();
     assert_eq!(
-        InfoList::from_chunk(by_id(&chunks, b"LIST")[0]),
+        InfoList::from_chunk(by_id(chunks.iter(), b"LIST")[0]),
         Some(info_list())
     );
-    assert_eq!(Smpl::from_chunk(by_id(&chunks, b"smpl")[0]), Some(smpl()));
+    assert_eq!(
+        Smpl::from_chunk(by_id(chunks.iter(), b"smpl")[0]),
+        Some(smpl())
+    );
 
     let mut got = Vec::new();
     reader.read_raw_interleaved(48, &mut got).unwrap();
@@ -239,12 +258,94 @@ fn metadata_survives_an_rf64_write() {
 
     cursor.set_position(0);
     let reader = WavReader::new(cursor).unwrap();
-    let chunks = &reader.params().chunks;
-    assert_eq!(Bext::from_chunk(by_id(chunks, b"bext")[0]), Some(bext()));
-    assert_eq!(Cue::from_chunk(by_id(chunks, b"cue ")[0]), Some(cue()));
     assert_eq!(
-        AdtlList::from_chunk(by_id(chunks, b"LIST")[0]),
+        Bext::from_chunk(by_id(reader.params().chunks(), b"bext")[0]),
+        Some(bext())
+    );
+    assert_eq!(
+        Cue::from_chunk(by_id(reader.params().chunks(), b"cue ")[0]),
+        Some(cue())
+    );
+    assert_eq!(
+        AdtlList::from_chunk(by_id(reader.params().chunks(), b"LIST")[0]),
         Some(adtl())
     );
     assert_eq!(reader.frames(), 48);
+}
+
+#[test]
+fn chunk_position_survives_a_rewrite() {
+    // A chunk written after the audio has to come back after the audio. The
+    // reader used to flatten both sides into one list, so the documented edit
+    // loop moved every trailing chunk to the front of the file.
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_with_chunks(&mut cursor, spec(), &[bext().to_chunk()]).unwrap();
+    writer.write_raw_interleaved(&audio()).unwrap();
+    writer.write_chunk(*b"LIST", &adtl().to_bytes()).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let reader = WavReader::new(cursor).unwrap();
+    let before: Vec<[u8; 4]> = reader.params().chunks_before.iter().map(|c| c.id).collect();
+    let after: Vec<[u8; 4]> = reader.params().chunks_after.iter().map(|c| c.id).collect();
+    assert_eq!(before, vec![*b"bext"], "leading chunk stays leading");
+    assert_eq!(after, vec![*b"LIST"], "trailing chunk stays trailing");
+}
+
+#[test]
+fn the_editing_loop_works_on_a_non_pcm_file() {
+    // Float, A-law and mu-law files all carry a `fact` chunk. While `fact` was
+    // both surfaced in `chunks` and reserved by the writer, feeding the chunks
+    // straight back, which is exactly what the documented loop does, failed with
+    // InvalidSpec for every one of them.
+    for format in [
+        SampleFormat::F32,
+        SampleFormat::ALAW,
+        SampleFormat::MULAW,
+        SampleFormat::I16,
+    ] {
+        let spec = WavSpec::new(1, 8000, format);
+        let mut cursor = Cursor::new(Vec::new());
+        let mut writer =
+            WavWriter::new_with_chunks(&mut cursor, spec, &[info_list().to_chunk()]).unwrap();
+        writer
+            .write_float_buffer(&InterleavedOwned::<f32>::new(0.25, 1, 32))
+            .unwrap();
+        writer.write_chunk(*b"id3 ", b"trailing").unwrap();
+        writer.finalize().unwrap();
+
+        cursor.set_position(0);
+        let mut reader = WavReader::new(cursor).unwrap();
+        let audio = reader.read_all_to_float::<f32>().unwrap();
+        let params = reader.params().clone();
+
+        // The loop from the metadata module docs, verbatim in spirit.
+        let leading: Vec<Chunk> = params.chunks_before.to_vec();
+        let mut out = Cursor::new(Vec::new());
+        let mut writer =
+            WavWriter::new_with_chunks(&mut out, params.spec().unwrap(), &leading).unwrap();
+        writer.write_float_buffer(&audio).unwrap();
+        for chunk in &params.chunks_after {
+            writer.write_chunk(chunk.id, &chunk.data).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let rewritten = WavReader::new(Cursor::new(out.into_inner())).unwrap();
+        assert_eq!(rewritten.sample_format(), Some(format), "{format:?}");
+        assert_eq!(
+            InfoList::from_chunk(&rewritten.params().chunks_before[0]),
+            Some(info_list()),
+            "{format:?}: leading metadata survived"
+        );
+        assert_eq!(
+            rewritten.params().chunks_after[0].id,
+            *b"id3 ",
+            "{format:?}: trailing metadata stayed trailing"
+        );
+        assert_eq!(
+            rewritten.params().fact_samples(),
+            params.fact_samples(),
+            "{format:?}: fact count preserved"
+        );
+    }
 }

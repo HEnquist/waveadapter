@@ -479,7 +479,7 @@ fn gsm610_survives_the_raw_path() {
     // The fact chunk is parsed, not left opaque, and it is the only place the
     // real frame count lives: `frames()` counts the three compressed blocks.
     assert_eq!(reader.params().fact_samples(), Some(960));
-    assert!(!reader.params().chunks.iter().any(|c| &c.id == b"fact"));
+    assert!(!reader.params().chunks().any(|c| &c.id == b"fact"));
 
     let mut bytes = Vec::new();
     let blocks = reader

@@ -35,11 +35,13 @@
 //! # Editing the metadata of a file
 //!
 //! The full loop ties three APIs together. Chunks come off the reader as raw
-//! blobs in [`WavParams::chunks`](crate::WavParams::chunks), get decoded and
-//! edited here, and go back through a leading-chunk constructor such as
-//! [`WavWriter::new_with_chunks`](crate::WavWriter::new_with_chunks). Chunks
-//! that are not recognized are passed along untouched, which is what keeps the
-//! metadata this crate has no types for from being dropped on the way:
+//! blobs in [`WavParams::chunks_before`](crate::WavParams::chunks_before) and
+//! [`chunks_after`](crate::WavParams::chunks_after), get decoded and edited
+//! here, and go back through a leading-chunk constructor such as
+//! [`WavWriter::new_with_chunks`](crate::WavWriter::new_with_chunks) and
+//! [`WavWriter::write_chunk`](crate::WavWriter::write_chunk). Chunks that are
+//! not recognized are passed along untouched, which is what keeps the metadata
+//! this crate has no types for from being dropped on the way:
 //!
 //! ```
 //! # use audioadapter_buffers::owned::InterleavedOwned;
@@ -47,38 +49,52 @@
 //! use waveadapter::metadata::{self, InfoList};
 //! use waveadapter::{Chunk, SampleFormat, WavReader, WavSpec, WavWriter};
 //!
-//! # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+//! # let spec = WavSpec::new(2, 44100, SampleFormat::F32);
 //! # let mut demo = InfoList::new();
 //! # demo.set(metadata::TITLE, "Demo Tone");
 //! # let mut w = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &[demo.to_chunk()])?;
 //! # w.write_float_buffer(&InterleavedOwned::<f32>::new(0.0, 2, 128))?;
+//! # w.write_chunk(*b"id3 ", b"trailing")?;
 //! # let wav_bytes = w.finalize()?.into_inner();
 //! // A whole wav file held in memory; a File works the same on both ends.
 //! let mut reader = WavReader::new(Cursor::new(wav_bytes))?;
 //! let audio = reader.read_all_to_float::<f32>()?;
 //!
 //! // Decode the chunk we want to edit, and keep every other one as it is.
+//! // Chunks that were after the audio stay after it.
 //! let mut info = InfoList::new();
-//! let mut chunks: Vec<Chunk> = Vec::new();
-//! for chunk in &reader.params().chunks {
+//! let mut leading: Vec<Chunk> = Vec::new();
+//! for chunk in &reader.params().chunks_before {
 //!     match InfoList::from_chunk(chunk) {
 //!         Some(list) => info = list,
-//!         None => chunks.push(chunk.clone()),
+//!         None => leading.push(chunk.clone()),
 //!     }
 //! }
 //! info.set(metadata::SOFTWARE, "waveadapter");
-//! chunks.push(info.to_chunk());
+//! leading.push(info.to_chunk());
+//! let trailing = reader.params().chunks_after.clone();
 //!
-//! let spec = WavSpec::new(reader.channels(), reader.sample_rate(), SampleFormat::I16);
-//! let mut writer = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &chunks)?;
+//! // `spec()` carries the format and channel mask over, so nothing about the
+//! // audio is retyped by hand.
+//! let spec = reader.params().spec().expect("a format we can decode");
+//! let mut writer = WavWriter::new_with_chunks(Cursor::new(Vec::new()), spec, &leading)?;
 //! writer.write_float_buffer(&audio)?;
+//! for chunk in &trailing {
+//!     writer.write_chunk(chunk.id, &chunk.data)?;
+//! }
 //! let output = writer.finalize()?.into_inner();
 //! # let edited = WavReader::new(Cursor::new(output))?;
-//! # let list = InfoList::from_chunk(&edited.params().chunks[0]).unwrap();
+//! # let list = InfoList::from_chunk(&edited.params().chunks_before[0]).unwrap();
 //! # assert_eq!(list.get(metadata::TITLE), Some("Demo Tone"));
 //! # assert_eq!(list.get(metadata::SOFTWARE), Some("waveadapter"));
+//! # assert_eq!(edited.params().chunks_after[0].id, *b"id3 ");
 //! # Ok::<(), waveadapter::WavError>(())
 //! ```
+//!
+//! The demo file above is float, so it has a `fact` chunk. That chunk does not
+//! appear in either list: the writer produces `fact` itself, so the reader owns
+//! it too (see [`WavParams::fact`](crate::WavParams::fact)) rather than handing
+//! back something that would be written twice. The same goes for `fmt `.
 //!
 //! Chunks can also go *after* the audio, written one at a time with
 //! [`WavWriter::write_chunk`](crate::WavWriter::write_chunk) once all the audio

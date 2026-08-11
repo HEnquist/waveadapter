@@ -181,9 +181,20 @@ pub struct WavParams {
     /// Files written in streaming mode declare this as [`u32::MAX`] because the
     /// final length is not known up front, so do not rely on it to be accurate.
     pub data_length: usize,
-    /// Every non-audio chunk found in the file, in the order encountered, with
-    /// its body bytes read out. See [`Chunk`].
-    pub chunks: Vec<Chunk>,
+    /// The non-audio chunks stored *before* the audio, in the order encountered.
+    ///
+    /// These go back through a leading-chunk constructor such as
+    /// [`WavWriter::new_with_chunks`](crate::WavWriter::new_with_chunks). See
+    /// [`Chunk`].
+    pub chunks_before: Vec<Chunk>,
+    /// The non-audio chunks stored *after* the audio, in the order encountered.
+    ///
+    /// These go back through [`WavWriter::write_chunk`](crate::WavWriter::write_chunk),
+    /// once the audio is written. Keeping the two sides apart is what stops a
+    /// rewrite from silently moving a trailing chunk to the front of the file,
+    /// which matters for the ones whose position is conventional: `cue `/`adtl`
+    /// pairs and `id3 ` are usually written after the audio.
+    pub chunks_after: Vec<Chunk>,
 }
 
 impl WavParams {
@@ -215,6 +226,15 @@ impl WavParams {
     /// This crate stores the mask but does not interpret it.
     pub fn channel_mask(&self) -> Option<u32> {
         self.fmt.channel_mask()
+    }
+
+    /// Every non-audio chunk, before and after the audio, in file order.
+    ///
+    /// Use this when the position does not matter. When re-writing a file it
+    /// does, so keep [`chunks_before`](WavParams::chunks_before) and
+    /// [`chunks_after`](WavParams::chunks_after) apart.
+    pub fn chunks(&self) -> impl Iterator<Item = &Chunk> {
+        self.chunks_before.iter().chain(&self.chunks_after)
     }
 
     /// The sample-frame count declared in the `fact` chunk, if the file has one.
@@ -789,7 +809,8 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     let mut fact: Option<Vec<u8>> = None;
     let mut data_offset = 0;
     let mut data_length: u64 = 0;
-    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut chunks_before: Vec<Chunk> = Vec::new();
+    let mut chunks_after: Vec<Chunk> = Vec::new();
 
     // Walk every chunk to the end of the file, so that metadata chunks placed
     // after the data chunk are captured too. A chunk is padded to an even length
@@ -913,7 +934,14 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             file.read_exact(&mut body)?;
             let mut id = [0u8; 4];
             id.copy_from_slice(&buffer[0..4]);
-            chunks.push(Chunk { id, data: body });
+            // Which side of the audio a chunk sits on is part of the file's
+            // shape, so it is recorded rather than flattened away.
+            let target = if found_data {
+                &mut chunks_after
+            } else {
+                &mut chunks_before
+            };
+            target.push(Chunk { id, data: body });
         }
         next_chunk_location = next_chunk_location
             .saturating_add(8)
@@ -928,7 +956,8 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 WavError::InvalidHeader("data length does not fit in memory".to_string())
             })?,
             data_offset: data_offset as usize,
-            chunks,
+            chunks_before,
+            chunks_after,
         });
     }
     Err(WavError::InvalidHeader(
