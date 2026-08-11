@@ -42,8 +42,9 @@ impl WriterSpec {
                     spec.channel_mask,
                 )?;
                 // The spec requires a `fact` chunk for every format that is not
-                // plain WAVE_FORMAT_PCM: float, and the WAVEFORMATEXTENSIBLE form.
-                let needs_fact = spec.sample_format.format_code() == 3
+                // plain WAVE_FORMAT_PCM: float, A-law, mu-law, and the
+                // WAVEFORMATEXTENSIBLE form even when its subformat is PCM.
+                let needs_fact = !spec.sample_format.is_pcm()
                     || header::writes_as_extensible(
                         spec.channels,
                         spec.sample_format,
@@ -546,6 +547,14 @@ impl<W: Write> WavWriter<W> {
     /// [`SampleFormat::F64`](crate::SampleFormat::F64)) are not range limited:
     /// values outside -1.0..1.0 are valid headroom and pass through unchanged,
     /// so writing to them always returns zero.
+    ///
+    /// The G.711 formats ([`ALAW`](crate::SampleFormat::ALAW) and
+    /// [`MULAW`](crate::SampleFormat::MULAW)) are lossy: every value is
+    /// quantized to one of 256 code words, not just the out-of-range ones. The
+    /// count still means "the sample exceeded full scale", not "the sample was
+    /// altered". Their largest code is also slightly short of full scale
+    /// (32256 and 32124 of the 32768 the conversion scales to), so a value just
+    /// under 1.0 saturates to the largest code without being counted.
     ///
     /// Returns [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) if a
     /// trailing chunk has already been written, since audio data must precede

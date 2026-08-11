@@ -70,6 +70,138 @@ fn roundtrip_all_formats() {
     // Float formats are exact for these values.
     roundtrip(SampleFormat::F32, 0.0);
     roundtrip(SampleFormat::F64, 0.0);
+    // The G.711 laws space their steps logarithmically, so the error depends on
+    // the magnitude rather than on a fixed bit depth. `make_buffer` stays inside
+    // +-0.26, where both laws are in their sixth segment and the step is 512 of
+    // the 32768 an i16 spans, so half a step is the bound.
+    roundtrip(SampleFormat::ALAW, 256.0 / 32768.0);
+    roundtrip(SampleFormat::MULAW, 256.0 / 32768.0);
+}
+
+/// Write a buffer as the given format and return the whole file.
+fn write_to_bytes(source: &InterleavedOwned<f32>, spec: WavSpec) -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(source).unwrap();
+    writer.finalize().unwrap();
+    cursor.into_inner()
+}
+
+#[test]
+fn g711_encoding_is_idempotent() {
+    // Companding quantizes on the way in, so a float does not survive a
+    // roundtrip. What must hold is that the quantization is stable: decoding a
+    // file and writing it back out again reproduces the same code words, so
+    // repeated read/write cycles do not drift.
+    for format in [SampleFormat::ALAW, SampleFormat::MULAW] {
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            sample_format: format,
+            channel_mask: None,
+        };
+        let first = write_to_bytes(&make_buffer(2, 64), spec);
+
+        let mut reader = WavReader::new(Cursor::new(first.clone())).unwrap();
+        let decoded = reader.read_all_to_float::<f32>().unwrap();
+        let second = write_to_bytes(&decoded, spec);
+
+        assert_eq!(first, second, "{format:?}: re-encoding changed the bytes");
+    }
+}
+
+#[test]
+fn g711_writes_a_non_pcm_header() {
+    for (format, code) in [(SampleFormat::ALAW, 6u16), (SampleFormat::MULAW, 7u16)] {
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            sample_format: format,
+            channel_mask: None,
+        };
+        let bytes = write_to_bytes(&make_buffer(2, 10), spec);
+        let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        let rd32 =
+            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+        // The 18-byte WAVEFORMATEX form: body 20..38, cbSize last.
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(rd32(16), 18, "{format:?}: non-PCM needs the cbSize field");
+        assert_eq!(rd16(20), code, "{format:?}: format tag");
+        assert_eq!(rd16(32), 2, "{format:?}: one byte per channel per frame");
+        assert_eq!(rd16(34), 8, "{format:?}: bits per sample");
+        assert_eq!(rd16(36), 0, "{format:?}: cbSize is zero");
+
+        // Non-PCM also means a `fact` chunk carrying the frame count.
+        assert_eq!(
+            &bytes[38..42],
+            b"fact",
+            "{format:?}: fact chunk follows fmt"
+        );
+        assert_eq!(rd32(46), 10, "{format:?}: fact frame count");
+
+        // One byte per sample on disk, so ten stereo frames are twenty bytes.
+        let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.sample_format(), Some(format));
+        assert_eq!(reader.frames(), 10);
+        assert_eq!(reader.params().data_length, 20);
+        assert_eq!(reader.read_all_to_float::<f32>().unwrap().frames(), 10);
+    }
+}
+
+#[test]
+fn multichannel_g711_uses_the_matching_subtype_guid() {
+    // More than two channels forces the extensible form, and the subformat GUID
+    // has to follow the format. Writing the PCM GUID here would produce a file
+    // that claims to be linear 8-bit and decodes to noise.
+    for (format, guid_first_byte) in [(SampleFormat::ALAW, 6u8), (SampleFormat::MULAW, 7u8)] {
+        let spec = WavSpec {
+            channels: 4,
+            sample_rate: 8000,
+            sample_format: format,
+            channel_mask: None,
+        };
+        let bytes = write_to_bytes(&make_buffer(4, 8), spec);
+
+        assert_eq!(
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            40,
+            "{format:?}: four channels write the extensible form"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[20], bytes[21]]),
+            0xFFFE,
+            "{format:?}: extensible format tag"
+        );
+        // Subformat GUID sits at body offset 24, so file offset 44.
+        assert_eq!(
+            &bytes[44..60],
+            &[
+                guid_first_byte,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x10,
+                0,
+                0x80,
+                0,
+                0,
+                0xaa,
+                0,
+                0x38,
+                0x9b,
+                0x71
+            ],
+            "{format:?}: subformat GUID"
+        );
+
+        let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.sample_format(), Some(format));
+        assert_eq!(reader.channels(), 4);
+        assert_eq!(reader.read_all_to_float::<f32>().unwrap().frames(), 8);
+    }
 }
 
 #[test]
@@ -383,15 +515,23 @@ fn float_write_emits_fact_chunk() {
 
     let rd32 = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
 
-    // RIFF/WAVE (12) + fmt chunk (8 + 16). The fact chunk follows the fmt chunk.
+    // RIFF/WAVE (12) + fmt chunk (8 + 18, float is non-PCM so it gets the
+    // WAVEFORMATEX form with a zero cbSize). The fact chunk follows it.
+    assert_eq!(rd32(16), 18, "float fmt body is the 18-byte WAVEFORMATEX");
+    // Body runs 20..38; cbSize is the last field of it.
     assert_eq!(
-        &bytes[36..40],
-        b"fact",
-        "fact chunk follows the 16-byte fmt"
+        u16::from_le_bytes([bytes[36], bytes[37]]),
+        0,
+        "cbSize is zero"
     );
-    assert_eq!(rd32(40), 4, "fact body is 4 bytes");
-    assert_eq!(rd32(44), 10, "fact carries the sample-frame count");
-    assert_eq!(&bytes[48..52], b"data", "data chunk follows the fact chunk");
+    assert_eq!(
+        &bytes[38..42],
+        b"fact",
+        "fact chunk follows the 18-byte fmt"
+    );
+    assert_eq!(rd32(42), 4, "fact body is 4 bytes");
+    assert_eq!(rd32(46), 10, "fact carries the sample-frame count");
+    assert_eq!(&bytes[50..54], b"data", "data chunk follows the fact chunk");
 
     // It reads back cleanly, with the fact chunk surfaced as a raw chunk.
     let cursor = Cursor::new(bytes);
@@ -535,10 +675,10 @@ fn rf64_roundtrip() {
 
     // fmt follows ds64; no fact chunk is written for RF64. The data chunk's
     // 32-bit size field carries the marker.
-    // ds64 ends at 48; the 16-byte-core fmt chunk (8 + 16) runs to 72.
+    // ds64 ends at 48; the float fmt chunk (8 + 18) runs to 74.
     assert_eq!(&bytes[48..52], b"fmt ");
-    assert_eq!(&bytes[72..76], b"data", "data follows fmt, no fact chunk");
-    assert_eq!(rd32(76), u32::MAX, "data size field is the marker");
+    assert_eq!(&bytes[74..78], b"data", "data follows fmt, no fact chunk");
+    assert_eq!(rd32(78), u32::MAX, "data size field is the marker");
 
     // It reads back with the resolved 64-bit data length and intact audio.
     let mut reader = WavReader::new(Cursor::new(bytes)).unwrap();
@@ -611,13 +751,13 @@ fn bw64_is_read_like_rf64() {
 
 #[test]
 fn raw_writer_roundtrips_an_unmodeled_format() {
-    // Mu-law: a valid format this crate does not model. Two channels, so one
-    // frame is two bytes.
+    // IMA ADPCM: a valid format this crate does not model. Two channels, so
+    // one "frame" is the two bytes the block alignment claims.
     let spec = RawSpec {
-        format_code: 7,
+        format_code: 0x11,
         channels: 2,
         sample_rate: 22050,
-        bits_per_sample: 8,
+        bits_per_sample: 4,
         block_align: 2,
     };
     let samples: Vec<u8> = (0..32u8).collect();
@@ -633,8 +773,8 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
     assert_eq!(reader.sample_format(), None);
     assert_eq!(reader.channels(), 2);
     assert_eq!(reader.sample_rate(), 22050);
-    assert_eq!(reader.params().format_code, 7);
-    assert_eq!(reader.params().bits_per_sample, 8);
+    assert_eq!(reader.params().format_code, 0x11);
+    assert_eq!(reader.params().bits_per_sample, 4);
     assert_eq!(reader.params().block_align, 2);
     assert_eq!(reader.frames(), 16);
 
@@ -651,10 +791,10 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
 #[test]
 fn float_read_on_raw_format_errors() {
     let spec = RawSpec {
-        format_code: 7,
+        format_code: 0x11,
         channels: 1,
         sample_rate: 8000,
-        bits_per_sample: 8,
+        bits_per_sample: 4,
         block_align: 1,
     };
     let mut cursor = Cursor::new(Vec::new());
@@ -675,10 +815,10 @@ fn float_read_on_raw_format_errors() {
 #[test]
 fn float_write_on_raw_writer_errors() {
     let spec = RawSpec {
-        format_code: 7,
+        format_code: 0x11,
         channels: 1,
         sample_rate: 8000,
-        bits_per_sample: 8,
+        bits_per_sample: 4,
         block_align: 1,
     };
     let mut writer = WavWriter::new_raw(Cursor::new(Vec::new()), spec).unwrap();
@@ -967,10 +1107,11 @@ fn update_header_makes_an_abandoned_rf64_readable() {
     let bytes = cursor.into_inner();
 
     // Both blocks are on disk, but the header only declares the first.
+    // Header is RIFF/WAVE (12) + ds64 (8 + 28) + float fmt (8 + 18) = 74.
     let expected_bytes = (half * channels * 4) as u64;
     assert_eq!(
         bytes.len() as u64,
-        72 + 8 + 2 * expected_bytes,
+        74 + 8 + 2 * expected_bytes,
         "both blocks were written"
     );
     let rd64 = |o: usize| {

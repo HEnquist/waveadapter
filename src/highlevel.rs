@@ -59,7 +59,7 @@ impl<T: Clone> WavData<T> {
 ///
 /// This is the "I don't care, just give me the data" path. It does not expose
 /// metadata chunks and returns [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat)
-/// for formats the float path cannot decode (such as A-law or mu-law); use
+/// for formats the float path cannot decode (such as ADPCM); use
 /// [`WavReader`] directly for those.
 pub fn read_wav_file<T, P>(path: P) -> Result<WavData<T>>
 where

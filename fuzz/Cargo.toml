@@ -35,6 +35,8 @@ doc = false
 bench = false
 
 # TEMPORARY: mirrors the patch in the parent Cargo.toml, needed because the fuzz
-# crate is its own workspace. Remove both once audioadapter-sample 5.1.0 is published.
+# crate is its own workspace. Remove both once audioadapter-sample 5.2.0 is published.
 [patch.crates-io]
-audioadapter-sample = { git = "https://github.com/HEnquist/audioadapter-rs", branch = "add-8bit-formats" }
+audioadapter = { path = "../../audioadapter-rs/audioadapter" }
+audioadapter-sample = { path = "../../audioadapter-rs/audioadapter-sample" }
+audioadapter-buffers = { path = "../../audioadapter-rs/audioadapter-buffers" }

@@ -52,8 +52,11 @@ and the replay test because a separate crate cannot reach into them; keep the tw
 The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.rs` (frame loop)
 <-> `audioadapter-sample` conversion <-> caller's `Adapter`/`AdapterMut` buffer.
 
-- **`format.rs`** is the hub. `SampleFormat` enumerates the seven supported on-disk formats (U8,
-  I16, I24_3, I24_4, I32, F32, F64; all little-endian, and U8 unsigned as wav 8-bit PCM always is).
+- **`format.rs`** is the hub. `SampleFormat` enumerates the nine supported on-disk formats (U8,
+  I16, I24_3, I24_4, I32, F32, F64, ALAW, MULAW; all little-endian, and U8 unsigned as wav 8-bit PCM
+  always is). ALAW and MULAW are the G.711 companded telephony formats: one byte per sample like U8,
+  but logarithmically spaced and therefore lossy, so they quantize on write and a float does not
+  survive a roundtrip (re-encoding what was read is stable, though).
   It deliberately mirrors the byte-wrapper sample types in `audioadapter_sample::sample`. `WavSpec`
   (channels/rate/format) is the input to the writer; `WavParams` (in `header.rs`) is the output of
   the reader.
@@ -61,9 +64,10 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 - **`dispatch.rs`** holds the `with_sample_type!` macro, the single bridge from a *value-level*
   `SampleFormat` to the *type-level* parameter required by `read_converted::<S, T>` /
   `write_converted::<S, T>`. Whenever you add a `SampleFormat` variant, you must extend this macro's
-  match (and `format_code`/`bits_per_sample` in `format.rs`, and both `look_up_format` tables in
-  `header.rs`). Byte sizes come from each sample type's `BYTES_PER_SAMPLE` via this macro, so they
-  stay in sync automatically.
+  match (and `format_code`/`bits_per_sample` in `format.rs`, both `look_up_format` tables in
+  `header.rs`, the subformat-GUID match in `FmtChunk::for_format`, and the format match in
+  `examples/read_raw.rs`). Byte sizes come from each sample type's `BYTES_PER_SAMPLE` via this
+  macro, so they stay in sync automatically.
 
 - **`header.rs`** parses and writes the RIFF/WAVE container. The parser walks *all* chunks to the
   end of the file, picking out the first `fmt ` and `data` (tolerating junk/extra chunks and
@@ -71,17 +75,23 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `Chunk { id, data }` blobs. This crate gives meaning only to `fmt ` and `data`; everything else
   (`LIST`/`INFO`, `bext`, `cue `, `fact`, `iXML`, ...) is passed through untouched so a higher-level
   metadata library can sit on top. It supports both plain `WAVEFORMAT` (16/18-byte fmt) and
-  `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype). `FmtChunk` is the single
-  byte-layout definition shared by parser and writer. Writing emits the minimal canonical 16-byte
-  `fmt ` chunk by default, switching to the 40-byte `WAVEFORMATEXTENSIBLE` form when the format
-  requires it (`I24_4`), there are more than two channels, or the spec carries a non-zero channel
-  mask (see `writes_as_extensible`). The `dwChannelMask` is stored, not interpreted:
+  `WAVEFORMATEXTENSIBLE` (40-byte fmt, matched by GUID subtype), and tolerates anything longer.
+  `FmtChunk` is the single byte-layout definition shared by parser and writer, with `FmtTail`
+  naming the three forms the body can take: bare 16-byte core, 18-byte `WAVEFORMATEX` (a zero
+  `cbSize`), and 40-byte `WAVEFORMATEXTENSIBLE`. Writing picks the core for plain integer PCM, the
+  `WAVEFORMATEX` form for every non-PCM format (float, A-law, mu-law, which the spec says must
+  carry `cbSize`), and the extensible form when the format requires it (`I24_4`), there are more
+  than two channels, or the spec carries a non-zero channel mask (see `writes_as_extensible`). The
+  subformat GUID in the extensible form mirrors the plain format code, so every code the crate can
+  write needs an arm in that match (`SUBTYPE_PCM`/`_FLOAT`/`_ALAW`/`_MULAW`); getting it wrong
+  produces a file that silently claims the wrong format. The `dwChannelMask` is stored, not
+  interpreted:
   `WavSpec::channel_mask` is written verbatim into the extensible header (validated to have one bit
   set per channel, or be zero) and surfaced on read as `WavParams::channel_mask` (`None` when the
   header is not extensible). It also
   emits a `fact` chunk (sample-frame count) after `fmt ` for every format the spec treats as
-  non-PCM: float, and the `WAVEFORMATEXTENSIBLE` form (format tag `0xFFFE`) even when its subformat
-  is PCM. Only plain integer PCM omits it. The granular
+  non-PCM: float, A-law, mu-law, and the `WAVEFORMATEXTENSIBLE` form (format tag `0xFFFE`) even
+  when its subformat is PCM. Only plain integer PCM omits it (`SampleFormat::is_pcm`). The granular
   `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/
   `write_data_header` helpers let the writer compose a header with `fact` and caller-supplied
   chunks; `write_wav_header` is the plain RIFF+fmt+data convenience built on them.
@@ -103,7 +113,7 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
     Writing returns the number of clipped samples.
   - *Raw path* (`read_raw_interleaved` / `write_raw_interleaved`): moves untouched interleaved bytes
     so the caller can wrap them with audioadapter's byte/number adapters directly. The raw path also
-    handles formats this crate does not model at all (A-law/µ-law, ADPCM, exotic
+    handles formats this crate does not model at all (ADPCM, GSM, exotic
     extensible subtypes): the parser records such a file with `WavParams::sample_format == None`
     (keeping the raw `format_code`/`bits_per_sample`/`block_align` fields), and `read_raw_interleaved`
     frames the bytes off `WavParams::frame_bytes()` (which falls back to `block_align` when the format
@@ -202,10 +212,15 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 - WAV data is always little-endian; only LE sample types are wired up. Don't add big-endian
   variants without a matching audioadapter sample type.
 - The reader stops at the last whole frame: a partial trailing frame is dropped, not errored.
-- Unsupported-but-valid files (e.g. A-law, which audioadapter has no sample type for) must never
+- Unsupported-but-valid files (e.g. IMA ADPCM, which audioadapter has no sample type for) must never
   panic. They parse with `sample_format == None` and are readable through the raw path; only the
   *float* path rejects them with a `WavError::UnsupportedFormat`. The `wav_variants` test enforces
-  both: that the float path errors and that the raw path still yields the bytes.
+  both: that the float path errors and that the raw path still yields the bytes. `ima_adpcm_mono` is
+  the fixture guarding this; it used to be `mulaw_mono`, until G.711 became a supported format.
+- The `fmt ` chunk is accepted at any length from 16 bytes up, not just the three standard sizes.
+  A non-PCM format may carry any amount of format-specific data after `cbSize` (IMA ADPCM has two
+  bytes, MS ADPCM a coefficient table), and those files still have to reach the raw path. Only the
+  first 40 bytes are ever read, which is also what bounds the allocation.
 
 ## Conventions
 

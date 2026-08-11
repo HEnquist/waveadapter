@@ -68,21 +68,71 @@ def fmt_pcm(channels=1, sample_rate=SAMPLE_RATE, bits_per_sample=16, fmt_size=16
     return chunk(b"fmt ", data)
 
 
-def fmt_mulaw(channels=1, sample_rate=SAMPLE_RATE):
-    """Mu-law fmt chunk (format tag 7). One byte per sample, but the bytes are
-    companded, so this crate does not model the format at all."""
+def fmt_g711(format_code, channels=1, sample_rate=SAMPLE_RATE):
+    """A-law (format tag 6) or mu-law (format tag 7) fmt chunk. One companded
+    byte per sample. Both are non-PCM, so they use the 18-byte WAVEFORMATEX
+    form with cbSize = 0."""
+    assert format_code in (6, 7)
     block_align = channels
     byte_rate = sample_rate * block_align
     data = struct.pack(
         "<HHIIHH",
-        7,  # WAVE_FORMAT_MULAW
+        format_code,
         channels,
         sample_rate,
         byte_rate,
         block_align,
         8,
     )
-    data += struct.pack("<H", 0)  # cbSize = 0, mu-law uses the 18-byte form
+    data += struct.pack("<H", 0)  # cbSize = 0
+    return chunk(b"fmt ", data)
+
+
+def fmt_ima_adpcm(channels=1, sample_rate=SAMPLE_RATE, samples_per_block=505):
+    """IMA/DVI ADPCM fmt chunk (format tag 0x11). A block-compressed format
+    with 4 bits per sample and a per-block predictor header, so its bytes do
+    not divide into per-sample units at all. This crate does not model it, and
+    it is here to keep the uninterpreted-format path covered."""
+    block_align = 256 * channels
+    # Roughly one block per this many sample frames.
+    byte_rate = sample_rate * block_align // samples_per_block
+    data = struct.pack(
+        "<HHIIHH",
+        0x11,  # WAVE_FORMAT_DVI_ADPCM
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        4,
+    )
+    data += struct.pack("<HH", 2, samples_per_block)  # cbSize = 2, wSamplesPerBlock
+    return chunk(b"fmt ", data)
+
+
+def fmt_gsm610(sample_rate=SAMPLE_RATE):
+    """MS GSM 6.10 fmt chunk (format tag 0x31), the most hostile fmt chunk in
+    common use. Three things are unusual and each one breaks a natural
+    assumption:
+
+      * wBitsPerSample is 0, so any "bytes = bits / 8" arithmetic gives zero
+      * nBlockAlign is 65, an odd number, so blocks never land on the 2-byte
+        boundary RIFF is otherwise built around
+      * a cbSize of 2 carries wSamplesPerBlock, making the chunk 20 bytes
+
+    Mono only, and one 65-byte block holds 320 sample frames."""
+    block_align = 65
+    samples_per_block = 320
+    byte_rate = sample_rate * block_align // samples_per_block
+    data = struct.pack(
+        "<HHIIHH",
+        0x31,  # WAVE_FORMAT_GSM610
+        1,
+        sample_rate,
+        byte_rate,
+        block_align,
+        0,  # wBitsPerSample, genuinely zero for GSM
+    )
+    data += struct.pack("<HH", 2, samples_per_block)  # cbSize = 2
     return chunk(b"fmt ", data)
 
 
@@ -121,6 +171,8 @@ def fmt_float(channels=1, sample_rate=SAMPLE_RATE, bits_per_sample=32, fmt_size=
 # Common speaker channel masks for WAVE_FORMAT_EXTENSIBLE
 KSDATAFORMAT_SUBTYPE_PCM = bytes.fromhex("0100000000001000800000aa00389b71")
 KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = bytes.fromhex("0300000000001000800000aa00389b71")
+KSDATAFORMAT_SUBTYPE_ALAW = bytes.fromhex("0600000000001000800000aa00389b71")
+KSDATAFORMAT_SUBTYPE_MULAW = bytes.fromhex("0700000000001000800000aa00389b71")
 
 
 def fmt_extensible(channels=2, sample_rate=SAMPLE_RATE, bits_per_sample=24,
@@ -498,12 +550,93 @@ def case_extensible_8bit():
     return riff(b"WAVE", f + d)
 
 
+def g711_ramp_data(num_frames, channels):
+    """A spread of G.711 code words. The values are the raw bytes, so what they
+    decode to depends on the law; all that matters here is that they cover the
+    whole code space rather than one corner of it."""
+    out = bytearray()
+    for frame in range(num_frames):
+        for ch in range(channels):
+            step = (frame * 256) // max(1, num_frames)
+            out.append((step + ch * 128) % 256)
+    return bytes(out)
+
+
 def case_mulaw_mono():
-    """Mu-law (format tag 7): a valid format with no audioadapter sample type,
-    so it parses but stays uninterpreted and is readable only as raw bytes."""
-    f = fmt_mulaw(channels=1)
-    d = data_chunk(bytes(range(NUM_FRAMES)))
+    """Mu-law (format tag 7), the 18-byte WAVEFORMATEX form most encoders
+    write."""
+    f = fmt_g711(7, channels=1)
+    d = data_chunk(g711_ramp_data(NUM_FRAMES, 1))
     return riff(b"WAVE", f + d)
+
+
+def case_mulaw_stereo():
+    """Mu-law with two channels, to check the framing is one byte per channel
+    rather than the two a 16-bit assumption would give."""
+    f = fmt_g711(7, channels=2)
+    d = data_chunk(g711_ramp_data(NUM_FRAMES, 2))
+    return riff(b"WAVE", f + d)
+
+
+def case_alaw_mono():
+    """A-law (format tag 6), the other half of G.711."""
+    f = fmt_g711(6, channels=1)
+    d = data_chunk(g711_ramp_data(NUM_FRAMES, 1))
+    return riff(b"WAVE", f + d)
+
+
+def case_alaw_stereo():
+    """A-law with two channels."""
+    f = fmt_g711(6, channels=2)
+    d = data_chunk(g711_ramp_data(NUM_FRAMES, 2))
+    return riff(b"WAVE", f + d)
+
+
+def case_extensible_alaw():
+    """A-law carried in a WAVEFORMATEXTENSIBLE header, matched by the
+    KSDATAFORMAT_SUBTYPE_ALAW GUID rather than the plain format tag."""
+    f = fmt_extensible(channels=2, bits_per_sample=8, valid_bits_per_sample=8,
+                       channel_mask=0x3, sub_format=KSDATAFORMAT_SUBTYPE_ALAW,
+                       byte_width=1)
+    d = data_chunk(g711_ramp_data(NUM_FRAMES, 2))
+    return riff(b"WAVE", f + d)
+
+
+def case_extensible_mulaw():
+    """Mu-law carried in a WAVEFORMATEXTENSIBLE header."""
+    f = fmt_extensible(channels=2, bits_per_sample=8, valid_bits_per_sample=8,
+                       channel_mask=0x3, sub_format=KSDATAFORMAT_SUBTYPE_MULAW,
+                       byte_width=1)
+    d = data_chunk(g711_ramp_data(NUM_FRAMES, 2))
+    return riff(b"WAVE", f + d)
+
+
+def case_ima_adpcm_mono():
+    """IMA ADPCM (format tag 0x11): a valid format with no audioadapter sample
+    type, so it parses but stays uninterpreted and is readable only as raw
+    bytes. This is the fixture guarding that path."""
+    f = fmt_ima_adpcm(channels=1)
+    # One block's worth of bytes, contents irrelevant since nothing decodes it.
+    d = data_chunk(bytes((i * 7) % 256 for i in range(256)))
+    return riff(b"WAVE", f + d)
+
+
+def case_gsm610_mono():
+    """MS GSM 6.10 (format tag 0x31): zero bits per sample, an odd 65-byte
+    block alignment, and a cbSize extension. Uninterpreted, raw path only.
+    Three blocks, so the data chunk is 195 bytes and therefore odd-sized and
+    padded, which is the whole point of the odd block alignment."""
+    f = fmt_gsm610()
+    blocks = 3
+    # Real GSM blocks start with the 0xD magic nibble; the rest is irrelevant
+    # since nothing decodes it.
+    payload = bytearray()
+    for block in range(blocks):
+        payload.append(0xD0 | block)
+        payload += bytes((i * 13 + block) % 256 for i in range(64))
+    fact = chunk(b"fact", struct.pack("<I", blocks * 320))
+    d = data_chunk(bytes(payload))
+    return riff(b"WAVE", f + fact + d)
 
 
 def case_huge_channel_count():
@@ -603,6 +736,13 @@ CASES = {
     "mono_8bit_unsigned": case_mono_8bit_unsigned,
     "extensible_8bit": case_extensible_8bit,
     "mulaw_mono": case_mulaw_mono,
+    "mulaw_stereo": case_mulaw_stereo,
+    "alaw_mono": case_alaw_mono,
+    "alaw_stereo": case_alaw_stereo,
+    "extensible_alaw": case_extensible_alaw,
+    "extensible_mulaw": case_extensible_mulaw,
+    "ima_adpcm_mono": case_ima_adpcm_mono,
+    "gsm610_mono": case_gsm610_mono,
     "huge_channel_count": case_huge_channel_count,
     "empty_riff_no_data_chunk": case_empty_riff_no_data_chunk,
     "rf64_16bit_stereo": case_rf64_16bit_stereo,

@@ -20,10 +20,11 @@ audioadapter adapters directly.
 - **Raw byte passthrough**: move the interleaved sample bytes untouched, to wrap with the
   audioadapter byte/number adapters yourself, or to handle formats this crate does not model.
 - **Wide format coverage**: 8- (unsigned), 16-, 24- (both 3-byte packed and 4-byte left-justified),
-  and 32-bit integer PCM, plus 32- and 64-bit IEEE float.
-- **Any container, even unmodeled formats**: A-law/µ-law, ADPCM and exotic
-  `WAVEFORMATEXTENSIBLE` subtypes round-trip as raw bytes, so the crate is a complete WAV container
-  library, not just the formats it can decode.
+  and 32-bit integer PCM, 32- and 64-bit IEEE float, and the G.711 companded telephony formats
+  A-law and mu-law.
+- **Any container, even unmodeled formats**: ADPCM, GSM and exotic `WAVEFORMATEXTENSIBLE` subtypes
+  round-trip as raw bytes, so the crate is a complete WAV container library, not just the formats
+  it can decode.
 - **Plain and extensible headers**: reads and writes both `WAVEFORMAT`/`WAVEFORMATEX` and
   `WAVEFORMATEXTENSIBLE`, picking the minimal form automatically. The `dwChannelMask` speaker layout
   is read and written.
@@ -52,14 +53,25 @@ audioadapter byte-wrapper sample types.
 | `I32`          | PCM        | 32   | 4     |
 | `F32`          | IEEE float | 32   | 4     |
 | `F64`          | IEEE float | 64   | 8     |
+| `ALAW`         | G.711 A-law  | 8  | 1     |
+| `MULAW`        | G.711 mu-law | 8  | 1     |
 
 `U8` is the odd one out: wav 8-bit PCM is unsigned and centered at 128, while every deeper integer
 depth is signed. The conversion handles that, so `0` reads back as -1.0 and `255` as +1.0.
 
+`ALAW` and `MULAW` are the companded telephony formats of ITU-T G.711. They also store one byte per
+sample, but space the quantization steps logarithmically, so they carry roughly 13 and 14 bits of
+dynamic range rather than the 8 of `U8`. Being lossy, they quantize on write: a value written and
+read back does not come out unchanged, though re-encoding what was read changes nothing further.
+Mu-law is also written μ-law, u-law or ulaw elsewhere; the spelling here follows the wav format tag
+`WAVE_FORMAT_MULAW`.
+
 Both plain `WAVEFORMAT`/`WAVEFORMATEX` and extended `WAVEFORMATEXTENSIBLE` headers are parsed.
 
-When writing, the minimal 16-byte `fmt ` chunk is used by default, and the 40-byte
-`WAVEFORMATEXTENSIBLE` form is used in two cases:
+When writing, plain integer PCM gets the minimal 16-byte `fmt ` chunk. Every other format (float,
+A-law, mu-law) gets the 18-byte `WAVEFORMATEX` form with a zero `cbSize`, which the spec requires
+for non-PCM data, along with a `fact` chunk carrying the frame count. The 40-byte
+`WAVEFORMATEXTENSIBLE` form is used in three cases:
 
 - **`I24_4`** (24 valid bits in a 4-byte container) is ambiguous as plain PCM, because the block
   alignment implies a 32-bit sample. It is written as a strict-spec `WAVEFORMATEXTENSIBLE` header,

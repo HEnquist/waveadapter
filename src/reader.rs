@@ -68,6 +68,11 @@ impl<R: Read + Seek> WavReader<R> {
     }
 
     /// The total number of frames declared in the header.
+    ///
+    /// This is the declared data length divided by
+    /// [`WavParams::frame_bytes`](crate::WavParams::frame_bytes), so for a format
+    /// this crate does not interpret it counts whatever `nBlockAlign` describes
+    /// rather than audio frames.
     pub fn frames(&self) -> usize {
         self.total_frames
     }
@@ -89,6 +94,12 @@ impl<R: Read + Seek> WavReader<R> {
     /// seeking past the end leaves the reader at the end with no frames
     /// remaining. Returns [`WavError::InvalidHeader`](crate::WavError::InvalidHeader)
     /// if the frame size is unknown (block alignment is zero).
+    ///
+    /// For a format this crate does not interpret (`sample_format` is `None`) the
+    /// unit follows [`WavParams::frame_bytes`](crate::WavParams::frame_bytes), so it
+    /// is whatever `nBlockAlign` describes: a compressed block for ADPCM and GSM, a
+    /// single byte for MPEG Layer 3. The seek lands on a multiple of that, which for
+    /// a stateful codec is not generally a point a decoder can start from.
     pub fn seek_to_frame(&mut self, frame: usize) -> Result<()> {
         let frame_bytes = self.params.frame_bytes();
         if frame_bytes == 0 {
@@ -180,7 +191,7 @@ impl<R: Read + Seek> WavReader<R> {
     /// The bytes are exactly as stored in the file, so each frame is
     /// [`WavParams::frame_bytes`] bytes. This works for any file, including ones
     /// whose format is unsupported by the float path (`sample_format` is `None`),
-    /// which is the way to read A-law or otherwise unmodeled audio. This is also
+    /// which is the way to read ADPCM or otherwise unmodeled audio. This is also
     /// the entry point for callers who want to wrap the data with the audioadapter
     /// byte or number adapters themselves. Returns the number of frames read.
     ///
