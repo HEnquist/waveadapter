@@ -14,22 +14,10 @@ readme = "README.md"
 [dependencies]
 num-traits = { version = "0.2.15", default-features = false }
 audioadapter = "5.0.0"
-audioadapter-sample = "5.1.0"
-audioadapter-buffers = "5.1.0"
+audioadapter-sample = "5.2.0"
+audioadapter-buffers = "5.2.0"
 
 [dev-dependencies]
 # Only for the raw path examples, which encode and decode real IMA ADPCM. That
 # is a codec, which this crate deliberately does not do itself.
 audio-codec-algorithms = "0.8.1"
-
-# TEMPORARY: `ALAW` and `MULAW` need audioadapter-sample 5.2.0, not yet on
-# crates.io. Pointed at a local checkout while the format is being wired up.
-# Remove this patch once 5.2.0 is published, a plain `cargo update` is then enough.
-#
-# `audioadapter` itself is unchanged, but it has to be patched too: the path
-# build of audioadapter-buffers depends on it by path, and cargo would otherwise
-# pull the registry copy in alongside it as a second, incompatible 5.0.0.
-[patch.crates-io]
-audioadapter = { path = "../audioadapter-rs/audioadapter" }
-audioadapter-sample = { path = "../audioadapter-rs/audioadapter-sample" }
-audioadapter-buffers = { path = "../audioadapter-rs/audioadapter-buffers" }
