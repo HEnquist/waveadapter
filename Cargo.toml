@@ -17,6 +17,11 @@ audioadapter = "5.0.0"
 audioadapter-sample = "5.1.0"
 audioadapter-buffers = "5.1.0"
 
+[dev-dependencies]
+# Only for the raw path examples, which encode and decode real IMA ADPCM. That
+# is a codec, which this crate deliberately does not do itself.
+audio-codec-algorithms = "0.8.1"
+
 # TEMPORARY: `ALAW` and `MULAW` need audioadapter-sample 5.2.0, not yet on
 # crates.io. Pointed at a local checkout while the format is being wired up.
 # Remove this patch once 5.2.0 is published, a plain `cargo update` is then enough.

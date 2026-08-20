@@ -11,8 +11,9 @@ audioadapter adapters directly.
 ## Features
 
 - **One-call file helpers**: `read_wav_file(path)` decodes a whole file into floats plus its sample
-  rate, and `write_wav_file(path, buffer, rate, format)` writes a buffer out, for when you do not
-  need streaming, chunks or random access.
+  rate, `write_wav_file(path, buffer, rate, format)` writes a buffer out, and
+  `write_wav_file_raw(path, bytes, format)` writes bytes that are already encoded, for when you do
+  not need streaming, chunks or random access.
 - **audioadapter integration**: read into and write from any `Adapter` / `AdapterMut` buffer
   (interleaved or planar, owned or borrowed), with on-the-fly conversion to and from `f32`/`f64`
   scaled to -1.0..1.0. The write path reports how many samples were clipped by the integer
@@ -89,10 +90,10 @@ header that carries no mask).
 
 ## One-call helpers
 
-For the common "just read/write a file" cases, two free functions wrap the reader and writer:
+For the common "just read/write a file" cases, three free functions wrap the reader and writer:
 
 ```rust no_run
-use waveadapter::{SampleFormat, read_wav_file, write_wav_file};
+use waveadapter::{SampleFormat, WavSpec, read_wav_file, write_wav_file, write_wav_file_raw};
 
 // Decode a whole file into f32 samples plus the sample rate.
 let audio = read_wav_file::<f32, _>("input.wav")?;
@@ -101,11 +102,18 @@ println!("{} ch, {} Hz, {} frames", audio.channels(), audio.sample_rate, audio.f
 // Write a buffer out as 16-bit PCM.
 let clipped = write_wav_file("output.wav", &audio.samples, audio.sample_rate, SampleFormat::I16)?;
 # let _ = clipped;
+
+// Or write bytes that are already in the target format, checked to be whole frames.
+let bytes: Vec<u8> = vec![0; 4 * 1024];
+write_wav_file_raw("raw.wav", &bytes, WavSpec::new(2, 44100, SampleFormat::I16))?;
 # Ok::<(), waveadapter::WavError>(())
 ```
 
-Reach for `WavReader` / `WavWriter` below when you need streaming, metadata chunks, RF64, raw
-formats or random access.
+`write_wav_file_raw` takes a `FmtChunk` just as happily as a `WavSpec`, so it also writes a format
+this crate does not model, straight from the chunk a file was read with.
+
+Reach for `WavReader` / `WavWriter` below when you need streaming, metadata chunks, RF64 or random
+access.
 
 ## Reading
 
@@ -122,7 +130,8 @@ let buffer = reader.read_all_to_float::<f32>()?;
 ```
 
 `read_into_float` fills an existing `AdapterMut` buffer block by block, and `read_raw_interleaved`
-hands back the untouched bytes for wrapping with the audioadapter byte/number adapters.
+hands back the untouched bytes for wrapping with the audioadapter byte/number adapters, or
+`read_raw_all` for all of them at once.
 `seek_to_frame` repositions the reader for random access (the reader is always seekable).
 
 ## Writing
@@ -183,8 +192,7 @@ if reader.sample_format().is_none() {
 
 // `frames()` counts whatever nBlockAlign describes, which for a block-compressed
 // format is compressed blocks. The real frame count is in the fact chunk.
-let mut audio = Vec::new();
-reader.read_raw_interleaved(reader.frames(), &mut audio)?;
+let audio = reader.read_raw_all()?;
 let frames = reader.params().sample_count();
 
 // Write it back: same fmt chunk, same fact count, byte for byte.
@@ -209,12 +217,16 @@ them with `cargo run --example <name> -- <file.wav>`.
 
 - **`read_float`** — read a file into an `f32` buffer (converting from whatever the on-disk format
   is) and report a peak level per channel.
-- **`read_raw`** — read the untouched interleaved sample bytes and decode the first frame by hand
-  with the matching audioadapter-sample byte type.
+- **`read_raw`** — read a file waveadapter cannot decode (IMA ADPCM), decode the blocks with a
+  codec crate, and report peak and RMS through audioadapter's stats.
 - **`write_float`** — write a file from an `f32` buffer, letting the writer convert and clip into
   the target format.
-- **`write_raw`** — write a file from raw interleaved sample bytes in streaming mode (size fields
-  set to `u32::MAX`, no seeking required).
+- **`write_raw`** — encode a sine to IMA ADPCM with that same codec crate and write it from a
+  hand-built `fmt ` chunk, with the frame count supplied for the `fact` chunk.
+
+The two raw path examples pair waveadapter with
+[audio-codec-algorithms](https://crates.io/crates/audio-codec-algorithms), a dev-dependency, since
+this crate does no codec work of its own. That seam is what they demonstrate.
 
 ## License
 

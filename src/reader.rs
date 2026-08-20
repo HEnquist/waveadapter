@@ -267,6 +267,57 @@ impl<R: Read + Seek> WavReader<R> {
         Ok(frames_read)
     }
 
+    /// Read all remaining raw interleaved bytes into a freshly allocated buffer.
+    ///
+    /// The bulk counterpart to
+    /// [`read_raw_interleaved`](WavReader::read_raw_interleaved), for handing a
+    /// whole file to a decoder in one go: a format this crate does not model has
+    /// to be read this way, and the frame count needed to size a
+    /// `read_raw_interleaved` call is exactly what such a file does not state.
+    /// Reading stops at the declared end of the data or at the end of the file,
+    /// whichever comes first, so it also works for a streaming file whose declared
+    /// length is the [`u32::MAX`] placeholder. Only whole frames are kept.
+    ///
+    /// The buffer grows as the data is read rather than being sized from the
+    /// declared length up front, so a header claiming far more data than the file
+    /// holds costs nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use audioadapter_buffers::owned::InterleavedOwned;
+    /// # use waveadapter::{SampleFormat, WavSpec, WavWriter};
+    /// # use std::io::Cursor;
+    /// use waveadapter::WavReader;
+    ///
+    /// # let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+    /// # let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec)?;
+    /// # writer.write_float_buffer(&InterleavedOwned::<f32>::new(0.5, 2, 128))?;
+    /// # let wav_bytes = writer.finalize()?.into_inner();
+    /// let mut reader = WavReader::new(Cursor::new(wav_bytes))?;
+    /// let bytes = reader.read_raw_all()?;
+    /// assert_eq!(bytes.len(), 128 * 2 * 2); // frames * channels * 2 bytes
+    /// # Ok::<(), waveadapter::WavError>(())
+    /// ```
+    pub fn read_raw_all(&mut self) -> Result<Vec<u8>> {
+        let frame_bytes = self.params.frame_bytes();
+        if frame_bytes == 0 {
+            return Err(WavError::InvalidHeader(
+                "cannot read raw frames: block alignment is zero".to_string(),
+            ));
+        }
+        // Bound the read by the declared length. For a streaming file that is the
+        // placeholder, which saturates into "read to end of file".
+        let limit = self.remaining().saturating_mul(frame_bytes) as u64;
+        let mut buf = Vec::new();
+        (&mut self.inner).take(limit).read_to_end(&mut buf)?;
+        // Keep only whole frames.
+        let frames_read = buf.len() / frame_bytes;
+        buf.truncate(frames_read * frame_bytes);
+        self.frames_pos += frames_read;
+        Ok(buf)
+    }
+
     /// Consume the reader and return the inner stream.
     pub fn into_inner(self) -> R {
         self.inner

@@ -1056,6 +1056,80 @@ fn convenience_file_roundtrip() {
     std::fs::remove_file(&path).unwrap();
 }
 
+fn temp_path(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("waveadapter_{name}_{}.wav", std::process::id()));
+    path
+}
+
+/// The raw one-call helper writes the bytes untouched, and the file it produces
+/// reads back as ordinary audio.
+#[test]
+fn convenience_raw_file_roundtrip() {
+    use waveadapter::write_wav_file_raw;
+
+    let path = temp_path("convenience_raw");
+    // Interleaved 16-bit stereo: a distinct value per sample, so 128 frames.
+    let source: Vec<u8> = (0..256u32).flat_map(|n| (n as u16).to_le_bytes()).collect();
+
+    write_wav_file_raw(&path, &source, WavSpec::new(2, 44100, SampleFormat::I16)).unwrap();
+
+    let mut reader = WavReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+    assert_eq!(reader.channels(), 2);
+    assert_eq!(reader.sample_rate(), 44100);
+    assert_eq!(reader.sample_format(), Some(SampleFormat::I16));
+    assert_eq!(reader.frames(), 128);
+    assert_eq!(reader.read_raw_all().unwrap(), source);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// The promise that is actually checked: bytes that do not fill whole frames are
+/// rejected instead of producing a `data` size that is not a multiple of
+/// `nBlockAlign`.
+#[test]
+fn convenience_raw_rejects_a_partial_frame() {
+    use waveadapter::write_wav_file_raw;
+
+    let path = temp_path("convenience_raw_partial");
+    // 10 bytes is two and a half frames of 16-bit stereo.
+    let result = write_wav_file_raw(&path, &[0u8; 10], WavSpec::new(2, 44100, SampleFormat::I16));
+
+    match result {
+        Err(WavError::InvalidSpec(_)) => {}
+        other => panic!("expected InvalidSpec, got {other:?}"),
+    }
+    assert!(!path.exists(), "no file should be left behind");
+}
+
+/// A format the crate does not model goes through the same helper, by handing it
+/// the `fmt ` chunk instead of a spec. The audio and the `fmt ` chunk survive
+/// byte for byte; the `fact` count does not, which is what the docs say.
+#[test]
+fn convenience_raw_writes_an_unmodeled_format() {
+    use waveadapter::write_wav_file_raw;
+
+    let mut reader =
+        WavReader::new(std::fs::File::open("tests/wav_variants/ima_adpcm_mono.wav").unwrap())
+            .unwrap();
+    assert_eq!(reader.sample_format(), None);
+    let fmt = reader.params().fmt.clone();
+    let audio = reader.read_raw_all().unwrap();
+    assert!(!audio.is_empty());
+
+    let path = temp_path("convenience_raw_adpcm");
+    write_wav_file_raw(&path, &audio, fmt.clone()).unwrap();
+
+    let mut rewritten = WavReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+    assert_eq!(rewritten.sample_format(), None);
+    assert_eq!(rewritten.params().fmt, fmt);
+    assert_eq!(rewritten.read_raw_all().unwrap(), audio);
+    // Fact::Auto writes nothing for a format it cannot count frames for.
+    assert_eq!(rewritten.params().fact_samples(), None);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
 #[test]
 fn abandoned_riff_writer_is_still_readable() {
     let channels = 2;
