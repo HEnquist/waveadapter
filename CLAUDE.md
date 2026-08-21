@@ -120,7 +120,10 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   counts the frames written and patches the field on finalize, but *only for a format the crate
   models*, since `data_bytes / block_align` is a block count for a compressed format and would be a
   plausible-looking lie; `Samples(n)` is how a codec supplies the count the container cannot
-  derive; `None` suppresses it. On read the body is kept verbatim in `WavParams::fact`, with
+  derive; `None` suppresses it. The same `Fact` choice steers RF64's `ds64` `sampleCount` field
+  (`ds64_sample_count`), where the only difference is that `Auto` counts for every modelled format,
+  PCM included, since that field is always present. On read the body is kept verbatim in
+  `WavParams::fact`, with
   `fact_samples()` over its first four bytes and `sample_count()` reading whichever of `fact` (RIFF)
   or `ds64` (RF64) the file has. The granular
   `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/`write_data_header` helpers let the
@@ -135,7 +138,9 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   sentinel only ever applies to plain RIFF (the two `0xFFFFFFFF` uses are told apart by the form
   id). Writing RF64 uses `write_rf64_wave` + `write_ds64_chunk` (zeroed sizes, patched on finalize)
   and a `data` header with the `RF64_DATA_SIZE_MARKER`; no `fact` chunk is written, since the sample
-  count lives in `ds64`. RF64 is write-only via `WavWriter::new_rf64`; the writer never emits BW64.
+  count lives in `ds64` (steered by the same `Fact`, so an unmodelled format leaves it zero rather
+  than storing a block count). RF64 is write-only via `WavWriter::new_rf64`; the writer never emits
+  BW64.
 
 - **`reader.rs` / `writer.rs`** provide two paths each:
   - *Float path* (`read_into_float` / `read_all_to_float` / `write_float_buffer`): converts on the
@@ -180,8 +185,8 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `Write + Seek` cannot shrink a stream, so they live in a third impl block bounded on the crate's
   own `Truncate` trait (`fn truncate_to(&mut self, len: u64)`), implemented for `File`, `&File`,
   `Cursor<Vec<u8>>`, `BufWriter<W: Truncate>` (which flushes first) and `&mut W`. They cut eagerly
-  rather than on finalize, so `patch_sizes` needs no changes: the declared sizes, the `fact` count
-  and the `ds64` sample count all derive from `data_bytes` anyway. Trimming is rejected for a
+  rather than on finalize, so `patch_sizes` needs no changes: the declared sizes and the counted
+  form of the `fact`/`ds64` sample count all derive from `data_bytes` anyway. Trimming is rejected for a
   streaming writer (its sizes are never patched), once a trailing chunk would be stranded, and when
   the frame size is unknown; a target at or past the extent is a no-op, since trimming never grows.
 
@@ -196,8 +201,8 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   write them as *leading* chunks (before `data`, via `WavWriter::new_with_chunks` /
   `new_streaming_with_chunks`) or *trailing* chunks (after the audio, via `WavWriter::write_chunk`).
   The writer manages even-byte padding, the RIFF/data size accounting, and rejects the reserved ids
-  it controls (`RIFF`, `fmt `, `data`, `fact`). Audio cannot be written once a trailing chunk has
-  been emitted.
+  it controls (`RIFF`, `fmt `, `data`, `fact`, `ds64`). Audio cannot be written once a trailing
+  chunk has been emitted.
 
 - **`metadata.rs`** is a thin typed layer over those blobs for the common cases. Each type has
   the same shape: `from_chunk`/`from_bytes` to decode and `to_chunk`/`to_bytes` to build a `Chunk`
@@ -261,9 +266,12 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   silently truncating at `finalize` (streaming RIFF skips the check since it never patches; RF64 has
   no limit).
 
-  **Constructors.** `WavWriterBuilder` is the general form, reached by `WavWriter::builder(source)`
-  where `source` is anything implementing `IntoFmtChunk` (a `WavSpec` or a `FmtChunk`). The
-  container is a *type parameter*, `Riff` or `Rf64`, so that the one impossible combination,
+  **Constructors.** `WavWriterBuilder` is the general form, reached by `WavWriterBuilder::new(source)`
+  or the identical `WavWriter::builder(source)`, where `source` is anything implementing
+  `IntoFmtChunk` (a `WavSpec` or a `FmtChunk`). `WavWriter::builder` sits on an arbitrary
+  `impl WavWriter<Cursor<Vec<u8>>>`, because an associated function whose return type does not
+  mention `W` cannot live on the generic impl. The container is a *type parameter*, `Riff` or
+  `Rf64`, so that the one impossible combination,
   streaming RF64, does not compile: `open_streaming` exists only on the `Riff` form. `.rf64()`
   moves between them, and `.chunks()` / `.fact()` set the rest. `new`, `new_with_chunks`,
   `new_streaming`, `new_streaming_with_chunks`, `new_rf64` and `new_rf64_with_chunks` remain as

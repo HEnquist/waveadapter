@@ -883,8 +883,8 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         if is_fact && fact.is_none() {
             // The writer emits `fact` itself, so the reader owns it too rather
             // than letting it through as an opaque chunk a caller could hand
-            // back and have written twice. A second one falls through to the
-            // catch-all like any other unmodelled chunk.
+            // back and have written twice. A second one is dropped, like a
+            // second `fmt ` or `data`.
             let body_end = next_chunk_location
                 .saturating_add(8)
                 .saturating_add(body_len);

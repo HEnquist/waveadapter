@@ -5,7 +5,28 @@ use std::io::Cursor;
 use audioadapter::{Adapter, AdapterMut};
 use audioadapter_buffers::owned::InterleavedOwned;
 use waveadapter::header::read_wav_header;
-use waveadapter::{Chunk, FmtChunk, SampleFormat, WavError, WavReader, WavSpec, WavWriter};
+use waveadapter::{Chunk, Fact, FmtChunk, SampleFormat, WavError, WavReader, WavSpec, WavWriter};
+
+/// An IMA ADPCM `fmt ` chunk: a valid format this crate does not model, in the
+/// shape a real encoder writes it. The two-byte extension (`wSamplesPerBlock`)
+/// makes it the 20-byte form, so it also exercises the verbatim extension
+/// bytes; `byte_rate` is not `block_align * sample_rate`, as it never is
+/// outside linear PCM.
+fn ima_adpcm_fmt(channels: u16, sample_rate: u32) -> FmtChunk {
+    let block_align = 256 * channels;
+    // Each block spends 4 bytes per channel on the preamble and then packs two
+    // samples per byte.
+    let samples_per_block = (block_align - 4 * channels) * 2 / channels + 1;
+    FmtChunk {
+        format_code: 0x11,
+        channels,
+        sample_rate,
+        byte_rate: sample_rate * block_align as u32 / samples_per_block as u32,
+        block_align,
+        bits_per_sample: 4,
+        extension: Some(samples_per_block.to_le_bytes().to_vec()),
+    }
+}
 
 fn make_buffer(channels: usize, frames: usize) -> InterleavedOwned<f32> {
     let mut buf = InterleavedOwned::<f32>::new(0.0, channels, frames);
@@ -702,6 +723,68 @@ fn rf64_roundtrip() {
 }
 
 #[test]
+fn rf64_sample_count_is_never_a_block_count() {
+    // RF64 keeps the sample-frame count in ds64 instead of a `fact` chunk, and
+    // the same honesty rule applies: for a format the crate does not model,
+    // data_bytes / block_align is a block count, so `Auto` writes nothing and
+    // the field keeps the zero it was written with.
+    let fmt = ima_adpcm_fmt(2, 22050);
+    let blocks = 3usize;
+    let audio = vec![0u8; blocks * fmt.block_align as usize];
+
+    let read_sample_count = |bytes: &[u8]| {
+        assert_eq!(&bytes[12..16], b"ds64");
+        u64::from_le_bytes(bytes[36..44].try_into().unwrap())
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .rf64()
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+    assert_eq!(
+        read_sample_count(&bytes),
+        0,
+        "no count rather than a block count"
+    );
+
+    // A codec that knows the real number says so, and it lands in ds64.
+    let samples = 12_345;
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .fact(Fact::Samples(samples))
+        .rf64()
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+    let bytes = cursor.into_inner();
+    assert_eq!(read_sample_count(&bytes), samples as u64);
+    // No `fact` chunk sneaks in alongside it.
+    let params = read_wav_header(Cursor::new(&bytes)).unwrap();
+    assert_eq!(params.sample_count(), Some(samples as u64));
+    assert!(!params.chunks().any(|c| &c.id == b"fact"));
+
+    // A modelled format still gets its counted frames.
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48000,
+        sample_format: SampleFormat::I16,
+        channel_mask: None,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_rf64(&mut cursor, spec).unwrap();
+    writer.write_float_buffer(&make_buffer(2, 40)).unwrap();
+    writer.finalize().unwrap();
+    assert_eq!(read_sample_count(&cursor.into_inner()), 40);
+}
+
+#[test]
 fn rf64_with_leading_chunk_roundtrips() {
     let spec = WavSpec {
         channels: 1,
@@ -754,21 +837,18 @@ fn bw64_is_read_like_rf64() {
 
 #[test]
 fn raw_writer_roundtrips_an_unmodeled_format() {
-    // IMA ADPCM: a valid format this crate does not model. Two channels, so
-    // one "frame" is the two bytes the block alignment claims.
-    let spec = FmtChunk {
-        format_code: 0x11,
-        channels: 2,
-        sample_rate: 22050,
-        byte_rate: 44100,
-        block_align: 2,
-        bits_per_sample: 4,
-        extension: None,
-    };
-    let samples: Vec<u8> = (0..32u8).collect();
+    // IMA ADPCM: a valid format this crate does not model. Nothing interprets
+    // the bytes, so a "frame" is whatever the block alignment claims, here one
+    // 512-byte block.
+    let spec = ima_adpcm_fmt(2, 22050);
+    let block = spec.block_align as usize;
+    let samples: Vec<u8> = (0..2 * block).map(|i| i as u8).collect();
 
     let mut cursor = Cursor::new(Vec::new());
-    let mut writer = WavWriter::builder(spec).unwrap().open(&mut cursor).unwrap();
+    let mut writer = WavWriter::builder(&spec)
+        .unwrap()
+        .open(&mut cursor)
+        .unwrap();
     writer.write_raw_interleaved(&samples).unwrap();
     writer.finalize().unwrap();
 
@@ -778,32 +858,22 @@ fn raw_writer_roundtrips_an_unmodeled_format() {
     assert_eq!(reader.sample_format(), None);
     assert_eq!(reader.channels(), 2);
     assert_eq!(reader.sample_rate(), 22050);
-    assert_eq!(reader.params().fmt.format_code, 0x11);
-    assert_eq!(reader.params().fmt.bits_per_sample, 4);
-    assert_eq!(reader.params().fmt.block_align, 2);
-    assert_eq!(reader.frames(), 16);
+    assert_eq!(reader.params().fmt, spec, "the fmt chunk survives verbatim");
+    assert_eq!(reader.frames(), 2);
 
     // No `fact` chunk is written for a raw format.
     assert!(!reader.params().chunks().any(|c| &c.id == b"fact"));
 
     // The bytes come back untouched through the raw read path.
     let mut out = Vec::new();
-    let frames_read = reader.read_raw_interleaved(16, &mut out).unwrap();
-    assert_eq!(frames_read, 16);
+    let frames_read = reader.read_raw_interleaved(2, &mut out).unwrap();
+    assert_eq!(frames_read, 2);
     assert_eq!(out, samples);
 }
 
 #[test]
 fn float_read_on_raw_format_errors() {
-    let spec = FmtChunk {
-        format_code: 0x11,
-        channels: 1,
-        sample_rate: 8000,
-        byte_rate: 8000,
-        block_align: 1,
-        bits_per_sample: 4,
-        extension: None,
-    };
+    let spec = ima_adpcm_fmt(1, 8000);
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::builder(spec).unwrap().open(&mut cursor).unwrap();
     writer
@@ -821,15 +891,7 @@ fn float_read_on_raw_format_errors() {
 
 #[test]
 fn float_write_on_raw_writer_errors() {
-    let spec = FmtChunk {
-        format_code: 0x11,
-        channels: 1,
-        sample_rate: 8000,
-        byte_rate: 8000,
-        block_align: 1,
-        bits_per_sample: 4,
-        extension: None,
-    };
+    let spec = ima_adpcm_fmt(1, 8000);
     let mut writer = WavWriter::builder(spec)
         .unwrap()
         .open(Cursor::new(Vec::new()))
