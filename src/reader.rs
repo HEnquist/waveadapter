@@ -37,12 +37,15 @@ impl<R: Read + Seek> WavReader<R> {
         let frame_bytes = params.frame_bytes();
         // The frame count stays a `usize`: it indexes buffers in memory, so a
         // declared length past what this target can address is clamped rather
-        // than overflowing.
-        let total_frames = params
-            .data_length
-            .checked_div(frame_bytes as u64)
-            .and_then(|frames| usize::try_from(frames).ok())
-            .unwrap_or(usize::MAX);
+        // than overflowing. A zero frame size (an unmodelled format declaring a
+        // zero `nBlockAlign`) means no framing exists at all, so the count is
+        // zero rather than the clamp, since `usize::MAX` frames would claim the
+        // file is enormous when nothing about it can be framed at all.
+        let total_frames = if frame_bytes == 0 {
+            0
+        } else {
+            usize::try_from(params.data_length / frame_bytes as u64).unwrap_or(usize::MAX)
+        };
         Ok(Self {
             inner,
             params,
@@ -79,7 +82,9 @@ impl<R: Read + Seek> WavReader<R> {
     /// This is the declared data length divided by
     /// [`WavParams::frame_bytes`](crate::WavParams::frame_bytes), so for a format
     /// this crate does not interpret it counts whatever `nBlockAlign` describes
-    /// rather than audio frames.
+    /// rather than audio frames. That makes it zero when such a file declares a
+    /// zero `nBlockAlign`: nothing about it can be framed, and the framed read
+    /// and seek methods reject it.
     pub fn frames(&self) -> usize {
         self.total_frames
     }
@@ -115,7 +120,13 @@ impl<R: Read + Seek> WavReader<R> {
             ));
         }
         let frame = frame.min(self.total_frames);
-        let offset = self.params.data_offset + (frame * frame_bytes) as u64;
+        // In 64-bit arithmetic throughout: `total_frames` is clamped to
+        // `usize::MAX` for a file declaring more frames than this target can
+        // index, and multiplying that back out overflows a `usize`.
+        let offset = self
+            .params
+            .data_offset
+            .saturating_add((frame as u64).saturating_mul(frame_bytes as u64));
         self.inner.seek(SeekFrom::Start(offset))?;
         self.frames_pos = frame;
         Ok(())

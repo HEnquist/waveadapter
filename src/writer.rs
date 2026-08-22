@@ -787,7 +787,11 @@ impl<W: Write> WavWriter<W> {
         })?;
         let frames = src.frames();
         let channels = src.channels();
-        let byte_count = (frames * channels * sample_format.bytes_per_sample()) as u64;
+        // In 64-bit arithmetic: a buffer big enough to overflow a `usize` here
+        // is one the capacity check should reject, not wrap around.
+        let byte_count = (frames as u64)
+            .saturating_mul(channels as u64)
+            .saturating_mul(sample_format.bytes_per_sample() as u64);
         self.check_capacity(byte_count)?;
         let mut clipped = 0;
         with_sample_type!(sample_format, S, {

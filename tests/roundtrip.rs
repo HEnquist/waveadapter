@@ -1328,6 +1328,96 @@ fn update_header_resumes_writing_at_the_right_place() {
 }
 
 #[test]
+fn zero_block_alignment_means_no_frames() {
+    // An unmodelled format declaring a zero nBlockAlign has no framing at all.
+    // The frame count used to come out as usize::MAX, the clamp meant for a
+    // file too large to index, which reads as "enormous" instead of "unknown".
+    let raw = FmtChunk {
+        format_code: 6,
+        channels: 1,
+        sample_rate: 8000,
+        byte_rate: 0,
+        block_align: 0,
+        bits_per_sample: 8,
+        extension: None,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(raw).unwrap().open(&mut cursor).unwrap();
+    writer.write_raw_interleaved(&[0; 16]).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.params().frame_bytes(), 0);
+    assert_eq!(reader.frames(), 0);
+    assert_eq!(reader.remaining(), 0);
+    // Every framed path still rejects it outright rather than guessing.
+    let mut buf = Vec::new();
+    assert!(matches!(
+        reader.read_raw_interleaved(1, &mut buf),
+        Err(WavError::InvalidHeader(_))
+    ));
+    assert!(matches!(
+        reader.read_raw_all(),
+        Err(WavError::InvalidHeader(_))
+    ));
+    assert!(matches!(
+        reader.seek_to_frame(1),
+        Err(WavError::InvalidHeader(_))
+    ));
+}
+
+#[test]
+fn seek_past_an_unindexable_frame_count_cannot_overflow() {
+    // An RF64 file can declare a data length filling the whole 64-bit field.
+    // Turning the resulting frame count back into a byte offset used to be done
+    // in usize arithmetic, which overflows once the product passes the target's
+    // pointer width: a panic in debug, and in release a wrapped offset landing
+    // somewhere arbitrary in the file. Only a 32-bit target can reach that with
+    // these numbers, so what this pins down on a 64-bit one is the boundary
+    // itself, that the largest declarable file still seeks and reads cleanly.
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RF64");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+    file.extend_from_slice(b"WAVE");
+
+    file.extend_from_slice(b"ds64");
+    file.extend_from_slice(&28u32.to_le_bytes());
+    file.extend_from_slice(&u64::MAX.to_le_bytes()); // riffSize
+    file.extend_from_slice(&u64::MAX.to_le_bytes()); // dataSize
+    file.extend_from_slice(&0u64.to_le_bytes()); // sampleCount
+    file.extend_from_slice(&0u32.to_le_bytes()); // tableLength
+
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&16u32.to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    file.extend_from_slice(&2u16.to_le_bytes()); // channels
+    file.extend_from_slice(&44100u32.to_le_bytes());
+    file.extend_from_slice(&176400u32.to_le_bytes()); // byte rate
+    file.extend_from_slice(&4u16.to_le_bytes()); // block align
+    file.extend_from_slice(&16u16.to_le_bytes()); // bits
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&u32::MAX.to_le_bytes()); // resolved through ds64
+    file.extend_from_slice(&[0u8; 8]);
+
+    let mut reader = WavReader::new(Cursor::new(file)).unwrap();
+    let frames = usize::try_from(u64::MAX / 4).unwrap_or(usize::MAX);
+    assert_eq!(
+        reader.frames(),
+        frames,
+        "the whole declared length, clamped"
+    );
+    // The seek clamps to the declared count, and the offset saturates instead
+    // of wrapping.
+    reader.seek_to_frame(usize::MAX).unwrap();
+    assert_eq!(reader.position(), frames);
+    // Nothing is there to read, but asking must not panic either.
+    let mut buf = Vec::new();
+    reader.read_raw_interleaved(1, &mut buf).unwrap();
+    assert!(buf.is_empty());
+}
+
+#[test]
 fn rf64_chunk_size_from_ds64_cannot_overflow_the_scan() {
     // Found by the parse_header fuzz target. For RF64 the real chunk size comes
     // from the ds64 table as an unvalidated 64-bit value, so a file can name a
