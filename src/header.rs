@@ -918,7 +918,10 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         let is_data = compare_4cc(&buffer, DATA);
         let is_fmt = compare_4cc(&buffer, FMT);
         let is_fact = compare_4cc(&buffer, FACT);
-        let is_ds64 = is_rf64 && compare_4cc(&buffer, DS64);
+        // `ds64` is recognized in every container, not just RF64: the writer
+        // reserves the id, so a caller handing `chunks_*` back must never find
+        // one there. Only RF64 gets its sizes read out (see below).
+        let is_ds64 = compare_4cc(&buffer, DS64);
         // The real body length: for RF64 a `0xFFFFFFFF` size is resolved through
         // the ds64 chunk, otherwise the 32-bit field is taken at face value.
         let body_len = if is_rf64 {
@@ -931,9 +934,11 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             // Honor the first one and parse its 64-bit sizes for later chunks. A
             // second one is dropped, like a second `fmt `, `data` or `fact`, and
             // for a sharper reason: its sizes frame every chunk after it, so
-            // letting it through would let a duplicate re-point the audio.
+            // letting it through would let a duplicate re-point the audio. In a
+            // plain RIFF file the chunk means nothing, so it is dropped without
+            // being read; RF64 is the only form whose sizes live there.
             let body_end = next_chunk_location.saturating_add(8 + chunk_length as u64);
-            if ds64_sample_count.is_none() && body_end <= filesize {
+            if is_rf64 && ds64_sample_count.is_none() && body_end <= filesize {
                 let mut body = vec![0; chunk_length as usize];
                 file.read_exact(&mut body)?;
                 ds64 = Ds64::parse(&body);

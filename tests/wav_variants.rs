@@ -909,3 +909,71 @@ fn a_second_ds64_chunk_is_ignored() {
         "a dropped ds64 is not passed through as an opaque chunk either"
     );
 }
+
+#[test]
+fn a_ds64_chunk_in_a_plain_riff_file_is_dropped() {
+    // `ds64` is reserved on the write side whatever the container, so the reader
+    // has to own it whatever the container too: leaving one among the passed
+    // through chunks would hand a caller something the writer then refuses,
+    // breaking the read, edit, write loop. In plain RIFF the chunk means
+    // nothing anyway, so it is dropped rather than interpreted.
+    let data: Vec<u8> = (0..40).collect();
+
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes());
+    fmt.extend_from_slice(&1u16.to_le_bytes());
+    fmt.extend_from_slice(&44100u32.to_le_bytes());
+    fmt.extend_from_slice(&88200u32.to_le_bytes());
+    fmt.extend_from_slice(&2u16.to_le_bytes());
+    fmt.extend_from_slice(&16u16.to_le_bytes());
+
+    // A ds64 body that would be a disaster if it were honored: it claims an
+    // 8-byte data chunk and 9999 frames.
+    let mut ds64 = Vec::new();
+    ds64.extend_from_slice(&0u64.to_le_bytes()); // riffSize
+    ds64.extend_from_slice(&8u64.to_le_bytes()); // dataSize
+    ds64.extend_from_slice(&9999u64.to_le_bytes()); // sampleCount
+    ds64.extend_from_slice(&0u32.to_le_bytes()); // tableLength
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    file.extend_from_slice(b"WAVE");
+    for (id, body) in [(b"fmt ", &fmt), (b"ds64", &ds64)] {
+        file.extend_from_slice(id);
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend_from_slice(body);
+    }
+    file.extend_from_slice(b"LIST");
+    file.extend_from_slice(&8u32.to_le_bytes());
+    file.extend_from_slice(b"INFOhell"); // form type plus four bytes of body
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    file.extend_from_slice(&data);
+    let riff_size = (file.len() - 8) as u32;
+    file[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+    let reader = WavReader::new(std::io::Cursor::new(file)).expect("it should parse as RIFF");
+    let params = reader.params();
+    assert_eq!(params.data_length, 40, "the ds64 sizes are not consulted");
+    assert_eq!(reader.frames(), 20);
+    assert_eq!(params.ds64_sample_count, None);
+    assert_eq!(params.sample_count(), None);
+    assert!(
+        !params.chunks().any(|c| &c.id == b"ds64"),
+        "a reserved id must never reach the caller"
+    );
+    assert_eq!(
+        params.chunks().count(),
+        1,
+        "the LIST chunk still comes back"
+    );
+
+    // The point of dropping it: what comes out can go straight back in.
+    use waveadapter::{SampleFormat, WavSpec, WavWriter};
+    let spec = WavSpec::new(1, 44100, SampleFormat::I16);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = WavWriter::new_with_chunks(&mut cursor, spec, &params.chunks_before).unwrap();
+    writer.write_raw_interleaved(&[0u8; 40]).unwrap();
+    writer.finalize().unwrap();
+}

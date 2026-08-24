@@ -75,14 +75,17 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   macro, so they stay in sync automatically.
 
 - **`header.rs`** parses and writes the RIFF/WAVE container. The parser walks *all* chunks to the
-  end of the file, consuming the first `fmt `, `data`, `fact` and (for RF64) `ds64`, and capturing
+  end of the file, consuming the first `fmt `, `data`, `fact` and `ds64`, and capturing
   every other chunk verbatim into `WavParams::chunks_before` / `chunks_after` as raw
   `Chunk { id, data }` blobs, split by which side of the audio they sat on. That split matters
   because it maps onto the writer's two mechanisms, so a rewrite does not move a trailing `cue `
   or `id3 ` to the front. Everything the crate does not model (`LIST`/`INFO`, `bext`, `iXML`, ...)
-  is passed through untouched so a higher-level metadata library can sit on top. **The four
-  consumed ids are exactly `RESERVED_IDS` in `writer.rs`**: the writer produces them, so the reader
-  owns them, and a caller feeding `chunks_*` back can never hand over something the writer refuses.
+  is passed through untouched so a higher-level metadata library can sit on top. **The consumed ids
+  are exactly `RESERVED_IDS` in `writer.rs`**: the writer produces them, so the reader owns them, and
+  a caller feeding `chunks_*` back can never hand over something the writer refuses. That is why
+  `ds64` is consumed in *every* container and not only RF64, even though only RF64 has sizes to read
+  out of it (`a_ds64_chunk_in_a_plain_riff_file_is_dropped`): the writer reserves the id whatever the
+  form, so the reader has to claim it whatever the form.
   A *second* `fmt `, `data`, `fact` or `ds64` chunk is dropped rather than captured, for the same
   reason (and none of them is valid in a WAVE file anyway). For `ds64` the stakes are higher than
   passing a stray chunk through: its sizes frame every chunk after it, so honoring a duplicate would
