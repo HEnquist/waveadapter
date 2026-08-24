@@ -835,6 +835,41 @@ fn rf64_sample_count_is_never_a_block_count() {
 }
 
 #[test]
+fn a_streaming_writer_omits_a_fact_chunk_it_cannot_patch() {
+    // `Auto` counts frames by patching the field on finalize. A streaming writer
+    // never finalizes, so the count would stay at the u32::MAX placeholder and
+    // claim 4.29 billion frames: the data size has a convention that reads as
+    // "unknown", the fact count does not. Omitting it is the same answer `Auto`
+    // gives for a format whose frames it cannot count.
+    let spec = WavSpec::new(1, 44100, SampleFormat::F32);
+    let mut writer = WavWriter::new_streaming(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[0u8; 400]).unwrap();
+    let bytes = writer.into_inner().unwrap().into_inner();
+
+    let params = read_wav_header(Cursor::new(&bytes)).unwrap();
+    assert_eq!(params.fact, None, "no unpatchable count");
+    assert_eq!(params.fact_samples(), None);
+
+    // A count the caller supplies needs no patch, so it is written as always.
+    let mut writer = WavWriter::builder(spec)
+        .unwrap()
+        .fact(Fact::Samples(100))
+        .open_streaming(Cursor::new(Vec::new()))
+        .unwrap();
+    writer.write_raw_interleaved(&[0u8; 400]).unwrap();
+    let bytes = writer.into_inner().unwrap().into_inner();
+    let params = read_wav_header(Cursor::new(&bytes)).unwrap();
+    assert_eq!(params.fact_samples(), Some(100));
+
+    // And a seekable writer still counts and patches.
+    let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[0u8; 400]).unwrap();
+    let bytes = writer.finalize().unwrap().into_inner();
+    let params = read_wav_header(Cursor::new(&bytes)).unwrap();
+    assert_eq!(params.fact_samples(), Some(100), "400 bytes of mono f32");
+}
+
+#[test]
 fn a_long_fact_body_survives_a_rewrite() {
     // The reader keeps the whole `fact` body, count and whatever a format
     // defines after it. `fact` is a reserved id, so a caller cannot hand those

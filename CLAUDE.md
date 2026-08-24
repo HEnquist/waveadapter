@@ -126,7 +126,9 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   counts the frames written and patches the field on finalize, but *only for a format the crate
   models*, since `data_bytes / block_align` is a block count for a compressed format and would be a
   plausible-looking lie; `Samples(n)` is how a codec supplies the count the container cannot
-  derive; `None` suppresses it; `Body(bytes)` writes a whole body verbatim, which is what preserves
+  derive (and `Auto` in a *streaming* writer omits the chunk for the same reason: counting means
+  patching on finalize, and a placeholder left in place claims `u32::MAX` frames with no convention
+  saying "unset"); `None` suppresses it; `Body(bytes)` writes a whole body verbatim, which is what preserves
   the bytes some formats keep *after* the count, since `fact` is reserved and cannot be handed back
   as an ordinary chunk. `Samples` carries a `u64`, the width of the `ds64` field, since a file long
   enough to need RF64 cannot state its count in 32 bits; writing one that large to a plain RIFF

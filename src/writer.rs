@@ -32,6 +32,13 @@ pub enum Fact {
     /// possible for a format this crate models; a `fact` chunk is omitted for
     /// anything else (and the RF64 `sampleCount` left at zero), since a guess
     /// would be worse than nothing.
+    ///
+    /// Counting means patching the field once the audio is written, so it also
+    /// needs a seekable output. A streaming writer omits the chunk instead:
+    /// leaving the placeholder in place would claim `u32::MAX` frames, and
+    /// unlike the data size there is no convention that reads as "not known".
+    /// A streaming caller who does know the count says so with
+    /// [`Samples`](Fact::Samples).
     #[default]
     Auto,
     /// Never write one, whatever the format. Leaves the RF64 `sampleCount` at
@@ -270,6 +277,7 @@ fn write_header(
     fact: &Fact,
     leading: &[Chunk],
     container: Container,
+    seekable: bool,
 ) -> Result<Layout> {
     for chunk in leading {
         check_extra_chunk(&chunk.id, chunk.data.len())?;
@@ -288,7 +296,15 @@ fn write_header(
             // `Auto` leaves it as a placeholder for `finalize` to patch with the
             // frames written.
             let mut fact_offset = None;
-            if let Some(body) = fact_body(fmt, fact) {
+            // A counted body is a placeholder that `finalize` fills in, so it
+            // needs a writer that comes back. A streaming one never does, and a
+            // `fact` chunk stuck at the placeholder claims 4.29 billion frames
+            // with nothing to mark it as unset, unlike the data size where that
+            // value is the convention. So the chunk is omitted, the same answer
+            // `Auto` gives for a format it cannot count.
+            let body =
+                fact_body(fmt, fact).filter(|body| seekable || !matches!(body, FactWrite::Counted));
+            if let Some(body) = body {
                 let offset = pos + 8;
                 match body {
                     // Verbatim means verbatim: whatever the caller kept from the
@@ -501,7 +517,14 @@ impl<'a, C> WavWriterBuilder<'a, C> {
         container: Container,
         seekable: bool,
     ) -> Result<WavWriter<W>> {
-        let layout = write_header(&mut inner, &self.fmt, &self.fact, self.leading, container)?;
+        let layout = write_header(
+            &mut inner,
+            &self.fmt,
+            &self.fact,
+            self.leading,
+            container,
+            seekable,
+        )?;
         Ok(WavWriter {
             inner,
             fmt: self.fmt,
@@ -538,6 +561,10 @@ impl<'a> WavWriterBuilder<'a, Riff> {
 
     /// Create a streaming writer, leaving the size fields at [`u32::MAX`].
     /// Finish with [`into_inner`](WavWriter::into_inner).
+    ///
+    /// Nothing here is patched afterwards, so [`Fact::Auto`] writes no `fact`
+    /// chunk at all rather than one stuck at its placeholder. Supply the count
+    /// with [`Fact::Samples`] to get one.
     pub fn open_streaming<W: Write>(self, inner: W) -> Result<WavWriter<W>> {
         self.build(inner, Container::Riff, false)
     }
@@ -694,7 +721,9 @@ impl<W: Write> WavWriter<W> {
     ///
     /// The RIFF and data size fields are set to [`u32::MAX`], matching what
     /// players expect from a stream of unknown length. The output does not need
-    /// to be seekable.
+    /// to be seekable. No `fact` chunk is written for a non-PCM format either,
+    /// since counting the frames would need a patch on finalize; see
+    /// [`Fact::Auto`].
     pub fn new_streaming(inner: W, spec: WavSpec) -> Result<Self> {
         WavWriter::builder(spec)?.open_streaming(inner)
     }
