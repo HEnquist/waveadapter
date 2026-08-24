@@ -818,3 +818,49 @@ fn a_block_align_that_is_not_a_multiple_of_the_channels_stays_raw() {
     );
     assert_eq!(bytes, (0..20).collect::<Vec<u8>>());
 }
+
+#[test]
+fn a_seventeen_byte_fmt_body_comes_back_as_the_bare_core() {
+    // 17 bytes is the one fmt length the typed chunk cannot represent: half a
+    // cbSize field and nothing after it. Pinning the deliberate choice here, so
+    // it reads as a decision rather than an oversight: the file parses, the
+    // stray byte is dropped, and the chunk re-encodes as the 16-byte core.
+    // Rejecting it would fail a file that is otherwise perfectly readable, and
+    // keeping the byte would need a public field for a half-written cbSize,
+    // which this crate derives and never stores.
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    fmt.extend_from_slice(&1u16.to_le_bytes());
+    fmt.extend_from_slice(&44100u32.to_le_bytes());
+    fmt.extend_from_slice(&88200u32.to_le_bytes());
+    fmt.extend_from_slice(&2u16.to_le_bytes());
+    fmt.extend_from_slice(&16u16.to_le_bytes());
+    fmt.push(0x00); // the lone low byte of cbSize
+    assert_eq!(fmt.len(), 17);
+
+    let data: Vec<u8> = (0..40).collect();
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    file.extend_from_slice(b"WAVE");
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    file.extend_from_slice(&fmt);
+    file.push(0); // RIFF pad byte after the odd-length body
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    file.extend_from_slice(&data);
+    let riff_size = (file.len() - 8) as u32;
+    file[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+    let reader = WavReader::new(std::io::Cursor::new(file)).expect("it should still parse");
+    let fmt = &reader.params().fmt;
+    assert_eq!(reader.sample_format(), Some(SampleFormat::I16));
+    assert_eq!(reader.frames(), 20, "the data chunk was still found");
+    assert_eq!(fmt.extension, None, "not a form the spec defines");
+    assert_eq!(
+        fmt.to_bytes().unwrap().len(),
+        16,
+        "re-encoded as the bare core"
+    );
+}

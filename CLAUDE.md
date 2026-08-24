@@ -91,8 +91,11 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   `from_chunk`/`to_chunk`), with the bytes as the source of truth. `extension: Option<Vec<u8>>`
   distinguishes the three forms: `None` is the bare 16-byte `WAVEFORMAT`, `Some(&[])` the 18-byte
   `WAVEFORMATEX` (a zero `cbSize`), `Some(bytes)` anything longer. **`cbSize` is derived, never
-  stored**, so it cannot disagree with the body; the one knowing deviation from byte-exactness is
-  that a file storing a wrong `cbSize` comes back corrected. The extensible fields (valid bits,
+  stored**, so it cannot disagree with the body; the knowing deviations from byte-exactness are
+  exactly two, both of them malformed input: a file storing a wrong `cbSize` comes back corrected,
+  and a 17-byte body (half a `cbSize` and nothing after it, the one length the type cannot
+  represent) comes back as the bare 16-byte core. Rejecting either would fail a file that is
+  otherwise perfectly readable, which is the worse trade. The extensible fields (valid bits,
   channel mask, subformat GUID) are *accessors* over those bytes rather than parallel fields, all
   routed through `extensible_extension()` so they are gated on the format tag: a 50-byte MS ADPCM
   chunk reaches offset 20 without being extensible, and reading `dwChannelMask` on length alone

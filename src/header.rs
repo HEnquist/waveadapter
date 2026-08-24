@@ -608,6 +608,15 @@ impl FmtChunk {
     /// from byte 18 on becomes the [`extension`](FmtChunk::extension); the
     /// stored `cbSize` at bytes 16..18 is ignored, since the real body length is
     /// the trustworthy one.
+    ///
+    /// A 17-byte body is the one length that cannot be represented, holding half
+    /// a `cbSize` field and nothing else. It decodes as the bare core and
+    /// [`to_bytes`](FmtChunk::to_bytes) re-emits 16 bytes, so that single byte is
+    /// dropped. That is deliberate on both counts: rejecting the chunk would fail
+    /// a whole file this crate can otherwise read, and keeping the byte would
+    /// mean a public field for a half-written `cbSize`, a value that is derived
+    /// here and never stored. Nothing is lost but the length, which the rewrite
+    /// changes from 17 to 16 either way.
     pub fn from_bytes(body: &[u8]) -> Option<Self> {
         if body.len() < Self::CORE_SIZE as usize {
             return None;
