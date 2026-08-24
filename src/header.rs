@@ -710,9 +710,20 @@ impl FmtChunk {
     }
 
     /// The number of bytes per single-channel sample, derived from the block
-    /// alignment and channel count. Returns `None` if the channel count is zero.
+    /// alignment and channel count.
+    ///
+    /// `None` when there is no whole number of them: zero channels, or a
+    /// `nBlockAlign` that is not a multiple of the channel count. The second
+    /// case is a malformed header, and rounding it down would name a format
+    /// whose frames are narrower than the ones the file declares, leaving every
+    /// read after the first frame misaligned. Uninterpreted is the honest
+    /// answer, and puts the file on the raw path where `nBlockAlign` is used as
+    /// stated.
     fn bytes_per_sample(&self) -> Option<u16> {
-        self.block_align.checked_div(self.channels)
+        if self.channels == 0 || !self.block_align.is_multiple_of(self.channels) {
+            return None;
+        }
+        Some(self.block_align / self.channels)
     }
 
     /// The number of bytes one frame occupies.

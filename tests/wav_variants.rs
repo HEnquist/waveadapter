@@ -769,3 +769,52 @@ fn a_zeroed_ds64_sample_count_falls_back_to_the_fact_chunk() {
     let reader = WavReader::new(std::fs::File::open(fixture("float32")).unwrap()).unwrap();
     assert_eq!(reader.params().sample_count(), None);
 }
+
+#[test]
+fn a_block_align_that_is_not_a_multiple_of_the_channels_stays_raw() {
+    // 16-bit stereo PCM with nBlockAlign = 5 is malformed: the field says five
+    // bytes per frame where the depth and channel count say four. Dividing and
+    // rounding down calls it I16 and reads four-byte frames, misaligned against
+    // the framing the file declares from the second frame on. It is a format we
+    // cannot interpret, so it belongs on the raw path with nBlockAlign taken as
+    // stated.
+    let data: Vec<u8> = (0..20).collect(); // four 5-byte frames
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    fmt.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    fmt.extend_from_slice(&44100u32.to_le_bytes());
+    fmt.extend_from_slice(&220500u32.to_le_bytes());
+    fmt.extend_from_slice(&5u16.to_le_bytes()); // nBlockAlign, not 2 * 2
+    fmt.extend_from_slice(&16u16.to_le_bytes());
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    file.extend_from_slice(b"WAVE");
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    file.extend_from_slice(&fmt);
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    file.extend_from_slice(&data);
+    let riff_size = (file.len() - 8) as u32;
+    file[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+    let mut reader = WavReader::new(std::io::Cursor::new(file)).expect("it should still parse");
+    assert_eq!(reader.sample_format(), None, "not I16");
+    assert_eq!(reader.params().frame_bytes(), 5, "nBlockAlign as stated");
+    assert_eq!(reader.frames(), 4);
+    assert!(matches!(
+        reader.read_all_to_float::<f32>(),
+        Err(waveadapter::WavError::UnsupportedFormat(_))
+    ));
+
+    let mut bytes = Vec::new();
+    assert_eq!(
+        reader
+            .read_raw_interleaved(reader.frames(), &mut bytes)
+            .unwrap(),
+        4
+    );
+    assert_eq!(bytes, (0..20).collect::<Vec<u8>>());
+}

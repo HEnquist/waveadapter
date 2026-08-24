@@ -292,6 +292,12 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   this; it used to be `mulaw_mono`, until G.711 became a supported format. "Cannot interpret" never
   means "cannot parse": a `0xFFFE` tag with no room for its subformat GUID degrades to `None`
   rather than failing the whole parse.
+- A format is named only when the `fmt ` fields agree. The per-sample width comes from
+  `nBlockAlign / nChannels` and that division has to be exact: a header claiming 16-bit stereo in
+  5-byte frames is malformed, and rounding down to `I16` would read 4-byte frames against the
+  file's declared 5, misaligned from the second frame on. Such a file goes down the raw path with
+  `nBlockAlign` used as stated
+  (`a_block_align_that_is_not_a_multiple_of_the_channels_stays_raw`).
 - **Everything the crate does not model round-trips byte for byte.** That is the point of the
   raw path and the thing most easily broken by a convenience. Concretely: read a file, hand
   `params.fmt` and `params.fact_samples()` back to the writer, and the output's `fmt ` and `fact`
