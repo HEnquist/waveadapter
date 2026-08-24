@@ -254,13 +254,19 @@ impl WavParams {
     }
 
     /// The declared sample-frame count, from wherever this container keeps it:
-    /// the `fact` chunk for RIFF, the `ds64` chunk for RF64/BW64.
+    /// the `ds64` chunk for RF64/BW64, the `fact` chunk for RIFF.
     ///
     /// The two forms carry the same number in different places, so this is the
-    /// one to reach for when the container form is not the point.
+    /// one to reach for when the container form is not the point. A file that
+    /// carries both (an RF64 file with a legacy `fact` chunk) is read from
+    /// `ds64`, the only one of the two that is 64-bit and so the only one an
+    /// RF64-sized file can state its count in. The exception is a `ds64` count
+    /// left at zero, which a writer that fills in only the sizes produces: a
+    /// `fact` chunk is the better source than a field nobody filled in.
     pub fn sample_count(&self) -> Option<u64> {
-        self.fact_samples()
-            .map(u64::from)
+        self.ds64_sample_count
+            .filter(|&count| count != 0)
+            .or_else(|| self.fact_samples().map(u64::from))
             .or(self.ds64_sample_count)
     }
 

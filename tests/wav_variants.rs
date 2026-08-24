@@ -686,3 +686,86 @@ fn every_fixture_is_covered() {
         "number of fixtures on disk does not match the cases covered by these tests"
     );
 }
+
+/// Build an RF64 file by hand: 16-bit mono PCM, `frames` frames of audio, a
+/// `ds64` chunk declaring `ds64_count` frames, and optionally a legacy `fact`
+/// chunk declaring a different one. No generator produces this combination,
+/// since the crate's own RF64 writer never emits a `fact` chunk.
+fn rf64_with_counts(frames: u32, ds64_count: u64, fact_count: Option<u32>) -> Vec<u8> {
+    let data: Vec<u8> = (0..frames * 2).map(|i| i as u8).collect();
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0u8; 8]); // riffSize, patched below
+    body.extend_from_slice(&(data.len() as u64).to_le_bytes()); // dataSize
+    body.extend_from_slice(&ds64_count.to_le_bytes()); // sampleCount
+    body.extend_from_slice(&0u32.to_le_bytes()); // tableLength
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RF64");
+    file.extend_from_slice(&u32::MAX.to_le_bytes()); // size lives in ds64
+    file.extend_from_slice(b"WAVE");
+
+    file.extend_from_slice(b"ds64");
+    file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    file.extend_from_slice(&body);
+
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
+    fmt.extend_from_slice(&44100u32.to_le_bytes());
+    fmt.extend_from_slice(&88200u32.to_le_bytes());
+    fmt.extend_from_slice(&2u16.to_le_bytes());
+    fmt.extend_from_slice(&16u16.to_le_bytes());
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    file.extend_from_slice(&fmt);
+
+    if let Some(count) = fact_count {
+        file.extend_from_slice(b"fact");
+        file.extend_from_slice(&4u32.to_le_bytes());
+        file.extend_from_slice(&count.to_le_bytes());
+    }
+
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&u32::MAX.to_le_bytes()); // size lives in ds64
+    file.extend_from_slice(&data);
+
+    let riff_size = (file.len() - 8) as u64;
+    let riff_size_offset = 12 + 8;
+    file[riff_size_offset..riff_size_offset + 8].copy_from_slice(&riff_size.to_le_bytes());
+    file
+}
+
+#[test]
+fn rf64_sample_count_comes_from_ds64_not_a_legacy_fact_chunk() {
+    // `ds64` is the only one of the two fields that is 64-bit, so on an RF64
+    // file it wins: a `fact` chunk there can only ever hold a truncated or
+    // stale copy. The 32-bit accessor still reports what the `fact` chunk says,
+    // since that is what a byte-exact rewrite has to put back.
+    let file = rf64_with_counts(20, 20, Some(9999));
+    let reader = WavReader::new(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(reader.params().sample_count(), Some(20));
+    assert_eq!(reader.params().fact_samples(), Some(9999));
+    assert_eq!(reader.frames(), 20);
+}
+
+#[test]
+fn a_zeroed_ds64_sample_count_falls_back_to_the_fact_chunk() {
+    // Some writers fill in the ds64 sizes and leave `sampleCount` at zero. A
+    // `fact` chunk is a better answer than a field nobody filled in.
+    let file = rf64_with_counts(20, 0, Some(20));
+    let reader = WavReader::new(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(reader.params().sample_count(), Some(20));
+
+    // With nothing to fall back to, the zero stands: the file did declare it.
+    let file = rf64_with_counts(20, 0, None);
+    let reader = WavReader::new(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(reader.params().sample_count(), Some(0));
+
+    // And a plain RIFF file is unaffected, having no ds64 chunk at all: its
+    // count comes from `fact` as before, or is absent when the file has none.
+    let reader = WavReader::new(std::fs::File::open(fixture("gsm610_mono")).unwrap()).unwrap();
+    assert_eq!(reader.params().sample_count(), Some(960));
+    let reader = WavReader::new(std::fs::File::open(fixture("float32")).unwrap()).unwrap();
+    assert_eq!(reader.params().sample_count(), None);
+}

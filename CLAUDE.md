@@ -125,7 +125,9 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   PCM included, since that field is always present. On read the body is kept verbatim in
   `WavParams::fact`, with
   `fact_samples()` over its first four bytes and `sample_count()` reading whichever of `fact` (RIFF)
-  or `ds64` (RF64) the file has. The granular
+  or `ds64` (RF64) the file has. A file carrying both (an RF64 file with a legacy `fact` chunk, which
+  this crate never writes but others do) is read from `ds64`, the only 64-bit one of the two, unless
+  that field was left at zero, where the `fact` count is the better answer. The granular
   `write_riff_wave`/`write_fmt_chunk`/`write_named_chunk`/`write_data_header` helpers let the
   writer compose a header with `fact` and caller-supplied chunks.
 
