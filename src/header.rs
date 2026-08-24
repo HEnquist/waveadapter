@@ -495,6 +495,22 @@ impl FmtChunk {
         )
     }
 
+    /// Check the fields that make a file unreadable rather than merely unusual.
+    ///
+    /// A `FmtChunk` handed to the writer is taken as authoritative, so this is
+    /// deliberately just the one rule the parser also enforces: a header with no
+    /// channels is rejected on read, and the writer must not produce a file this
+    /// crate cannot read back. Everything else, including a `nBlockAlign` of
+    /// zero or a format code nobody has heard of, is the caller's business.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.channels == 0 {
+            return Err(WavError::InvalidSpec(
+                "channel count must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn for_format(
         channels: usize,
         sample_format: SampleFormat,

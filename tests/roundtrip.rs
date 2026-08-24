@@ -1328,6 +1328,31 @@ fn update_header_resumes_writing_at_the_right_place() {
 }
 
 #[test]
+fn a_hand_built_chunk_with_no_channels_is_rejected() {
+    // A FmtChunk is taken as authoritative, but the writer still must not
+    // produce a file its own reader refuses, and zero channels is the one field
+    // the parser rejects outright.
+    let mut fmt = ima_adpcm_fmt(1, 8000);
+    fmt.channels = 0;
+    assert!(matches!(
+        WavWriter::builder(fmt.clone()).map(|_| ()),
+        Err(WavError::InvalidSpec(_))
+    ));
+
+    // The same chunk with a channel opens, unmodelled format and all.
+    fmt.channels = 1;
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(fmt).unwrap().open(&mut cursor).unwrap();
+    writer.write_raw_interleaved(&[0; 256]).unwrap();
+    writer.finalize().unwrap();
+
+    cursor.set_position(0);
+    let reader = WavReader::new(cursor).unwrap();
+    assert_eq!(reader.channels(), 1);
+    assert_eq!(reader.frames(), 1);
+}
+
+#[test]
 fn zero_block_alignment_means_no_frames() {
     // An unmodelled format declaring a zero nBlockAlign has no framing at all.
     // The frame count used to come out as usize::MAX, the clamp meant for a

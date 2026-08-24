@@ -397,9 +397,17 @@ impl<'a> WavWriterBuilder<'a, Riff> {
     /// The container starts as plain RIFF; [`rf64`](Self::rf64) switches it. The
     /// output type is fixed only by the terminal [`open`](Self::open) /
     /// [`open_streaming`](Self::open_streaming) call.
+    ///
+    /// Returns [`WavError::InvalidSpec`] if the chunk declares zero channels,
+    /// the one field a hand-built chunk can get wrong badly enough that this
+    /// crate's own reader would refuse the file.
     pub fn new<T: IntoFmtChunk>(source: T) -> Result<Self> {
+        let fmt = source.into_fmt_chunk()?;
+        // A `WavSpec` was validated on the way in, a hand-built `FmtChunk` was
+        // not, and only one field can make a file the parser refuses.
+        fmt.validate()?;
         Ok(WavWriterBuilder {
-            fmt: source.into_fmt_chunk()?,
+            fmt,
             fact: Fact::Auto,
             leading: &[],
             container: PhantomData,

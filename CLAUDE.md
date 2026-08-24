@@ -277,7 +277,11 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   streaming RF64, does not compile: `open_streaming` exists only on the `Riff` form. `.rf64()`
   moves between them, and `.chunks()` / `.fact()` set the rest. `new`, `new_with_chunks`,
   `new_streaming`, `new_streaming_with_chunks`, `new_rf64` and `new_rf64_with_chunks` remain as
-  thin front doors over the builder for the common `WavSpec` cases.
+  thin front doors over the builder for the common `WavSpec` cases. Every constructor funnels
+  through `WavWriterBuilder::new`, which runs `FmtChunk::validate` on the chunk: a hand-built one
+  skipped the checks `for_spec` does, and the writer must not emit a file the parser refuses. That
+  is one rule and deliberately no more (zero channels), since a `FmtChunk` is otherwise
+  authoritative.
 
 ## Key invariants
 
