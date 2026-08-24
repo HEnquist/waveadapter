@@ -512,7 +512,7 @@ fn rewrite_raw(name: &str) -> (Vec<u8>, Vec<u8>, Option<u32>, Option<u32>) {
         .unwrap();
     let params = reader.params().clone();
 
-    let fact = params.fact_samples().map_or(Fact::None, Fact::Samples);
+    let fact = params.sample_count().map_or(Fact::None, Fact::Samples);
     let mut cursor = std::io::Cursor::new(Vec::new());
     let mut writer = WavWriter::builder(params.fmt.clone())
         .unwrap()

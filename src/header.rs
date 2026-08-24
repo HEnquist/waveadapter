@@ -244,10 +244,13 @@ impl WavParams {
 
     /// The sample-frame count declared in the `fact` chunk, if the file has one.
     ///
-    /// This is the only trustworthy frame count for a block-compressed format,
-    /// where [`WavReader::frames`](crate::WavReader::frames) counts compressed
-    /// blocks instead. Pass it back through
-    /// [`Fact::Samples`](crate::Fact::Samples) to preserve it on rewrite.
+    /// This is the field as the file stores it, 32 bits and all. To preserve a
+    /// count on rewrite, reach for [`sample_count`](WavParams::sample_count)
+    /// instead and pass that through
+    /// [`Fact::Samples`](crate::Fact::Samples): it is the same number for a
+    /// RIFF file and the right one for an RF64 file, which keeps no `fact`
+    /// chunk. Either way it beats [`WavReader::frames`](crate::WavReader::frames)
+    /// for a block-compressed format, where that counts compressed blocks.
     pub fn fact_samples(&self) -> Option<u32> {
         let body = self.fact.as_deref()?;
         (body.len() >= 4).then(|| read_u32(body, 0))

@@ -123,7 +123,9 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   counts the frames written and patches the field on finalize, but *only for a format the crate
   models*, since `data_bytes / block_align` is a block count for a compressed format and would be a
   plausible-looking lie; `Samples(n)` is how a codec supplies the count the container cannot
-  derive; `None` suppresses it. The same `Fact` choice steers RF64's `ds64` `sampleCount` field
+  derive; `None` suppresses it. `Samples` carries a `u64`, the width of the `ds64` field, since a
+  file long enough to need RF64 cannot state its count in 32 bits; writing one that large to a plain
+  RIFF `fact` chunk is an `InvalidSpec` at open time rather than a truncated field. The same `Fact` choice steers RF64's `ds64` `sampleCount` field
   (`ds64_sample_count`), where the only difference is that `Auto` counts for every modelled format,
   PCM included, since that field is always present. On read the body is kept verbatim in
   `WavParams::fact`, with

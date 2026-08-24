@@ -764,10 +764,10 @@ fn rf64_sample_count_is_never_a_block_count() {
     writer.write_raw_interleaved(&audio).unwrap();
     writer.finalize().unwrap();
     let bytes = cursor.into_inner();
-    assert_eq!(read_sample_count(&bytes), samples as u64);
+    assert_eq!(read_sample_count(&bytes), samples);
     // No `fact` chunk sneaks in alongside it.
     let params = read_wav_header(Cursor::new(&bytes)).unwrap();
-    assert_eq!(params.sample_count(), Some(samples as u64));
+    assert_eq!(params.sample_count(), Some(samples));
     assert!(!params.chunks().any(|c| &c.id == b"fact"));
 
     // A modelled format still gets its counted frames.
@@ -782,6 +782,62 @@ fn rf64_sample_count_is_never_a_block_count() {
     writer.write_float_buffer(&make_buffer(2, 40)).unwrap();
     writer.finalize().unwrap();
     assert_eq!(read_sample_count(&cursor.into_inner()), 40);
+}
+
+#[test]
+fn a_supplied_count_reaches_ds64_at_the_full_64_bits() {
+    // The ds64 sampleCount field is 64-bit, which is the whole point of RF64:
+    // a file too long to state its frame count in a 32-bit `fact` chunk. A
+    // supplied count has to survive at that width, and for an unmodelled format
+    // supplying it is the only way the file gets a count at all.
+    let fmt = ima_adpcm_fmt(2, 22050);
+    let audio = vec![0u8; fmt.block_align as usize];
+    let samples = u64::from(u32::MAX) + 12_345;
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .fact(Fact::Samples(samples))
+        .rf64()
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+
+    let bytes = cursor.into_inner();
+    assert_eq!(&bytes[12..16], b"ds64");
+    assert_eq!(
+        u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
+        samples,
+        "written to the ds64 field untruncated"
+    );
+    let params = read_wav_header(Cursor::new(&bytes)).unwrap();
+    assert_eq!(params.sample_count(), Some(samples));
+
+    // The same count on a plain RIFF file has nowhere to go: the `fact` field
+    // is 32 bits, so it is refused rather than written truncated.
+    let mut cursor = Cursor::new(Vec::new());
+    assert!(matches!(
+        WavWriter::builder(&fmt)
+            .unwrap()
+            .fact(Fact::Samples(samples))
+            .open(&mut cursor)
+            .map(|_| ()),
+        Err(WavError::InvalidSpec(_))
+    ));
+
+    // And a count that does fit is still written to the `fact` chunk as before.
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .fact(Fact::Samples(12_345))
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+    let params = read_wav_header(Cursor::new(cursor.into_inner())).unwrap();
+    assert_eq!(params.fact_samples(), Some(12_345));
+    assert_eq!(params.sample_count(), Some(12_345));
 }
 
 #[test]

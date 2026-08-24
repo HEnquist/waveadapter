@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the file carries no trustworthy frame count at all. A supplied count is
     // written as is and left alone by finalize.
     let mut writer = WavWriter::builder(fmt)?
-        .fact(Fact::Samples(frames))
+        .fact(Fact::Samples(frames as u64))
         .open(std::fs::File::create(&path)?)?;
 
     let sine: Vec<i16> = (0..frames)

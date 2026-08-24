@@ -37,9 +37,13 @@ pub enum Fact {
     /// Never write one, whatever the format. Leaves the RF64 `sampleCount` at
     /// zero.
     None,
-    /// Write this exact sample-frame count. Used for the RF64 `sampleCount`
-    /// too, widened to 64 bits.
-    Samples(u32),
+    /// Write this exact sample-frame count.
+    ///
+    /// The RF64 `sampleCount` field is 64-bit and takes any value here. The
+    /// RIFF `fact` chunk's is 32-bit, so a count above [`u32::MAX`] is rejected
+    /// when the writer is opened rather than truncated: a file with that many
+    /// frames needs RF64 anyway.
+    Samples(u64),
 }
 
 /// An output stream that can be shortened.
@@ -168,8 +172,9 @@ enum SizeFields {
 enum FactBody {
     /// Count the frames as they are written and patch the field on finalize.
     Counted,
-    /// A count the caller supplied up front.
-    Fixed(u32),
+    /// A count the caller supplied up front. 64-bit, since that is what the
+    /// `ds64` field holds; the 32-bit `fact` field range-checks it on write.
+    Fixed(u64),
 }
 
 /// Decide whether to write a `fact` chunk, and with what.
@@ -201,8 +206,8 @@ fn fact_body(fmt: &FmtChunk, fact: Fact) -> Option<FactBody> {
 /// format the crate models, since `data_bytes / block_align` is a block count
 /// for a compressed format. With nothing to say, the field keeps the zero it
 /// was written with rather than a plausible-looking lie. [`Fact::Samples`] is
-/// how a codec supplies the real number, widened from the `fact` chunk's 32-bit
-/// field.
+/// how a codec supplies the real number, at the full 64-bit width this field
+/// has and the `fact` chunk's does not.
 fn ds64_sample_count(fmt: &FmtChunk, fact: Fact) -> Option<FactBody> {
     match fact {
         Fact::None => None,
@@ -253,7 +258,14 @@ fn write_header(
                 let offset = pos + 8;
                 let count = match body {
                     FactBody::Counted => header::UNKNOWN_SIZE,
-                    FactBody::Fixed(samples) => samples,
+                    // The `fact` field is 32 bits wide. A larger count is a
+                    // file that needs RF64, where the `ds64` field takes it.
+                    FactBody::Fixed(samples) => u32::try_from(samples).map_err(|_| {
+                        WavError::InvalidSpec(format!(
+                            "sample count {samples} does not fit in the 32-bit fact chunk field; \
+                             write the file as RF64 instead"
+                        ))
+                    })?,
                 };
                 pos += header::write_named_chunk(inner, b"fact", &count.to_le_bytes())?;
                 if matches!(body, FactBody::Counted) {
@@ -370,7 +382,7 @@ pub struct Rf64;
 /// let mut audio = Vec::new();
 /// reader.read_raw_interleaved(reader.frames(), &mut audio)?;
 ///
-/// let fact = reader.params().fact_samples().map_or(Fact::None, Fact::Samples);
+/// let fact = reader.params().sample_count().map_or(Fact::None, Fact::Samples);
 /// let mut writer = WavWriter::builder(reader.params().fmt.clone())?
 ///     .fact(fact)
 ///     .open(File::create("out.wav")?)?;
@@ -1101,7 +1113,7 @@ impl<W: Write + Seek> WavWriter<W> {
                 // written as zero and stays there.
                 let count = match sample_count {
                     Some(FactBody::Counted) => Some(frames),
-                    Some(FactBody::Fixed(samples)) => Some(samples as u64),
+                    Some(FactBody::Fixed(samples)) => Some(samples),
                     None => None,
                 };
                 if let Some(count) = count {
