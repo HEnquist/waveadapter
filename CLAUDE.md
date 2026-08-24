@@ -83,8 +83,11 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   is passed through untouched so a higher-level metadata library can sit on top. **The four
   consumed ids are exactly `RESERVED_IDS` in `writer.rs`**: the writer produces them, so the reader
   owns them, and a caller feeding `chunks_*` back can never hand over something the writer refuses.
-  A *second* `fmt `, `data` or `fact` chunk is dropped rather than captured, for the same reason
-  (and none of them is valid in a WAVE file anyway).
+  A *second* `fmt `, `data`, `fact` or `ds64` chunk is dropped rather than captured, for the same
+  reason (and none of them is valid in a WAVE file anyway). For `ds64` the stakes are higher than
+  passing a stray chunk through: its sizes frame every chunk after it, so honoring a duplicate would
+  let it re-point the audio and restate the frame count
+  (`a_second_ds64_chunk_is_ignored`).
 
   **`FmtChunk` is public and is the write-side input as well as the read-side output.** It is the
   typed view of the chunk in the same shape as the `metadata.rs` types (`from_bytes`/`to_bytes`/

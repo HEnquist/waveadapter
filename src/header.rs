@@ -912,9 +912,12 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         };
         if is_ds64 {
             // The ds64 chunk is container metadata, not exposed as a raw chunk.
-            // Honor the first one and parse its 64-bit sizes for later chunks.
+            // Honor the first one and parse its 64-bit sizes for later chunks. A
+            // second one is dropped, like a second `fmt `, `data` or `fact`, and
+            // for a sharper reason: its sizes frame every chunk after it, so
+            // letting it through would let a duplicate re-point the audio.
             let body_end = next_chunk_location.saturating_add(8 + chunk_length as u64);
-            if body_end <= filesize {
+            if ds64_sample_count.is_none() && body_end <= filesize {
                 let mut body = vec![0; chunk_length as usize];
                 file.read_exact(&mut body)?;
                 ds64 = Ds64::parse(&body);

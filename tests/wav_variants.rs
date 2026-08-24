@@ -864,3 +864,42 @@ fn a_seventeen_byte_fmt_body_comes_back_as_the_bare_core() {
         "re-encoded as the bare core"
     );
 }
+
+#[test]
+fn a_second_ds64_chunk_is_ignored() {
+    // The ds64 sizes frame every chunk after them, so a duplicate is not just a
+    // stray field: honoring it would re-point the audio and change the frame
+    // count. First one wins, as for a second `fmt `, `data` or `fact`.
+    let base = rf64_with_counts(20, 20, None);
+
+    // A second ds64 right after the first, claiming a shorter data chunk and a
+    // different sample count.
+    let mut liar = Vec::new();
+    liar.extend_from_slice(&0u64.to_le_bytes()); // riffSize, unused on read
+    liar.extend_from_slice(&8u64.to_le_bytes()); // dataSize
+    liar.extend_from_slice(&9999u64.to_le_bytes()); // sampleCount
+    liar.extend_from_slice(&0u32.to_le_bytes()); // tableLength
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"ds64");
+    chunk.extend_from_slice(&(liar.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(&liar);
+
+    let first_ds64_end = 12 + 8 + 28;
+    assert_eq!(&base[12..16], b"ds64");
+    let mut file = base[..first_ds64_end].to_vec();
+    file.extend_from_slice(&chunk);
+    file.extend_from_slice(&base[first_ds64_end..]);
+
+    let reader = WavReader::new(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(
+        reader.params().data_length,
+        40,
+        "40 bytes, not the liar's 8"
+    );
+    assert_eq!(reader.frames(), 20);
+    assert_eq!(reader.params().sample_count(), Some(20));
+    assert!(
+        !reader.params().chunks().any(|c| &c.id == b"ds64"),
+        "a dropped ds64 is not passed through as an opaque chunk either"
+    );
+}
