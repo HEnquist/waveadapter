@@ -835,6 +835,66 @@ fn rf64_sample_count_is_never_a_block_count() {
 }
 
 #[test]
+fn a_long_fact_body_survives_a_rewrite() {
+    // The reader keeps the whole `fact` body, count and whatever a format
+    // defines after it. `fact` is a reserved id, so a caller cannot hand those
+    // trailing bytes back as an ordinary chunk; `Fact::Body` is the way, and
+    // without it the byte-exact promise stops at the first four bytes.
+    let fmt = ima_adpcm_fmt(1, 8000);
+    let audio = vec![0u8; fmt.block_align as usize];
+    let mut body = 505u32.to_le_bytes().to_vec();
+    body.extend_from_slice(b"extra-bytes"); // 11 more, an odd total
+    assert_eq!(body.len(), 15);
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .fact(Fact::Body(body.clone()))
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+
+    let bytes = cursor.into_inner();
+    let reader = WavReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(reader.params().fact.as_deref(), Some(&body[..]));
+    assert_eq!(
+        reader.params().fact_samples(),
+        Some(505),
+        "the count is still the first four bytes"
+    );
+    // The odd body was padded, so everything after it is still aligned.
+    assert_eq!(reader.frames(), 1);
+
+    // And handing that body back reproduces it exactly.
+    let round = reader.params().fact.clone().unwrap();
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .fact(Fact::Body(round))
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+    let params = read_wav_header(Cursor::new(cursor.into_inner())).unwrap();
+    assert_eq!(params.fact.as_deref(), Some(&body[..]));
+
+    // RF64 has no `fact` chunk, so the body's dwSampleLength goes to ds64.
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = WavWriter::builder(&fmt)
+        .unwrap()
+        .fact(Fact::Body(body))
+        .rf64()
+        .open(&mut cursor)
+        .unwrap();
+    writer.write_raw_interleaved(&audio).unwrap();
+    writer.finalize().unwrap();
+    let params = read_wav_header(Cursor::new(cursor.into_inner())).unwrap();
+    assert_eq!(params.sample_count(), Some(505));
+    assert!(params.fact.is_none(), "no fact chunk in an RF64 file");
+}
+
+#[test]
 fn a_supplied_count_reaches_ds64_at_the_full_64_bits() {
     // The ds64 sampleCount field is 64-bit, which is the whole point of RF64:
     // a file too long to state its frame count in a 32-bit `fact` chunk. A

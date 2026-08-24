@@ -150,7 +150,9 @@ where
 /// So a block-compressed file written this way loses its frame count. Supplying
 /// that count, like anything else beyond a plain file (metadata, RF64,
 /// streaming), means going through [`WavWriter`] directly:
-/// `WavWriter::builder(fmt)?.fact(Fact::Samples(n))`.
+/// `WavWriter::builder(fmt)?.fact(Fact::Samples(n))`, or
+/// `.fact(Fact::Body(params.fact.clone().unwrap()))` to carry a whole body over
+/// from a file that was read.
 pub fn write_wav_file_raw<S, P>(path: P, data: &[u8], format: S) -> Result<()>
 where
     S: IntoFmtChunk,

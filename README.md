@@ -195,8 +195,8 @@ if reader.sample_format().is_none() {
 let audio = reader.read_raw_all()?;
 let frames = reader.params().sample_count();
 
-// Write it back: same fmt chunk, same fact count, byte for byte.
-let fact = reader.params().sample_count().map_or(Fact::None, Fact::Samples);
+// Write it back: same fmt chunk, same fact body, byte for byte.
+let fact = reader.params().fact.clone().map_or(Fact::None, Fact::Body);
 let mut writer = WavWriter::builder(reader.params().fmt.clone())?
     .fact(fact)
     .open(File::create("out.wav")?)?;

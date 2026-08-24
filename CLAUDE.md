@@ -126,9 +126,13 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   counts the frames written and patches the field on finalize, but *only for a format the crate
   models*, since `data_bytes / block_align` is a block count for a compressed format and would be a
   plausible-looking lie; `Samples(n)` is how a codec supplies the count the container cannot
-  derive; `None` suppresses it. `Samples` carries a `u64`, the width of the `ds64` field, since a
-  file long enough to need RF64 cannot state its count in 32 bits; writing one that large to a plain
-  RIFF `fact` chunk is an `InvalidSpec` at open time rather than a truncated field. The same `Fact` choice steers RF64's `ds64` `sampleCount` field
+  derive; `None` suppresses it; `Body(bytes)` writes a whole body verbatim, which is what preserves
+  the bytes some formats keep *after* the count, since `fact` is reserved and cannot be handed back
+  as an ordinary chunk. `Samples` carries a `u64`, the width of the `ds64` field, since a file long
+  enough to need RF64 cannot state its count in 32 bits; writing one that large to a plain RIFF
+  `fact` chunk is an `InvalidSpec` at open time rather than a truncated field. `Fact` is therefore
+  `Clone` and not `Copy`; internally it splits into `FactWrite` (what to write now, which may borrow
+  the caller's bytes) and `Ds64Count` (what to patch later, still `Copy` so `SizeFields` is). The same `Fact` choice steers RF64's `ds64` `sampleCount` field
   (`ds64_sample_count`), where the only difference is that `Auto` counts for every modelled format,
   PCM included, since that field is always present. On read the body is kept verbatim in
   `WavParams::fact`, with
@@ -316,8 +320,8 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   (`a_block_align_that_is_not_a_multiple_of_the_channels_stays_raw`).
 - **Everything the crate does not model round-trips byte for byte.** That is the point of the
   raw path and the thing most easily broken by a convenience. Concretely: read a file, hand
-  `params.fmt` and `params.fact_samples()` back to the writer, and the output's `fmt ` and `fact`
-  chunks must be identical to the input's. `unmodeled_formats_rewrite_byte_for_byte` enforces it
+  `params.fmt` and `params.fact` back to the writer (the latter as `Fact::Body`, the whole body and
+  not just the count), and the output's `fmt ` and `fact` chunks must be identical to the input's. `unmodeled_formats_rewrite_byte_for_byte` enforces it
   over GSM, MS ADPCM and IMA ADPCM. Never recompute a `fmt ` field the file already stated;
   `byte_rate` in particular is *not* `block_align * sample_rate` outside linear PCM.
 - The `fmt ` chunk is accepted at any length from 16 bytes up, not just the three standard sizes,

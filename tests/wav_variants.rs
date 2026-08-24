@@ -502,7 +502,11 @@ fn gsm610_survives_the_raw_path() {
 
 /// Read a fixture, write it back out through the codec-facing path, and return
 /// the two files' `fmt ` chunk bodies plus their `fact` counts.
-fn rewrite_raw(name: &str) -> (Vec<u8>, Vec<u8>, Option<u32>, Option<u32>) {
+/// The `fmt ` bytes and `fact` body of a fixture, and of that fixture rewritten
+/// through the raw path: what a byte-exact rewrite has to keep identical.
+type Rewritten = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn rewrite_raw(name: &str) -> Rewritten {
     use waveadapter::{Fact, WavWriter};
 
     let mut reader = WavReader::new(std::fs::File::open(fixture(name)).unwrap()).unwrap();
@@ -512,7 +516,9 @@ fn rewrite_raw(name: &str) -> (Vec<u8>, Vec<u8>, Option<u32>, Option<u32>) {
         .unwrap();
     let params = reader.params().clone();
 
-    let fact = params.sample_count().map_or(Fact::None, Fact::Samples);
+    // The whole body, not just the count: a `fact` chunk may carry bytes after
+    // it, and a byte-exact rewrite has to put those back too.
+    let fact = params.fact.clone().map_or(Fact::None, Fact::Body);
     let mut cursor = std::io::Cursor::new(Vec::new());
     let mut writer = WavWriter::builder(params.fmt.clone())
         .unwrap()
@@ -526,8 +532,8 @@ fn rewrite_raw(name: &str) -> (Vec<u8>, Vec<u8>, Option<u32>, Option<u32>) {
     (
         params.fmt.to_bytes().unwrap(),
         rewritten.params().fmt.to_bytes().unwrap(),
-        params.fact_samples(),
-        rewritten.params().fact_samples(),
+        params.fact.clone(),
+        rewritten.params().fact.clone(),
     )
 }
 
@@ -540,7 +546,7 @@ fn unmodeled_formats_rewrite_byte_for_byte() {
     for name in ["gsm610_mono", "ms_adpcm_stereo", "ima_adpcm_mono"] {
         let (original, rewritten, fact_before, fact_after) = rewrite_raw(name);
         assert_eq!(original, rewritten, "{name}: fmt chunk changed on rewrite");
-        assert_eq!(fact_before, fact_after, "{name}: fact count changed");
+        assert_eq!(fact_before, fact_after, "{name}: fact body changed");
     }
 }
 

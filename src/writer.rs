@@ -26,7 +26,7 @@ use crate::header::{self, Chunk, FmtChunk, RIFF_SIZE_OFFSET};
 /// RF64 has no `fact` chunk, but the same choice applies there: the count goes
 /// into the `ds64` chunk's `sampleCount` field instead, and a variant that
 /// writes nothing leaves it at zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Fact {
     /// Write one if the format needs it, counting the frames written. Only
     /// possible for a format this crate models; a `fact` chunk is omitted for
@@ -44,6 +44,18 @@ pub enum Fact {
     /// when the writer is opened rather than truncated: a file with that many
     /// frames needs RF64 anyway.
     Samples(u64),
+    /// Write this body verbatim, whatever it holds.
+    ///
+    /// The chunk's first four bytes are the count, but a format may define more
+    /// after it, and the reader keeps whatever it finds in
+    /// [`WavParams::fact`](crate::WavParams::fact). This is how those bytes get
+    /// back out again, and so how a file with a longer `fact` chunk rewrites
+    /// byte for byte. Nothing is patched on finalize: verbatim is verbatim.
+    ///
+    /// For RF64 there is no `fact` chunk to write, so the `ds64` `sampleCount`
+    /// takes the body's first four bytes, that field being `dwSampleLength` by
+    /// definition. A body too short to hold one leaves the count at zero.
+    Body(Vec<u8>),
 }
 
 /// An output stream that can be shortened.
@@ -162,19 +174,31 @@ enum SizeFields {
         sample_count_offset: u64,
         /// What to put in the `ds64` sample-count field, or `None` to leave it
         /// at zero because no honest count is available.
-        sample_count: Option<FactBody>,
+        sample_count: Option<Ds64Count>,
     },
 }
 
-/// What a `fact` chunk should hold, once the format and the caller's [`Fact`]
-/// choice are both taken into account.
+/// What the `ds64` sample-count field should hold, once the format and the
+/// caller's [`Fact`] choice are both taken into account. Recorded in
+/// [`SizeFields`] and applied on finalize, so it stays `Copy`.
 #[derive(Clone, Copy)]
-enum FactBody {
+enum Ds64Count {
     /// Count the frames as they are written and patch the field on finalize.
     Counted,
     /// A count the caller supplied up front. 64-bit, since that is what the
     /// `ds64` field holds; the 32-bit `fact` field range-checks it on write.
     Fixed(u64),
+}
+
+/// What to put in the `fact` chunk body, decided while the header is written
+/// and never stored, which is what lets it borrow the caller's bytes.
+enum FactWrite<'a> {
+    /// A placeholder count now, patched with the frames written on finalize.
+    Counted,
+    /// A four-byte count the caller supplied up front.
+    Fixed(u64),
+    /// A whole body the caller supplied, written as it stands.
+    Verbatim(&'a [u8]),
 }
 
 /// Decide whether to write a `fact` chunk, and with what.
@@ -184,15 +208,17 @@ enum FactBody {
 /// knowing how many bytes one takes. For anything else `Auto` writes nothing:
 /// `data_bytes / block_align` is a count of compressed blocks, and putting that
 /// in a field defined as sample frames would be a plausible-looking lie. Callers
-/// who know the real number say so with [`Fact::Samples`].
-fn fact_body(fmt: &FmtChunk, fact: Fact) -> Option<FactBody> {
+/// who know the real number say so with [`Fact::Samples`], and callers holding
+/// a whole body from a file they read hand it back with [`Fact::Body`].
+fn fact_body<'a>(fmt: &FmtChunk, fact: &'a Fact) -> Option<FactWrite<'a>> {
     match fact {
         Fact::None => None,
-        Fact::Samples(samples) => Some(FactBody::Fixed(samples)),
+        Fact::Samples(samples) => Some(FactWrite::Fixed(*samples)),
+        Fact::Body(body) => Some(FactWrite::Verbatim(body)),
         // The extensible form counts as non-PCM even when its subformat is PCM.
         Fact::Auto => match fmt.sample_format() {
             Some(format) if format.is_pcm() && !fmt.is_extensible() => None,
-            Some(_) => Some(FactBody::Counted),
+            Some(_) => Some(FactWrite::Counted),
             None => None,
         },
     }
@@ -208,11 +234,18 @@ fn fact_body(fmt: &FmtChunk, fact: Fact) -> Option<FactBody> {
 /// was written with rather than a plausible-looking lie. [`Fact::Samples`] is
 /// how a codec supplies the real number, at the full 64-bit width this field
 /// has and the `fact` chunk's does not.
-fn ds64_sample_count(fmt: &FmtChunk, fact: Fact) -> Option<FactBody> {
+fn ds64_sample_count(fmt: &FmtChunk, fact: &Fact) -> Option<Ds64Count> {
     match fact {
         Fact::None => None,
-        Fact::Samples(samples) => Some(FactBody::Fixed(samples)),
-        Fact::Auto => fmt.sample_format().map(|_| FactBody::Counted),
+        Fact::Samples(samples) => Some(Ds64Count::Fixed(*samples)),
+        // A verbatim body has no `fact` chunk to live in here, but its first
+        // four bytes are `dwSampleLength`, which is exactly what this field
+        // holds. A body too short to have one says nothing, so the field keeps
+        // its zero.
+        Fact::Body(body) => body
+            .get(..4)
+            .map(|head| Ds64Count::Fixed(u64::from(u32::from_le_bytes(head.try_into().unwrap())))),
+        Fact::Auto => fmt.sample_format().map(|_| Ds64Count::Counted),
     }
 }
 
@@ -234,7 +267,7 @@ struct Layout {
 fn write_header(
     inner: &mut impl Write,
     fmt: &FmtChunk,
-    fact: Fact,
+    fact: &Fact,
     leading: &[Chunk],
     container: Container,
 ) -> Result<Layout> {
@@ -250,26 +283,44 @@ fn write_header(
             pos += header::write_fmt_chunk(inner, fmt)?;
 
             // A `fact` chunk (sample-frame count) is required for every format
-            // that is not plain WAVE_FORMAT_PCM. The 4-byte body sits right
-            // after the 8-byte chunk header, and `Auto` leaves it as a
-            // placeholder for `finalize` to patch with the frames written.
+            // that is not plain WAVE_FORMAT_PCM. The count sits in the first
+            // four bytes of the body, right after the 8-byte chunk header, and
+            // `Auto` leaves it as a placeholder for `finalize` to patch with the
+            // frames written.
             let mut fact_offset = None;
             if let Some(body) = fact_body(fmt, fact) {
                 let offset = pos + 8;
-                let count = match body {
-                    FactBody::Counted => header::UNKNOWN_SIZE,
-                    // The `fact` field is 32 bits wide. A larger count is a
-                    // file that needs RF64, where the `ds64` field takes it.
-                    FactBody::Fixed(samples) => u32::try_from(samples).map_err(|_| {
-                        WavError::InvalidSpec(format!(
-                            "sample count {samples} does not fit in the 32-bit fact chunk field; \
-                             write the file as RF64 instead"
-                        ))
-                    })?,
-                };
-                pos += header::write_named_chunk(inner, b"fact", &count.to_le_bytes())?;
-                if matches!(body, FactBody::Counted) {
-                    fact_offset = Some(offset);
+                match body {
+                    // Verbatim means verbatim: whatever the caller kept from the
+                    // file it read, including any bytes a format defines after
+                    // the count. Nothing here is patched on finalize.
+                    FactWrite::Verbatim(bytes) => {
+                        if u32::try_from(bytes.len()).is_err() {
+                            return Err(WavError::InvalidSpec(format!(
+                                "fact body of {} bytes does not fit in 32 bits",
+                                bytes.len()
+                            )));
+                        }
+                        pos += header::write_named_chunk(inner, b"fact", bytes)?;
+                    }
+                    FactWrite::Counted | FactWrite::Fixed(_) => {
+                        let count = match body {
+                            FactWrite::Counted => header::UNKNOWN_SIZE,
+                            // The `fact` field is 32 bits wide. A larger count is
+                            // a file that needs RF64, where `ds64` takes it.
+                            FactWrite::Fixed(samples) => u32::try_from(samples).map_err(|_| {
+                                WavError::InvalidSpec(format!(
+                                    "sample count {samples} does not fit in the 32-bit fact \
+                                         chunk field; write the file as RF64 instead"
+                                ))
+                            })?,
+                            FactWrite::Verbatim(_) => unreachable!("handled above"),
+                        };
+                        pos += header::write_named_chunk(inner, b"fact", &count.to_le_bytes())?;
+                        if matches!(body, FactWrite::Counted) {
+                            fact_offset = Some(offset);
+                        }
+                    }
                 }
             }
 
@@ -382,7 +433,10 @@ pub struct Rf64;
 /// let mut audio = Vec::new();
 /// reader.read_raw_interleaved(reader.frames(), &mut audio)?;
 ///
-/// let fact = reader.params().sample_count().map_or(Fact::None, Fact::Samples);
+/// // The whole `fact` body, so any bytes a format keeps after the count
+/// // come back too. A codec that computed the count instead says
+/// // `Fact::Samples(n)`.
+/// let fact = reader.params().fact.clone().map_or(Fact::None, Fact::Body);
 /// let mut writer = WavWriter::builder(reader.params().fmt.clone())?
 ///     .fact(fact)
 ///     .open(File::create("out.wav")?)?;
@@ -447,7 +501,7 @@ impl<'a, C> WavWriterBuilder<'a, C> {
         container: Container,
         seekable: bool,
     ) -> Result<WavWriter<W>> {
-        let layout = write_header(&mut inner, &self.fmt, self.fact, self.leading, container)?;
+        let layout = write_header(&mut inner, &self.fmt, &self.fact, self.leading, container)?;
         Ok(WavWriter {
             inner,
             fmt: self.fmt,
@@ -1112,8 +1166,8 @@ impl<W: Write + Seek> WavWriter<W> {
                 // Nothing to patch when the count is unknown: the field was
                 // written as zero and stays there.
                 let count = match sample_count {
-                    Some(FactBody::Counted) => Some(frames),
-                    Some(FactBody::Fixed(samples)) => Some(samples),
+                    Some(Ds64Count::Counted) => Some(frames),
+                    Some(Ds64Count::Fixed(samples)) => Some(samples),
                     None => None,
                 };
                 if let Some(count) = count {
