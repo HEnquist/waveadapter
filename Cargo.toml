@@ -14,5 +14,10 @@ readme = "README.md"
 [dependencies]
 num-traits = { version = "0.2.15", default-features = false }
 audioadapter = "5.0.0"
-audioadapter-sample = "5.1.0"
-audioadapter-buffers = "5.1.0"
+audioadapter-sample = "5.2.0"
+audioadapter-buffers = "5.2.0"
+
+[dev-dependencies]
+# Only for the raw path examples, which encode and decode real IMA ADPCM. That
+# is a codec, which this crate deliberately does not do itself.
+audio-codec-algorithms = "0.8.1"

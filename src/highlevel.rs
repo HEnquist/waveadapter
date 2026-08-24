@@ -2,9 +2,15 @@
 //!
 //! These wrap [`WavReader`]/[`WavWriter`] for callers who do not need streaming,
 //! random access or chunk handling: open a path, get the audio as floats; or
-//! hand over a float buffer and a format, get a finalized file. Anything beyond
-//! that (metadata chunks, RF64, raw formats, seeking) needs the full
-//! reader/writer types.
+//! hand over a buffer and a format, get a finalized file. Anything beyond
+//! that (metadata chunks, RF64, seeking) needs the full reader/writer types.
+//!
+//! The write side comes in both flavours, [`write_wav_file`] converting from
+//! floats and [`write_wav_file_raw`] taking bytes that are already in the target
+//! format. There is no read-side counterpart to the latter: decoding a format
+//! this crate does not model needs the `fmt ` chunk as well as the bytes, so it
+//! goes through [`WavReader`] and
+//! [`read_raw_all`](WavReader::read_raw_all).
 
 use std::fs::File;
 use std::path::Path;
@@ -14,10 +20,10 @@ use audioadapter_buffers::owned::InterleavedOwned;
 use num_traits::float::FloatCore;
 use num_traits::{ToPrimitive, Zero};
 
-use crate::error::Result;
+use crate::error::{Result, WavError};
 use crate::format::{SampleFormat, WavSpec};
 use crate::reader::WavReader;
-use crate::writer::WavWriter;
+use crate::writer::{IntoFmtChunk, WavWriter};
 
 /// The decoded contents of a wav file: the audio as an owned interleaved float
 /// buffer, plus the sample rate (which the buffer itself does not carry).
@@ -59,7 +65,7 @@ impl<T: Clone> WavData<T> {
 ///
 /// This is the "I don't care, just give me the data" path. It does not expose
 /// metadata chunks and returns [`WavError::UnsupportedFormat`](crate::WavError::UnsupportedFormat)
-/// for formats the float path cannot decode (such as A-law or mu-law); use
+/// for formats the float path cannot decode (such as ADPCM); use
 /// [`WavReader`] directly for those.
 pub fn read_wav_file<T, P>(path: P) -> Result<WavData<T>>
 where
@@ -110,4 +116,65 @@ where
     let clipped = writer.write_float_buffer(samples)?;
     writer.finalize()?;
     Ok(clipped)
+}
+
+/// Write already-encoded interleaved bytes to a wav file at `path`.
+///
+/// The raw counterpart to [`write_wav_file`]: the audio data is written exactly
+/// as given, so `format` only has to describe it truthfully. It is anything
+/// implementing [`IntoFmtChunk`], which means a [`WavSpec`] for a format this
+/// crate models, or a [`FmtChunk`](crate::FmtChunk) for one it does not (ADPCM,
+/// GSM, an exotic extensible subtype), including one taken straight off a file
+/// that was just read.
+///
+/// ```no_run
+/// use waveadapter::{SampleFormat, WavSpec, write_wav_file_raw};
+///
+/// let bytes: Vec<u8> = vec![0; 4 * 1024]; // interleaved 16-bit stereo
+/// write_wav_file_raw("output.wav", &bytes, WavSpec::new(2, 44100, SampleFormat::I16))?;
+/// # Ok::<(), waveadapter::WavError>(())
+/// ```
+///
+/// The one part of the promise that is checked is the framing: `data` must be a
+/// whole number of frames for the format, otherwise the file would declare a
+/// `data` size that is not a multiple of `nBlockAlign`. A partial frame is
+/// [`WavError::InvalidSpec`](crate::WavError::InvalidSpec) rather than a
+/// silently malformed file. For a format this crate does not model the unit is
+/// whatever `nBlockAlign` describes, so for a block-compressed format that means
+/// whole compressed blocks.
+///
+/// This writes a plain seekable RIFF file with no extra chunks, and leaves the
+/// `fact` chunk to [`Fact::Auto`](crate::Fact::Auto): counted for the non-PCM
+/// formats this crate models, and *omitted* for one it does not, since
+/// `data_bytes / block_align` is a block count there rather than a frame count.
+/// So a block-compressed file written this way loses its frame count. Supplying
+/// that count, like anything else beyond a plain file (metadata, RF64,
+/// streaming), means going through [`WavWriter`] directly:
+/// `WavWriter::builder(fmt)?.fact(Fact::Samples(n))`, or
+/// `.fact(Fact::Body(params.fact.clone().unwrap()))` to carry a whole body over
+/// from a file that was read.
+pub fn write_wav_file_raw<S, P>(path: P, data: &[u8], format: S) -> Result<()>
+where
+    S: IntoFmtChunk,
+    P: AsRef<Path>,
+{
+    let fmt = format.into_fmt_chunk()?;
+    let frame_bytes = fmt.frame_bytes();
+    if frame_bytes == 0 {
+        return Err(WavError::InvalidSpec(
+            "cannot write raw audio data: block alignment is zero".to_string(),
+        ));
+    }
+    let leftover = data.len() % frame_bytes;
+    if leftover != 0 {
+        return Err(WavError::InvalidSpec(format!(
+            "raw audio data is {} bytes, {leftover} more than a whole number of \
+             {frame_bytes}-byte frames",
+            data.len()
+        )));
+    }
+    let mut writer = WavWriter::builder(fmt)?.open(File::create(path)?)?;
+    writer.write_raw_interleaved(data)?;
+    writer.finalize()?;
+    Ok(())
 }
