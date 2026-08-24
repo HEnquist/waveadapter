@@ -290,6 +290,22 @@ impl WavParams {
         })
     }
 
+    /// Whether the declared data length is the streaming placeholder rather
+    /// than a real size, meaning the audio runs to the end of the file.
+    ///
+    /// A plain RIFF file written to a pipe declares [`u32::MAX`] here, the
+    /// "size not known yet" convention, so
+    /// [`data_length`](WavParams::data_length) and everything derived from it,
+    /// including [`WavReader::frames`](crate::WavReader::frames), are a ceiling
+    /// rather than a count. RF64 has no such convention: its sizes are written
+    /// as zero and patched, and its length is resolved through the `ds64`
+    /// chunk, so a resolved length of exactly that value is a real 4 GiB minus
+    /// one. Both halves of that matter, which is why this is a method and not a
+    /// comparison a caller can make.
+    pub fn length_is_unknown(&self) -> bool {
+        self.data_length == UNKNOWN_SIZE as u64 && self.ds64_sample_count.is_none()
+    }
+
     /// The number of bytes per frame (one sample for each channel).
     ///
     /// For an interpreted format this is the channel count times the format's

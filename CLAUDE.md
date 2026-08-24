@@ -166,10 +166,14 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
 
     `read_raw_all` is the whole-file form, and exists for exactly those unmodelled formats: it
     bounds the read with `Read::take` on the declared length rather than sizing a buffer from it,
-    so the streaming `u32::MAX` placeholder degrades to "read to EOF" and a header claiming more
-    data than the file holds costs nothing. It is the one raw read that does not need a frame
-    count up front, which matters because a block-compressed file is the case where the caller has
-    no reliable one.
+    so a header claiming more data than the file holds costs nothing. It is the one raw read that
+    does not need a frame count up front, which matters because a block-compressed file is the case
+    where the caller has no reliable one. The streaming `u32::MAX` placeholder is not used as that
+    bound at all: it is the "runs to the end of the file" convention, and a streaming RIFF writer
+    never revisits the field, so a stream may pass 4 GiB and taking the value literally would cut it
+    off there. `WavParams::length_is_unknown()` is the test, and it needs both halves of the
+    convention, since an RF64 length resolved through `ds64` may legitimately be exactly
+    `0xFFFFFFFF`.
 
     **There is no separate "raw writer" mode.** Whether the float path works is a property of the
     `fmt ` bytes, not of which constructor was called: `write_float_buffer` runs

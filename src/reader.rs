@@ -286,8 +286,13 @@ impl<R: Read + Seek> WavReader<R> {
     /// to be read this way, and the frame count needed to size a
     /// `read_raw_interleaved` call is exactly what such a file does not state.
     /// Reading stops at the declared end of the data or at the end of the file,
-    /// whichever comes first, so it also works for a streaming file whose declared
-    /// length is the [`u32::MAX`] placeholder. Only whole frames are kept.
+    /// whichever comes first. A streaming file whose declared length is the
+    /// [`u32::MAX`] placeholder
+    /// ([`WavParams::length_is_unknown`](crate::WavParams::length_is_unknown))
+    /// has no declared end, so reading runs to the end of the file however far
+    /// past 4 GiB that is: a streaming writer never revisits the size field, so
+    /// the placeholder is a convention, not a ceiling. Only whole frames are
+    /// kept.
     ///
     /// The buffer grows as the data is read rather than being sized from the
     /// declared length up front, so a header claiming far more data than the file
@@ -317,9 +322,14 @@ impl<R: Read + Seek> WavReader<R> {
                 "cannot read raw frames: block alignment is zero".to_string(),
             ));
         }
-        // Bound the read by the declared length. For a streaming file that is the
-        // placeholder, which saturates into "read to end of file".
-        let limit = self.remaining().saturating_mul(frame_bytes) as u64;
+        // Bound the read by the declared length, except when that length is the
+        // streaming placeholder: it is a convention meaning "runs to the end of
+        // the file", and taking it literally would cut a stream off at 4 GiB.
+        let limit = if self.params.length_is_unknown() {
+            u64::MAX
+        } else {
+            self.remaining().saturating_mul(frame_bytes) as u64
+        };
         let mut buf = Vec::new();
         (&mut self.inner).take(limit).read_to_end(&mut buf)?;
         // Keep only whole frames.

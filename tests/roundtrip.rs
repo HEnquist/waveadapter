@@ -254,6 +254,56 @@ fn streaming_writer_produces_readable_file() {
 }
 
 #[test]
+fn the_streaming_placeholder_is_not_a_four_gigabyte_ceiling() {
+    // A streaming writer leaves the declared length at u32::MAX and never comes
+    // back to correct it, so the value is the "runs to the end of the file"
+    // convention and not a size. Bounding a whole-file read by it would cut a
+    // stream off at 4 GiB, which a streaming RIFF file is free to exceed since
+    // nothing patches the field. (The cut itself is past what a test can
+    // allocate; what is covered here is telling the placeholder apart from a
+    // real length, plus the ordinary paths staying bounded.)
+    let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+    let mut writer = WavWriter::new_streaming(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[7u8; 400]).unwrap();
+    let cursor = writer.into_inner().unwrap();
+
+    let mut reader = WavReader::new(cursor).unwrap();
+    assert!(reader.params().length_is_unknown());
+    assert_eq!(reader.params().data_length, u64::from(u32::MAX));
+    assert_eq!(reader.read_raw_all().unwrap(), vec![7u8; 400]);
+
+    // A finalized file states its real length, placeholder or not.
+    let mut writer = WavWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[7u8; 400]).unwrap();
+    let cursor = writer.finalize().unwrap();
+    let reader = WavReader::new(cursor).unwrap();
+    assert!(!reader.params().length_is_unknown());
+}
+
+#[test]
+fn an_rf64_length_of_exactly_u32_max_is_a_real_length() {
+    // RF64 has no placeholder convention: its sizes start at zero and are
+    // patched, and the length is resolved through ds64. A resolved length that
+    // happens to equal 0xFFFFFFFF is a real 4 GiB minus one, so it must not be
+    // mistaken for the RIFF placeholder and read to the end of the file.
+    let spec = WavSpec::new(2, 44100, SampleFormat::I16);
+    let mut writer = WavWriter::new_rf64(Cursor::new(Vec::new()), spec).unwrap();
+    writer.write_raw_interleaved(&[7u8; 400]).unwrap();
+    let mut bytes = writer.finalize().unwrap().into_inner();
+
+    // Overwrite the ds64 dataSize with the value that is a placeholder in RIFF.
+    assert_eq!(&bytes[12..16], b"ds64");
+    bytes[28..36].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+
+    let params = read_wav_header(Cursor::new(&bytes)).unwrap();
+    assert_eq!(params.data_length, u64::from(u32::MAX));
+    assert!(
+        !params.length_is_unknown(),
+        "an RF64 file states its length, however large"
+    );
+}
+
+#[test]
 fn read_into_partial_buffer() {
     let channels = 2;
     let frames = 100;
