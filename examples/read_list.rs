@@ -1,7 +1,8 @@
 //! Read and decode a `LIST`/`INFO` metadata chunk.
 //!
-//! waveadapter treats every chunk other than `fmt ` and `data` as an opaque
-//! blob, handing it back in `WavReader::params().chunks()`. The `metadata` module
+//! waveadapter models the container chunks itself (`fmt `, `data`, `fact`,
+//! `ds64`) and treats every other chunk as an opaque blob, handing those back in
+//! `WavReader::params().chunks()`. The `metadata` module
 //! gives the common `LIST`/`INFO` tag list (title, artist, comment, ...) a typed
 //! form: `InfoList::from_chunk` decodes one, `InfoList::to_chunk` builds one.
 //!

@@ -37,8 +37,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fmt = params.fmt.clone();
     let channels = params.channels();
     let data_offset = params.data_offset;
-    // A streaming file declares u32::MAX instead of a real size.
-    let declared_bytes = (params.data_length != u32::MAX as u64).then_some(params.data_length);
+    // A streaming file declares the u32::MAX placeholder instead of a real size.
+    // `length_is_unknown` is the way to ask: an RF64 file whose real size is
+    // exactly that value is not a stream, and the accessor knows the difference.
+    let declared_bytes = (!params.length_is_unknown()).then_some(params.data_length);
 
     println!(
         "format {:#06x}, {channels} ch at {} Hz, {} bits per sample",
