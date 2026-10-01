@@ -9,7 +9,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::mem;
 
 use crate::error::{Result, WavError};
-use crate::format::{RawSpec, SampleFormat};
+use crate::format::{SampleFormat, WavSpec};
 
 const RIFF: &[u8] = b"RIFF";
 /// The RF64 form id, used in place of `RIFF` for files that may exceed 4 GB.
@@ -18,9 +18,15 @@ const RF64: &[u8] = b"RF64";
 const BW64: &[u8] = b"BW64";
 const WAVE: &[u8] = b"WAVE";
 const DATA: &[u8] = b"data";
-const FMT: &[u8] = b"fmt ";
+const FMT: &[u8; 4] = b"fmt ";
 /// The `ds64` chunk that carries the 64-bit sizes of an RF64/BW64 file.
 const DS64: &[u8] = b"ds64";
+/// The `fact` chunk, carrying the sample-frame count for non-PCM formats.
+const FACT: &[u8; 4] = b"fact";
+
+/// The `wFormatTag` value that marks a `WAVEFORMATEXTENSIBLE` header, where the
+/// real format is named by the subformat GUID in the extension instead.
+const EXTENSIBLE_FORMAT_CODE: u16 = 0xFFFE;
 
 /// Byte offset of the 32-bit RIFF chunk size field, measured from the start of the file.
 pub(crate) const RIFF_SIZE_OFFSET: u64 = 4;
@@ -109,6 +115,22 @@ const SUBTYPE_PCM: Guid = Guid {
     data4: [128, 0, 0, 170, 0, 56, 155, 113],
 };
 
+/// `KSDATAFORMAT_SUBTYPE_ALAW`
+const SUBTYPE_ALAW: Guid = Guid {
+    data1: 6,
+    data2: 0,
+    data3: 16,
+    data4: [128, 0, 0, 170, 0, 56, 155, 113],
+};
+
+/// `KSDATAFORMAT_SUBTYPE_MULAW`
+const SUBTYPE_MULAW: Guid = Guid {
+    data1: 7,
+    data2: 0,
+    data3: 16,
+    data4: [128, 0, 0, 170, 0, 56, 155, 113],
+};
+
 /// A raw, uninterpreted wav chunk.
 ///
 /// This crate parses only the `fmt ` and `data` chunks; every other chunk
@@ -130,55 +152,176 @@ pub struct Chunk {
 /// The parameters extracted from a wav header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WavParams {
-    /// The binary sample format of the audio data, if it is one this crate can
-    /// interpret. `None` means the `fmt ` chunk described a valid but
-    /// unsupported format (for example A-law or ADPCM); the audio can still
-    /// be read as raw bytes via
-    /// [`WavReader::read_raw_interleaved`](crate::WavReader::read_raw_interleaved),
-    /// using the raw `fmt ` fields below to make sense of it. The float read path
-    /// is unavailable in that case.
-    pub sample_format: Option<SampleFormat>,
-    /// The `fmt ` format code (`wFormatTag`) as stored in the file. For
-    /// `WAVEFORMATEXTENSIBLE` files this is `0xFFFE`.
-    pub format_code: u16,
-    /// Bits per single-channel sample (`wBitsPerSample`) as stored in the file.
-    pub bits_per_sample: u16,
-    /// Bytes per frame (`nBlockAlign`) as stored in the file. This is the source
-    /// of truth for framing raw byte reads when `sample_format` is `None`.
-    pub block_align: u16,
-    /// The sample rate in Hz.
-    pub sample_rate: usize,
-    /// The number of channels.
-    pub channels: usize,
-    /// The speaker-position channel mask (`dwChannelMask`) read from a
-    /// `WAVEFORMATEXTENSIBLE` header, or `None` if the file uses a plain
-    /// `WAVEFORMAT`/`WAVEFORMATEX` header that carries no mask. A value of
-    /// `Some(0)` means the extensible header was present but left the layout
-    /// unspecified. This crate stores the mask but does not interpret it.
-    pub channel_mask: Option<u32>,
+    /// The `fmt ` chunk exactly as the file carries it, including any
+    /// format-specific extension this crate does not interpret.
+    ///
+    /// This is the source of truth for everything about the format. The
+    /// accessors below are the interpreted view of it; the individual fields are
+    /// reachable directly as `params.fmt.block_align` and so on. Handing this
+    /// back to the writer reproduces the chunk byte for byte, which is what lets
+    /// a caller round-trip a format waveadapter does not model.
+    pub fmt: FmtChunk,
+    /// The body of the `fact` chunk, verbatim, or `None` if the file has none.
+    ///
+    /// The spec requires one for every non-PCM format, where it carries the
+    /// sample-frame count that the data size cannot give (a block-compressed
+    /// file's data size is a count of blocks). Its first four bytes are that
+    /// count, reachable through [`fact_samples`](WavParams::fact_samples); the
+    /// rest, if a format defines any, is kept as-is.
+    ///
+    /// Like [`fmt`](WavParams::fmt) this is *not* repeated in
+    /// [`chunks`](WavParams::chunks): the writer produces `fact` itself, so a
+    /// caller passing `chunks` straight back would otherwise be handing over a
+    /// chunk the writer is about to write again.
+    pub fact: Option<Vec<u8>>,
+    /// The sample-frame count from the `ds64` chunk of an RF64/BW64 file, which
+    /// is where that form keeps what `fact` carries in a plain RIFF file.
+    /// `None` for plain RIFF. Prefer [`sample_count`](WavParams::sample_count),
+    /// which reads whichever of the two the file actually has.
+    pub ds64_sample_count: Option<u64>,
     /// Byte offset from the start of the file to the first audio sample.
-    pub data_offset: usize,
+    pub data_offset: u64,
     /// The length of the audio data in bytes, as declared in the header.
     ///
     /// Files written in streaming mode declare this as [`u32::MAX`] because the
     /// final length is not known up front, so do not rely on it to be accurate.
-    pub data_length: usize,
-    /// Every non-audio chunk found in the file, in the order encountered, with
-    /// its body bytes read out. See [`Chunk`].
-    pub chunks: Vec<Chunk>,
+    pub data_length: u64,
+    /// The non-audio chunks stored *before* the audio, in the order encountered.
+    ///
+    /// These go back through a leading-chunk constructor such as
+    /// [`WavWriter::new_with_chunks`](crate::WavWriter::new_with_chunks). See
+    /// [`Chunk`].
+    pub chunks_before: Vec<Chunk>,
+    /// The non-audio chunks stored *after* the audio, in the order encountered.
+    ///
+    /// These go back through [`WavWriter::write_chunk`](crate::WavWriter::write_chunk),
+    /// once the audio is written. Keeping the two sides apart is what stops a
+    /// rewrite from silently moving a trailing chunk to the front of the file,
+    /// which matters for the ones whose position is conventional: `cue `/`adtl`
+    /// pairs and `id3 ` are usually written after the audio.
+    pub chunks_after: Vec<Chunk>,
 }
 
 impl WavParams {
+    /// The binary sample format of the audio data, if it is one this crate can
+    /// interpret.
+    ///
+    /// `None` means the `fmt ` chunk described a valid but unsupported format
+    /// (for example ADPCM or GSM); the audio can still be read as raw bytes via
+    /// [`WavReader::read_raw_interleaved`](crate::WavReader::read_raw_interleaved),
+    /// using [`fmt`](WavParams::fmt) to make sense of it. The float read path is
+    /// unavailable in that case.
+    pub fn sample_format(&self) -> Option<SampleFormat> {
+        self.fmt.sample_format()
+    }
+
+    /// The number of channels.
+    pub fn channels(&self) -> usize {
+        self.fmt.channels as usize
+    }
+
+    /// The sample rate in Hz.
+    pub fn sample_rate(&self) -> usize {
+        self.fmt.sample_rate as usize
+    }
+
+    /// The speaker-position channel mask (`dwChannelMask`), or `None` if the
+    /// header is not `WAVEFORMATEXTENSIBLE` and so carries no mask. `Some(0)`
+    /// means the extensible header was present but left the layout unspecified.
+    /// This crate stores the mask but does not interpret it.
+    pub fn channel_mask(&self) -> Option<u32> {
+        self.fmt.channel_mask()
+    }
+
+    /// Every non-audio chunk, before and after the audio, in file order.
+    ///
+    /// Use this when the position does not matter. When re-writing a file it
+    /// does, so keep [`chunks_before`](WavParams::chunks_before) and
+    /// [`chunks_after`](WavParams::chunks_after) apart.
+    pub fn chunks(&self) -> impl Iterator<Item = &Chunk> {
+        self.chunks_before.iter().chain(&self.chunks_after)
+    }
+
+    /// The sample-frame count declared in the `fact` chunk, if the file has one.
+    ///
+    /// This is the field as the file stores it, 32 bits and all. To preserve a
+    /// count on rewrite, reach for [`sample_count`](WavParams::sample_count)
+    /// instead and pass that through
+    /// [`Fact::Samples`](crate::Fact::Samples): it is the same number for a
+    /// RIFF file and the right one for an RF64 file, which keeps no `fact`
+    /// chunk. Either way it beats [`WavReader::frames`](crate::WavReader::frames)
+    /// for a block-compressed format, where that counts compressed blocks.
+    pub fn fact_samples(&self) -> Option<u32> {
+        let body = self.fact.as_deref()?;
+        (body.len() >= 4).then(|| read_u32(body, 0))
+    }
+
+    /// The declared sample-frame count, from wherever this container keeps it:
+    /// the `ds64` chunk for RF64/BW64, the `fact` chunk for RIFF.
+    ///
+    /// The two forms carry the same number in different places, so this is the
+    /// one to reach for when the container form is not the point. A file that
+    /// carries both (an RF64 file with a legacy `fact` chunk) is read from
+    /// `ds64`, the only one of the two that is 64-bit and so the only one an
+    /// RF64-sized file can state its count in. The exception is a `ds64` count
+    /// left at zero, which a writer that fills in only the sizes produces: a
+    /// `fact` chunk is the better source than a field nobody filled in.
+    pub fn sample_count(&self) -> Option<u64> {
+        self.ds64_sample_count
+            .filter(|&count| count != 0)
+            .or_else(|| self.fact_samples().map(u64::from))
+            .or(self.ds64_sample_count)
+    }
+
+    /// The spec that would reproduce this file's format through the typed write
+    /// path, or `None` if the format is not one this crate models.
+    ///
+    /// This is the way to re-write a file with one property changed while
+    /// keeping the rest: `WavSpec { sample_rate: 48000, ..params.spec()? }`.
+    /// Editing [`fmt`](WavParams::fmt) directly is not the way, because changing
+    /// a field there leaves `byte_rate` stale and no one can recompute it for a
+    /// compressed format.
+    pub fn spec(&self) -> Option<WavSpec> {
+        Some(WavSpec {
+            channels: self.channels(),
+            sample_rate: self.sample_rate(),
+            sample_format: self.sample_format()?,
+            channel_mask: self.channel_mask(),
+        })
+    }
+
+    /// Whether the declared data length is the streaming placeholder rather
+    /// than a real size, meaning the audio runs to the end of the file.
+    ///
+    /// A plain RIFF file written to a pipe declares [`u32::MAX`] here, the
+    /// "size not known yet" convention, so
+    /// [`data_length`](WavParams::data_length) and everything derived from it,
+    /// including [`WavReader::frames`](crate::WavReader::frames), are a ceiling
+    /// rather than a count. RF64 has no such convention: its sizes are written
+    /// as zero and patched, and its length is resolved through the `ds64`
+    /// chunk, so a resolved length of exactly that value is a real 4 GiB minus
+    /// one. Both halves of that matter, which is why this is a method and not a
+    /// comparison a caller can make.
+    pub fn length_is_unknown(&self) -> bool {
+        self.data_length == UNKNOWN_SIZE as u64 && self.ds64_sample_count.is_none()
+    }
+
     /// The number of bytes per frame (one sample for each channel).
     ///
     /// For an interpreted format this is the channel count times the format's
     /// byte width; for a raw/unsupported format (`sample_format` is `None`) it is
     /// the `nBlockAlign` field read from the file.
+    ///
+    /// For an uninterpreted format this is a byte-framing convenience, not
+    /// necessarily one audio frame. `nBlockAlign` means different things across the
+    /// compressed format tags: A-law and mu-law declare a real frame, ADPCM and GSM
+    /// declare a whole compressed block spanning many audio frames, and MPEG Layer 3
+    /// (`0x0055`) declares 1, which makes the unit a single byte. Anything derived
+    /// from this value, such as [`WavReader::frames`](crate::WavReader::frames) and
+    /// [`WavReader::seek_to_frame`](crate::WavReader::seek_to_frame), inherits that
+    /// meaning.
     pub fn frame_bytes(&self) -> usize {
-        match self.sample_format {
-            Some(format) => self.channels * format.bytes_per_sample(),
-            None => self.block_align as usize,
-        }
+        self.fmt.frame_bytes()
     }
 }
 
@@ -213,6 +356,7 @@ fn read_u64(buffer: &[u8], start_index: usize) -> u64 {
 /// 32-bit size is `0xFFFFFFFF` is looked up by id in `table`.
 struct Ds64 {
     data_size: u64,
+    sample_count: u64,
     table: Vec<([u8; 4], u64)>,
 }
 
@@ -226,7 +370,13 @@ impl Ds64 {
         } else {
             0
         };
-        // sampleCount (16..24) is surfaced via the fact chunk path, not here.
+        // sampleCount is what `fact` carries in a plain RIFF file, so it is
+        // surfaced the same way (see `WavParams::sample_count`).
+        let sample_count = if body.len() >= 24 {
+            read_u64(body, 16)
+        } else {
+            0
+        };
         let table_length = if body.len() >= 28 {
             read_u32(body, 24) as usize
         } else {
@@ -243,7 +393,11 @@ impl Ds64 {
             table.push((id, read_u64(body, offset + 4)));
             offset += 12;
         }
-        Ds64 { data_size, table }
+        Ds64 {
+            data_size,
+            sample_count,
+            table,
+        }
     }
 
     /// The real body length of a chunk whose 32-bit size field is the
@@ -275,41 +429,107 @@ fn write_chunk_header(dest: &mut impl Write, fourcc: &[u8], size: u32) -> std::i
     dest.write_all(&size.to_le_bytes())
 }
 
-/// The `WAVEFORMATEXTENSIBLE` extension: the 24 bytes that follow the 16-byte
-/// core (cbSize is implied to be 22).
-struct FmtExtension {
-    valid_bits_per_sample: u16,
-    channel_mask: u32,
-    sub_format: [u8; 16],
-}
-
-/// The fields of a `fmt ` chunk body, with an optional extensible extension.
+/// The `fmt ` chunk: the six core fields every wav file has, plus the
+/// format-specific extension that follows them.
 ///
-/// This gives the byte layout a single named definition, shared by the header
-/// parser and writer instead of repeating raw offsets and byte sequences. The
-/// parser populates only the 16-byte core (the extension fields are read
-/// directly in [`look_up_extended_format`]); the writer fills in the extension
-/// for formats that need an extensible header.
-struct FmtChunk {
-    format_code: u16,
-    channels: u16,
-    sample_rate: u32,
-    byte_rate: u32,
-    block_align: u16,
-    bits_per_sample: u16,
-    extension: Option<FmtExtension>,
+/// This is the typed view of the chunk, in the same shape as the metadata types
+/// in [`crate::metadata`]: [`from_bytes`](FmtChunk::from_bytes) /
+/// [`to_bytes`](FmtChunk::to_bytes) to decode and encode, with the bytes staying
+/// the source of truth. The reader hands one back on
+/// [`WavParams::fmt`], and the writer takes one, so a `fmt ` chunk this crate
+/// does not model survives a read/write cycle unchanged. That is what makes it
+/// possible to build a codec for a format waveadapter has no
+/// [`SampleFormat`] for.
+///
+/// # The extension
+///
+/// The wav spec grew the chunk in three steps, and [`extension`](FmtChunk::extension)
+/// is how the three are told apart:
+///
+/// | `extension` | Chunk body | Form |
+/// | --- | --- | --- |
+/// | `None` | 16 bytes | `WAVEFORMAT`, valid only for integer PCM |
+/// | `Some(&[])` | 18 bytes | `WAVEFORMATEX`, a `cbSize` of 0, required for non-PCM |
+/// | `Some(bytes)` | 18 + n | `cbSize` is `bytes.len()`, contents defined by the format |
+///
+/// `cbSize` is *derived, never stored*: it is recomputed from the extension
+/// length on write, and a stored value that disagrees with the real body length
+/// is ignored on read. Encoders do write 40-byte chunks with a `cbSize` of 0,
+/// and honoring that would silently drop the subformat GUID. This is the one
+/// place a round trip is knowingly not byte-exact: such a chunk comes back with
+/// its `cbSize` corrected.
+///
+/// # Trust
+///
+/// The fields are what the file says, not what they ought to be. `byte_rate` is
+/// not assumed to be `block_align * sample_rate` (for GSM 6.10 it is not),
+/// `block_align` is not assumed to be `channels * bits_per_sample / 8`, and
+/// `bits_per_sample` of 0 is legal (GSM again). Nothing is normalized, because
+/// the codec owns these numbers and the container does not get to second-guess
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FmtChunk {
+    /// The format tag (`wFormatTag`): `1` for integer PCM, `3` for IEEE float,
+    /// `6`/`7` for G.711 A-law/mu-law, `0xFFFE` for `WAVEFORMATEXTENSIBLE`, and
+    /// a few hundred others this crate does not model.
+    pub format_code: u16,
+    /// The number of channels (`nChannels`).
+    pub channels: u16,
+    /// The sample rate in Hz (`nSamplesPerSec`).
+    pub sample_rate: u32,
+    /// Bytes per second (`nAvgBytesPerSec`), as declared. For a compressed
+    /// format this is not derivable from the other fields, which is why it is
+    /// carried rather than computed.
+    pub byte_rate: u32,
+    /// Bytes per frame (`nBlockAlign`). For a block-compressed format this is
+    /// the size of a whole compressed block, not of one sample frame.
+    pub block_align: u16,
+    /// Bits per single-channel sample (`wBitsPerSample`). Zero is legal and
+    /// means the format does not have a meaningful per-sample bit depth.
+    pub bits_per_sample: u16,
+    /// The bytes after `cbSize`, or `None` for the bare 16-byte form. See the
+    /// table above.
+    pub extension: Option<Vec<u8>>,
 }
 
 impl FmtChunk {
     /// Size of the 16-byte core `fmt ` chunk body.
-    const CORE_SIZE: u32 = 16;
-    /// Size of the 40-byte `WAVEFORMATEXTENSIBLE` `fmt ` chunk body.
-    const EXTENSIBLE_SIZE: u32 = 40;
+    pub(crate) const CORE_SIZE: u32 = 16;
+    /// Size of the 18-byte `WAVEFORMATEX` `fmt ` chunk body.
+    pub(crate) const EX_SIZE: u32 = 18;
+    /// Length of the `WAVEFORMATEXTENSIBLE` extension: valid bits, channel mask
+    /// and the 16-byte subformat GUID.
+    pub(crate) const EXTENSIBLE_EXTENSION_LEN: usize = 22;
 
-    /// Build the chunk describing a given format.
+    /// Build the chunk describing a [`WavSpec`], the way this crate writes it.
     ///
     /// Returns an error if the parameters cannot be represented in the header
     /// fields, rather than silently truncating an out-of-range value.
+    pub fn for_spec(spec: &WavSpec) -> Result<Self> {
+        Self::for_format(
+            spec.channels,
+            spec.sample_format,
+            spec.sample_rate,
+            spec.channel_mask,
+        )
+    }
+
+    /// Check the fields that make a file unreadable rather than merely unusual.
+    ///
+    /// A `FmtChunk` handed to the writer is taken as authoritative, so this is
+    /// deliberately just the one rule the parser also enforces: a header with no
+    /// channels is rejected on read, and the writer must not produce a file this
+    /// crate cannot read back. Everything else, including a `nBlockAlign` of
+    /// zero or a format code nobody has heard of, is the caller's business.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.channels == 0 {
+            return Err(WavError::InvalidSpec(
+                "channel count must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn for_format(
         channels: usize,
         sample_format: SampleFormat,
@@ -359,25 +579,27 @@ impl FmtChunk {
         if writes_as_extensible(channels, sample_format, channel_mask) {
             // Strict-spec extensible: wBitsPerSample carries the container size
             // (bytes per sample * 8), and the real depth goes in validBits. The
-            // subformat GUID mirrors the plain format code (PCM vs IEEE float).
-            // The channel mask is the caller's value, or 0 ("no assignment") when
-            // none was given.
+            // subformat GUID mirrors the plain format code, so every code this
+            // crate can write needs an arm here. The channel mask is the caller's
+            // value, or 0 ("no assignment") when none was given.
             let sub_format = match sample_format.format_code() {
                 3 => SUBTYPE_FLOAT,
+                6 => SUBTYPE_ALAW,
+                7 => SUBTYPE_MULAW,
                 _ => SUBTYPE_PCM,
             };
+            let mut extension = Vec::with_capacity(Self::EXTENSIBLE_EXTENSION_LEN);
+            extension.extend_from_slice(&(sample_format.bits_per_sample() as u16).to_le_bytes());
+            extension.extend_from_slice(&channel_mask.unwrap_or(0).to_le_bytes());
+            extension.extend_from_slice(&sub_format.to_bytes());
             Ok(FmtChunk {
-                format_code: 0xFFFE,
+                format_code: EXTENSIBLE_FORMAT_CODE,
                 channels: channels_u16,
                 sample_rate: sample_rate_u32,
                 byte_rate,
                 block_align,
                 bits_per_sample: (bytes_per_sample * 8) as u16,
-                extension: Some(FmtExtension {
-                    valid_bits_per_sample: sample_format.bits_per_sample() as u16,
-                    channel_mask: channel_mask.unwrap_or(0),
-                    sub_format: sub_format.to_bytes(),
-                }),
+                extension: Some(extension),
             })
         } else {
             Ok(FmtChunk {
@@ -387,152 +609,254 @@ impl FmtChunk {
                 byte_rate,
                 block_align,
                 bits_per_sample: sample_format.bits_per_sample() as u16,
-                extension: None,
+                // Only plain integer PCM may use the bare 16-byte form. Every
+                // other format (float, A-law, mu-law) needs the `cbSize` field,
+                // even though it is zero.
+                extension: if sample_format.is_pcm() {
+                    None
+                } else {
+                    Some(Vec::new())
+                },
             })
         }
     }
 
-    /// Build a plain 16-byte core chunk from raw `fmt ` fields, without
-    /// interpreting them as a [`SampleFormat`]. Used by the raw writer.
+    /// Decode a `fmt ` chunk body.
     ///
-    /// Returns an error if the channel count or sample rate cannot be
-    /// represented in the header fields.
-    fn for_raw(spec: &RawSpec) -> Result<Self> {
-        if spec.channels == 0 {
-            return Err(WavError::InvalidSpec(
-                "channel count must be at least 1".to_string(),
-            ));
+    /// Returns `None` if the body is shorter than the 16-byte core. Everything
+    /// from byte 18 on becomes the [`extension`](FmtChunk::extension); the
+    /// stored `cbSize` at bytes 16..18 is ignored, since the real body length is
+    /// the trustworthy one.
+    ///
+    /// A 17-byte body is the one length that cannot be represented, holding half
+    /// a `cbSize` field and nothing else. It decodes as the bare core and
+    /// [`to_bytes`](FmtChunk::to_bytes) re-emits 16 bytes, so that single byte is
+    /// dropped. That is deliberate on both counts: rejecting the chunk would fail
+    /// a whole file this crate can otherwise read, and keeping the byte would
+    /// mean a public field for a half-written `cbSize`, a value that is derived
+    /// here and never stored. Nothing is lost but the length, which the rewrite
+    /// changes from 17 to 16 either way.
+    pub fn from_bytes(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::CORE_SIZE as usize {
+            return None;
         }
-        let channels = u16::try_from(spec.channels).map_err(|_| {
-            WavError::InvalidSpec(format!(
-                "channel count {} does not fit in 16 bits",
-                spec.channels
-            ))
-        })?;
-        let sample_rate = u32::try_from(spec.sample_rate).map_err(|_| {
-            WavError::InvalidSpec(format!(
-                "sample rate {} does not fit in 32 bits",
-                spec.sample_rate
-            ))
-        })?;
-        let byte_rate = (spec.block_align as u32)
-            .checked_mul(sample_rate)
-            .ok_or_else(|| {
-                WavError::InvalidSpec("bytes per second does not fit in 32 bits".to_string())
-            })?;
-        Ok(FmtChunk {
-            format_code: spec.format_code,
-            channels,
-            sample_rate,
-            byte_rate,
-            block_align: spec.block_align,
-            bits_per_sample: spec.bits_per_sample,
-            extension: None,
+        Some(FmtChunk {
+            format_code: read_u16(body, 0),
+            channels: read_u16(body, 2),
+            sample_rate: read_u32(body, 4),
+            byte_rate: read_u32(body, 8),
+            block_align: read_u16(body, 12),
+            bits_per_sample: read_u16(body, 14),
+            // A 17-byte body has half a cbSize field and nothing after it, which
+            // is not a form the spec defines; treat it as the bare core.
+            extension: if body.len() >= Self::EX_SIZE as usize {
+                Some(body[Self::EX_SIZE as usize..].to_vec())
+            } else {
+                None
+            },
         })
     }
 
-    /// Parse the first 16 bytes of a `fmt ` chunk body (the core; any extensible
-    /// fields are read separately in [`look_up_extended_format`]).
-    fn parse(data: &[u8]) -> Self {
-        FmtChunk {
-            format_code: read_u16(data, 0),
-            channels: read_u16(data, 2),
-            sample_rate: read_u32(data, 4),
-            byte_rate: read_u32(data, 8),
-            block_align: read_u16(data, 12),
-            bits_per_sample: read_u16(data, 14),
-            extension: None,
+    /// Decode a `fmt ` chunk, checking the id first.
+    pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
+        if &chunk.id != FMT {
+            return None;
         }
+        Self::from_bytes(&chunk.data)
+    }
+
+    /// Encode the chunk body, computing `cbSize` from the extension length.
+    ///
+    /// Returns [`WavError::InvalidSpec`] if the extension is too long to
+    /// describe in the 16-bit `cbSize` field.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let extension = self.extension.as_deref();
+        let cb_size = match extension {
+            Some(bytes) => Some(u16::try_from(bytes.len()).map_err(|_| {
+                WavError::InvalidSpec(format!(
+                    "fmt extension of {} bytes does not fit in the 16-bit cbSize field",
+                    bytes.len()
+                ))
+            })?),
+            None => None,
+        };
+        let mut out = Vec::with_capacity(self.body_size() as usize);
+        out.extend_from_slice(&self.format_code.to_le_bytes());
+        out.extend_from_slice(&self.channels.to_le_bytes());
+        out.extend_from_slice(&self.sample_rate.to_le_bytes());
+        out.extend_from_slice(&self.byte_rate.to_le_bytes());
+        out.extend_from_slice(&self.block_align.to_le_bytes());
+        out.extend_from_slice(&self.bits_per_sample.to_le_bytes());
+        if let (Some(cb_size), Some(bytes)) = (cb_size, extension) {
+            out.extend_from_slice(&cb_size.to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        Ok(out)
+    }
+
+    /// Encode as a [`Chunk`] with the `fmt ` id.
+    pub fn to_chunk(&self) -> Result<Chunk> {
+        Ok(Chunk {
+            id: *b"fmt ",
+            data: self.to_bytes()?,
+        })
     }
 
     /// The size in bytes of this chunk's body when written.
-    fn body_size(&self) -> u32 {
-        if self.extension.is_some() {
-            Self::EXTENSIBLE_SIZE
-        } else {
-            Self::CORE_SIZE
+    pub(crate) fn body_size(&self) -> u32 {
+        match &self.extension {
+            None => Self::CORE_SIZE,
+            Some(bytes) => Self::EX_SIZE + bytes.len() as u32,
         }
     }
 
-    /// Write the `fmt ` chunk body (16 bytes, or 40 with the extension).
-    fn write_body(&self, dest: &mut impl Write) -> std::io::Result<()> {
-        dest.write_all(&self.format_code.to_le_bytes())?;
-        dest.write_all(&self.channels.to_le_bytes())?;
-        dest.write_all(&self.sample_rate.to_le_bytes())?;
-        dest.write_all(&self.byte_rate.to_le_bytes())?;
-        dest.write_all(&self.block_align.to_le_bytes())?;
-        dest.write_all(&self.bits_per_sample.to_le_bytes())?;
-        if let Some(ext) = &self.extension {
-            dest.write_all(&22u16.to_le_bytes())?; // cbSize
-            dest.write_all(&ext.valid_bits_per_sample.to_le_bytes())?;
-            dest.write_all(&ext.channel_mask.to_le_bytes())?;
-            dest.write_all(&ext.sub_format)?;
+    /// Whether this is a `WAVEFORMATEXTENSIBLE` header, meaning the real format
+    /// is named by [`sub_format`](FmtChunk::sub_format) rather than by
+    /// [`format_code`](FmtChunk::format_code).
+    ///
+    /// The extension has to be long enough to hold the fields as well as the
+    /// tag saying they are there; a truncated one is not extensible.
+    pub fn is_extensible(&self) -> bool {
+        self.format_code == EXTENSIBLE_FORMAT_CODE
+            && self
+                .extension
+                .as_ref()
+                .is_some_and(|ext| ext.len() >= Self::EXTENSIBLE_EXTENSION_LEN)
+    }
+
+    /// The real bit depth (`wValidBitsPerSample`), for an extensible header
+    /// whose container is wider than its samples. `None` if not extensible.
+    pub fn valid_bits_per_sample(&self) -> Option<u16> {
+        self.extensible_extension().map(|ext| read_u16(ext, 0))
+    }
+
+    /// The speaker-position channel mask (`dwChannelMask`). `None` if the header
+    /// is not extensible, since that is the only form that carries one.
+    pub fn channel_mask(&self) -> Option<u32> {
+        self.extensible_extension().map(|ext| read_u32(ext, 2))
+    }
+
+    /// The subformat GUID naming the real format. `None` if not extensible.
+    pub fn sub_format(&self) -> Option<[u8; 16]> {
+        self.extensible_extension()
+            .map(|ext| ext[6..22].try_into().unwrap())
+    }
+
+    /// The extension bytes, but only when they are the `WAVEFORMATEXTENSIBLE`
+    /// ones. Everything typed above reads through here, so a long `fmt ` chunk
+    /// that merely happens to reach offset 20 (MS ADPCM keeps `wNumCoef` there)
+    /// is never mistaken for an extensible one.
+    fn extensible_extension(&self) -> Option<&[u8]> {
+        if !self.is_extensible() {
+            return None;
         }
-        Ok(())
+        self.extension.as_deref()
     }
 
     /// The number of bytes per single-channel sample, derived from the block
-    /// alignment and channel count. Returns `None` if the channel count is zero.
+    /// alignment and channel count.
+    ///
+    /// `None` when there is no whole number of them: zero channels, or a
+    /// `nBlockAlign` that is not a multiple of the channel count. The second
+    /// case is a malformed header, and rounding it down would name a format
+    /// whose frames are narrower than the ones the file declares, leaving every
+    /// read after the first frame misaligned. Uninterpreted is the honest
+    /// answer, and puts the file on the raw path where `nBlockAlign` is used as
+    /// stated.
     fn bytes_per_sample(&self) -> Option<u16> {
-        self.block_align.checked_div(self.channels)
+        if self.channels == 0 || !self.block_align.is_multiple_of(self.channels) {
+            return None;
+        }
+        Some(self.block_align / self.channels)
+    }
+
+    /// The number of bytes one frame occupies.
+    ///
+    /// For a format this crate models that is the channel count times the sample
+    /// width; otherwise it is `nBlockAlign` as declared, which for a
+    /// block-compressed format is a whole compressed block rather than one
+    /// sample frame.
+    pub fn frame_bytes(&self) -> usize {
+        match self.sample_format() {
+            Some(format) => self.channels as usize * format.bytes_per_sample(),
+            None => self.block_align as usize,
+        }
+    }
+
+    /// The sample format this chunk describes, if it is one this crate can
+    /// convert. `None` covers every valid-but-unmodeled format (ADPCM, GSM, an
+    /// exotic extensible subtype), which is readable only through the raw path.
+    pub fn sample_format(&self) -> Option<SampleFormat> {
+        let bytes_per_sample = self.bytes_per_sample()?;
+        let bits = self.bits_per_sample;
+        match (self.format_code, bits, bytes_per_sample) {
+            (1, 8, 1) => Some(SampleFormat::U8),
+            (1, 16, 2) => Some(SampleFormat::I16),
+            (1, 24, 3) => Some(SampleFormat::I24_3),
+            (1, 24, 4) => Some(SampleFormat::I24_4),
+            (1, 32, 4) => Some(SampleFormat::I32),
+            (3, 32, 4) => Some(SampleFormat::F32),
+            (3, 64, 8) => Some(SampleFormat::F64),
+            (6, 8, 1) => Some(SampleFormat::ALAW),
+            (7, 8, 1) => Some(SampleFormat::MULAW),
+            (EXTENSIBLE_FORMAT_CODE, _, _) => self.extended_sample_format(bytes_per_sample),
+            _ => None,
+        }
+    }
+
+    fn extended_sample_format(&self, bytes_per_sample: u16) -> Option<SampleFormat> {
+        let guid = Guid::from_slice(&self.sub_format()?);
+        let valid_bits_per_sample = self.valid_bits_per_sample()?;
+        look_up_extended_format(
+            guid,
+            self.bits_per_sample,
+            bytes_per_sample,
+            valid_bits_per_sample,
+        )
     }
 }
 
-fn look_up_format(
-    data: &[u8],
-    formatcode: u16,
-    bits: u16,
-    bytes_per_sample: u16,
-    chunk_length: u32,
-) -> Result<SampleFormat> {
-    match (formatcode, bits, bytes_per_sample) {
-        (1, 8, 1) => Ok(SampleFormat::U8),
-        (1, 16, 2) => Ok(SampleFormat::I16),
-        (1, 24, 3) => Ok(SampleFormat::I24_3),
-        (1, 24, 4) => Ok(SampleFormat::I24_4),
-        (1, 32, 4) => Ok(SampleFormat::I32),
-        (3, 32, 4) => Ok(SampleFormat::F32),
-        (3, 64, 8) => Ok(SampleFormat::F64),
-        (0xFFFE, _, _) => look_up_extended_format(data, bits, bytes_per_sample, chunk_length),
-        (code, bits, bytes) => Err(WavError::UnsupportedFormat(format!(
-            "format code {code}, {bits} bits, {bytes} bytes per sample"
-        ))),
+impl TryFrom<WavSpec> for FmtChunk {
+    type Error = WavError;
+
+    fn try_from(spec: WavSpec) -> Result<Self> {
+        FmtChunk::for_spec(&spec)
+    }
+}
+
+impl TryFrom<&WavSpec> for FmtChunk {
+    type Error = WavError;
+
+    fn try_from(spec: &WavSpec) -> Result<Self> {
+        FmtChunk::for_spec(spec)
     }
 }
 
 fn look_up_extended_format(
-    data: &[u8],
+    subformat_guid: Guid,
     bits: u16,
     bytes_per_sample: u16,
-    chunk_length: u32,
-) -> Result<SampleFormat> {
-    if chunk_length != 40 {
-        return Err(WavError::InvalidHeader(
-            "extended fmt chunk must be 40 bytes".to_string(),
-        ));
-    }
-    let valid_bits_per_sample = read_u16(data, 18);
-    let subformat = &data[24..40];
-    let subformat_guid = Guid::from_slice(subformat.try_into().unwrap());
+    valid_bits_per_sample: u16,
+) -> Option<SampleFormat> {
     match (
         subformat_guid,
         bits,
         bytes_per_sample,
         valid_bits_per_sample,
     ) {
-        (SUBTYPE_PCM, 8, 1, 8) => Ok(SampleFormat::U8),
-        (SUBTYPE_PCM, 16, 2, 16) => Ok(SampleFormat::I16),
-        (SUBTYPE_PCM, 24, 3, 24) => Ok(SampleFormat::I24_3),
+        (SUBTYPE_PCM, 8, 1, 8) => Some(SampleFormat::U8),
+        (SUBTYPE_PCM, 16, 2, 16) => Some(SampleFormat::I16),
+        (SUBTYPE_PCM, 24, 3, 24) => Some(SampleFormat::I24_3),
         // 24-in-4-byte: the lenient form (wBitsPerSample = 24) and the
         // strict-spec form (wBitsPerSample = container size 32, validBits = 24).
-        (SUBTYPE_PCM, 24, 4, 24) => Ok(SampleFormat::I24_4),
-        (SUBTYPE_PCM, 32, 4, 24) => Ok(SampleFormat::I24_4),
-        (SUBTYPE_PCM, 32, 4, 32) => Ok(SampleFormat::I32),
-        (SUBTYPE_FLOAT, 32, 4, 32) => Ok(SampleFormat::F32),
-        (SUBTYPE_FLOAT, 64, 8, 64) => Ok(SampleFormat::F64),
-        (guid, bits, bytes, valid) => Err(WavError::UnsupportedFormat(format!(
-            "extended subformat {guid:?}, {bits} bits, {bytes} bytes per sample, {valid} valid bits"
-        ))),
+        (SUBTYPE_PCM, 24, 4, 24) => Some(SampleFormat::I24_4),
+        (SUBTYPE_PCM, 32, 4, 24) => Some(SampleFormat::I24_4),
+        (SUBTYPE_PCM, 32, 4, 32) => Some(SampleFormat::I32),
+        (SUBTYPE_FLOAT, 32, 4, 32) => Some(SampleFormat::F32),
+        (SUBTYPE_FLOAT, 64, 8, 64) => Some(SampleFormat::F64),
+        (SUBTYPE_ALAW, 8, 1, 8) => Some(SampleFormat::ALAW),
+        (SUBTYPE_MULAW, 8, 1, 8) => Some(SampleFormat::MULAW),
+        _ => None,
     }
 }
 
@@ -566,20 +890,17 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     // reached (it is required to come first). Stays zeroed for plain RIFF.
     let mut ds64 = Ds64 {
         data_size: 0,
+        sample_count: 0,
         table: Vec::new(),
     };
 
-    // Dummy values until the real ones are found.
-    let mut sample_format = None;
-    let mut format_code = 0u16;
-    let mut bits_per_sample = 0u16;
-    let mut block_align = 0u16;
-    let mut sample_rate = 0;
-    let mut channels = 0;
-    let mut channel_mask = None;
+    let mut fmt: Option<FmtChunk> = None;
+    let mut fact: Option<Vec<u8>> = None;
+    let mut ds64_sample_count: Option<u64> = None;
     let mut data_offset = 0;
     let mut data_length: u64 = 0;
-    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut chunks_before: Vec<Chunk> = Vec::new();
+    let mut chunks_after: Vec<Chunk> = Vec::new();
 
     // Walk every chunk to the end of the file, so that metadata chunks placed
     // after the data chunk are captured too. A chunk is padded to an even length
@@ -596,7 +917,11 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         let chunk_length = read_u32(&buffer, 4);
         let is_data = compare_4cc(&buffer, DATA);
         let is_fmt = compare_4cc(&buffer, FMT);
-        let is_ds64 = is_rf64 && compare_4cc(&buffer, DS64);
+        let is_fact = compare_4cc(&buffer, FACT);
+        // `ds64` is recognized in every container, not just RF64: the writer
+        // reserves the id, so a caller handing `chunks_*` back must never find
+        // one there. Only RF64 gets its sizes read out (see below).
+        let is_ds64 = compare_4cc(&buffer, DS64);
         // The real body length: for RF64 a `0xFFFFFFFF` size is resolved through
         // the ds64 chunk, otherwise the 32-bit field is taken at face value.
         let body_len = if is_rf64 {
@@ -606,53 +931,86 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
         };
         if is_ds64 {
             // The ds64 chunk is container metadata, not exposed as a raw chunk.
-            // Honor the first one and parse its 64-bit sizes for later chunks.
+            // Honor the first one and parse its 64-bit sizes for later chunks. A
+            // second one is dropped, like a second `fmt `, `data` or `fact`, and
+            // for a sharper reason: its sizes frame every chunk after it, so
+            // letting it through would let a duplicate re-point the audio. In a
+            // plain RIFF file the chunk means nothing, so it is dropped without
+            // being read; RF64 is the only form whose sizes live there.
             let body_end = next_chunk_location.saturating_add(8 + chunk_length as u64);
-            if body_end <= filesize {
+            if is_rf64 && ds64_sample_count.is_none() && body_end <= filesize {
                 let mut body = vec![0; chunk_length as usize];
                 file.read_exact(&mut body)?;
                 ds64 = Ds64::parse(&body);
+                ds64_sample_count = Some(ds64.sample_count);
             }
             next_chunk_location = next_chunk_location
                 .saturating_add(8 + chunk_length as u64 + (chunk_length as u64 & 1));
             continue;
         }
-        if is_fmt {
-            // Honor the first valid fmt chunk; ignore any later or malformed one.
-            if !found_fmt && (chunk_length == 16 || chunk_length == 18 || chunk_length == 40) {
-                found_fmt = true;
-                let mut data = vec![0; chunk_length as usize];
-                file.read_exact(&mut data)?;
-                let fmt = FmtChunk::parse(&data);
-                channels = fmt.channels;
-                sample_rate = fmt.sample_rate;
-                format_code = fmt.format_code;
-                bits_per_sample = fmt.bits_per_sample;
-                block_align = fmt.block_align;
-                // The channel mask lives only in the 40-byte extensible form, at
-                // offset 20 (after cbSize and wValidBitsPerSample).
-                if chunk_length == 40 {
-                    channel_mask = Some(read_u32(&data, 20));
-                }
-                let bytes_per_sample = fmt
-                    .bytes_per_sample()
-                    .ok_or_else(|| WavError::InvalidHeader("zero channels".to_string()))?;
-                // A valid but unsupported format (no matching audioadapter sample
-                // type, e.g. A-law) is not an error here: it is recorded as
-                // `None` so the file can still be read as raw bytes. A genuinely
-                // malformed fmt chunk still errors.
-                sample_format = match look_up_format(
-                    &data,
-                    fmt.format_code,
-                    fmt.bits_per_sample,
-                    bytes_per_sample,
-                    chunk_length,
-                ) {
-                    Ok(format) => Some(format),
-                    Err(WavError::UnsupportedFormat(_)) => None,
-                    Err(other) => return Err(other),
-                };
+        let mut consumed = false;
+        if is_fact && fact.is_none() {
+            // The writer emits `fact` itself, so the reader owns it too rather
+            // than letting it through as an opaque chunk a caller could hand
+            // back and have written twice. A second one is dropped, like a
+            // second `fmt ` or `data`.
+            let body_end = next_chunk_location
+                .saturating_add(8)
+                .saturating_add(body_len);
+            if body_end <= filesize {
+                let read_len = usize::try_from(body_len).map_err(|_| {
+                    WavError::InvalidHeader("fact chunk length does not fit in memory".to_string())
+                })?;
+                let mut body = vec![0; read_len];
+                file.read_exact(&mut body)?;
+                fact = Some(body);
+                consumed = true;
             }
+        }
+        if !consumed && is_fmt && !found_fmt {
+            // Honor the first valid fmt chunk. Anything from the 16-byte core
+            // upwards counts: the three standard sizes are 16, 18 and 40, but a
+            // format may carry any amount of format-specific data after `cbSize`
+            // (IMA ADPCM two bytes, MS ADPCM a coefficient table, GSM two), and
+            // those files have to reach the raw path with their bytes intact.
+            //
+            // The body is bounded the same way the catch-all branch bounds its
+            // chunks: it has to fit inside the file. That is what stops a
+            // declared 4 GB fmt chunk from being allocated, now that the read is
+            // no longer capped at 40 bytes.
+            let body_end = next_chunk_location
+                .saturating_add(8)
+                .saturating_add(body_len);
+            if chunk_length >= FmtChunk::CORE_SIZE && body_end <= filesize {
+                let read_len = usize::try_from(body_len).map_err(|_| {
+                    WavError::InvalidHeader("fmt chunk length does not fit in memory".to_string())
+                })?;
+                let mut body = vec![0; read_len];
+                file.read_exact(&mut body)?;
+                let parsed = FmtChunk::from_bytes(&body).ok_or_else(|| {
+                    WavError::InvalidHeader("fmt chunk is shorter than 16 bytes".to_string())
+                })?;
+                // A zero channel count would make the frame size zero and every
+                // frame-based offset meaningless, so it is the one core field
+                // worth rejecting outright.
+                if parsed.channels == 0 {
+                    return Err(WavError::InvalidHeader("zero channels".to_string()));
+                }
+                found_fmt = true;
+                consumed = true;
+                fmt = Some(parsed);
+            }
+        }
+        if consumed || is_fmt || is_fact {
+            // Either read above, or a duplicate of a chunk this crate owns.
+            //
+            // A second `fmt `, `data` or `fact` chunk is dropped rather than
+            // captured. Capturing would be worse than useless: those ids are
+            // reserved on the write side precisely because the writer produces
+            // them, so a caller feeding the chunks back would be handed
+            // something the writer then refuses. For `data` there is the
+            // additional problem that its body is audio, and reading a second
+            // one into memory to hand back is unbounded.
         } else if is_data {
             // Honor the first data chunk; ignore any later one.
             if !found_data {
@@ -683,27 +1041,29 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
             file.read_exact(&mut body)?;
             let mut id = [0u8; 4];
             id.copy_from_slice(&buffer[0..4]);
-            chunks.push(Chunk { id, data: body });
+            // Which side of the audio a chunk sits on is part of the file's
+            // shape, so it is recorded rather than flattened away.
+            let target = if found_data {
+                &mut chunks_after
+            } else {
+                &mut chunks_before
+            };
+            target.push(Chunk { id, data: body });
         }
         next_chunk_location = next_chunk_location
             .saturating_add(8)
             .saturating_add(body_len)
             .saturating_add(body_len & 1);
     }
-    if found_data && found_fmt {
+    if let (true, Some(fmt)) = (found_data, fmt) {
         return Ok(WavParams {
-            sample_format,
-            format_code,
-            bits_per_sample,
-            block_align,
-            sample_rate: sample_rate as usize,
-            channels: channels as usize,
-            channel_mask,
-            data_length: usize::try_from(data_length).map_err(|_| {
-                WavError::InvalidHeader("data length does not fit in memory".to_string())
-            })?,
-            data_offset: data_offset as usize,
-            chunks,
+            fmt,
+            fact,
+            ds64_sample_count,
+            data_length,
+            data_offset,
+            chunks_before,
+            chunks_after,
         });
     }
     Err(WavError::InvalidHeader(
@@ -744,35 +1104,15 @@ pub(crate) fn write_ds64_chunk(dest: &mut impl Write) -> std::io::Result<()> {
 /// an RF64 file, where the real size lives in the `ds64` chunk.
 pub(crate) const RF64_DATA_SIZE_MARKER: u32 = SIZE_IN_DS64;
 
-/// Write the `fmt ` chunk (id, size and body) and return its body size in bytes.
+/// Write the `fmt ` chunk (id, size and body), returning the total number of
+/// bytes written including the 8-byte header and any pad byte.
 ///
-/// Returns [`WavError::InvalidSpec`] if the channel count or sample rate cannot
-/// be represented in the header fields.
-pub(crate) fn write_fmt_chunk(
-    dest: &mut impl Write,
-    channels: usize,
-    sample_format: SampleFormat,
-    sample_rate: usize,
-    channel_mask: Option<u32>,
-) -> Result<u32> {
-    let fmt = FmtChunk::for_format(channels, sample_format, sample_rate, channel_mask)?;
-    let body_size = fmt.body_size();
-    write_chunk_header(dest, FMT, body_size)?;
-    fmt.write_body(dest)?;
-    Ok(body_size)
-}
-
-/// Write a `fmt ` chunk from raw, uninterpreted fields (a 16-byte core chunk)
-/// and return its body size in bytes.
-///
-/// Returns [`WavError::InvalidSpec`] if the channel count or sample rate cannot
-/// be represented in the header fields.
-pub(crate) fn write_fmt_chunk_raw(dest: &mut impl Write, spec: &RawSpec) -> Result<u32> {
-    let fmt = FmtChunk::for_raw(spec)?;
-    let body_size = fmt.body_size();
-    write_chunk_header(dest, FMT, body_size)?;
-    fmt.write_body(dest)?;
-    Ok(body_size)
+/// This goes through [`write_named_chunk`] rather than emitting the body
+/// directly, because a caller-supplied extension can be an odd number of bytes
+/// and RIFF requires the pad. Without it every offset after the header, the
+/// `data` size field included, would be one byte out.
+pub(crate) fn write_fmt_chunk(dest: &mut impl Write, fmt: &FmtChunk) -> Result<u64> {
+    Ok(write_named_chunk(dest, FMT, &fmt.to_bytes()?)?)
 }
 
 /// Write the `data` chunk header (id and size, 8 bytes). The audio data is
@@ -801,29 +1141,4 @@ pub(crate) fn write_named_chunk(
         written += 1;
     }
     Ok(written)
-}
-
-/// Write a plain wav header: RIFF + WAVE, a `fmt ` chunk (16-byte core, or a
-/// 40-byte `WAVEFORMATEXTENSIBLE` chunk for formats that need it), then the data
-/// chunk header. No `fact` or metadata chunks are written.
-///
-/// The RIFF size and data size fields are written from the supplied values. Pass
-/// [`u32::MAX`] for streaming output where the final length is not yet known, or
-/// the real byte counts when they are known (for example when patching the
-/// header on finalize).
-///
-/// Returns [`WavError::InvalidSpec`] if the channel count or sample rate cannot
-/// be represented in the header fields.
-pub fn write_wav_header(
-    dest: &mut impl Write,
-    channels: usize,
-    sample_format: SampleFormat,
-    sample_rate: usize,
-    riff_size: u32,
-    data_size: u32,
-) -> Result<()> {
-    write_riff_wave(dest, riff_size)?;
-    write_fmt_chunk(dest, channels, sample_format, sample_rate, None)?;
-    write_data_header(dest, data_size)?;
-    Ok(())
 }

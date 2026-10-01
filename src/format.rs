@@ -29,6 +29,23 @@ pub enum SampleFormat {
     F32,
     /// Double precision floating point, 64 bits in 8 bytes.
     F64,
+    /// A-law companded, 1 byte per sample, as defined by ITU-T G.711.
+    ///
+    /// The telephony format of Europe and most of the world, stored in wav files
+    /// as `WAVE_FORMAT_ALAW`. It packs roughly 13 bits of dynamic range into a
+    /// byte by spacing the quantization steps logarithmically, so it is far
+    /// better than [`U8`](SampleFormat::U8) at the same size, but it quantizes:
+    /// a value written and read back does not come out unchanged.
+    ALAW,
+    /// Mu-law companded, 1 byte per sample, as defined by ITU-T G.711.
+    ///
+    /// The telephony format of North America and Japan, stored in wav files as
+    /// `WAVE_FORMAT_MULAW`. Like [`ALAW`](SampleFormat::ALAW) but with roughly
+    /// 14 bits of dynamic range, and it does have a code for exact silence.
+    ///
+    /// Also written μ-law, u-law or ulaw elsewhere; the spelling here follows the
+    /// wav format tag.
+    MULAW,
 }
 
 impl SampleFormat {
@@ -42,6 +59,8 @@ impl SampleFormat {
             SampleFormat::I32 => 32,
             SampleFormat::F32 => 32,
             SampleFormat::F64 => 64,
+            SampleFormat::ALAW => 8,
+            SampleFormat::MULAW => 8,
         }
     }
 
@@ -53,12 +72,23 @@ impl SampleFormat {
         with_sample_type!(*self, S, { S::BYTES_PER_SAMPLE })
     }
 
-    /// The wav format code: `1` for integer PCM, `3` for IEEE float.
+    /// The wav format code: `1` for integer PCM, `3` for IEEE float, `6` for
+    /// A-law and `7` for mu-law.
     pub fn format_code(&self) -> u16 {
         match self {
             SampleFormat::F32 | SampleFormat::F64 => 3,
+            SampleFormat::ALAW => 6,
+            SampleFormat::MULAW => 7,
             _ => 1,
         }
+    }
+
+    /// Whether this is plain integer PCM (`WAVE_FORMAT_PCM`).
+    ///
+    /// Everything else counts as non-PCM in the wav spec, which is what decides
+    /// whether the header needs the `cbSize` field and a `fact` chunk.
+    pub(crate) fn is_pcm(&self) -> bool {
+        self.format_code() == 1
     }
 }
 
@@ -101,36 +131,7 @@ impl WavSpec {
     }
 }
 
-/// The properties needed to write a wav file in *raw* (uninterpreted) mode: the
-/// `fmt ` chunk fields written verbatim, with no attempt to map them to a
-/// [`SampleFormat`].
-///
-/// This is the write-side counterpart to a [`WavParams`](crate::WavParams) whose
-/// `sample_format` is `None`: it lets a caller emit a container for a format this
-/// crate does not model (A-law/µ-law, ADPCM, an exotic
-/// `WAVEFORMATEXTENSIBLE` subtype, ...) and then push the audio through
-/// [`WavWriter::write_raw_interleaved`](crate::WavWriter::write_raw_interleaved).
-/// The float write path is not available for a raw writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RawSpec {
-    /// The `fmt ` format code (`wFormatTag`), for example `1` for integer PCM or
-    /// `6`/`7` for A-law/µ-law.
-    pub format_code: u16,
-    /// The number of channels.
-    pub channels: usize,
-    /// The sample rate in Hz.
-    pub sample_rate: usize,
-    /// Bits per single-channel sample (`wBitsPerSample`).
-    pub bits_per_sample: u16,
-    /// Bytes per frame (`nBlockAlign`). This is what the reader and writer use to
-    /// frame the raw byte stream, so the caller must set it to match the audio.
-    pub block_align: u16,
-}
-
-impl RawSpec {
-    /// The number of bytes occupied by one frame, taken directly from
-    /// [`block_align`](RawSpec::block_align).
-    pub fn frame_bytes(&self) -> usize {
-        self.block_align as usize
-    }
-}
+// The write-side counterpart to a `WavParams` whose format is not one this crate
+// models used to be a `RawSpec` of loose fields. It is now `FmtChunk` in
+// `header.rs`: the same struct the reader hands back, so the bytes survive a
+// round trip instead of being rebuilt from a PCM-shaped guess.

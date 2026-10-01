@@ -18,11 +18,11 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(params) = waveadapter::header::read_wav_header(Cursor::new(data)) {
         // The invariants the reader relies on when it frames the audio. A parse
         // that reports success while breaking these would trip up every caller.
-        assert!(params.channels > 0, "a parsed file must have channels");
-        if let Some(format) = params.sample_format {
+        assert!(params.channels() > 0, "a parsed file must have channels");
+        if let Some(format) = params.sample_format() {
             assert_eq!(
                 params.frame_bytes(),
-                params.channels * format.bytes_per_sample(),
+                params.channels() * format.bytes_per_sample(),
                 "frame size must agree with the interpreted format"
             );
             assert!(params.frame_bytes() > 0, "interpreted frames must be sized");

@@ -40,6 +40,14 @@ macro_rules! with_sample_type {
                 type $alias = F64_LE;
                 $body
             }
+            SampleFormat::ALAW => {
+                type $alias = ALAW;
+                $body
+            }
+            SampleFormat::MULAW => {
+                type $alias = MULAW;
+                $body
+            }
         }
     }};
 }
