@@ -355,6 +355,7 @@ fn read_u64(buffer: &[u8], start_index: usize) -> u64 {
 /// markers in the RIFF and `data` 32-bit size fields; any other chunk whose
 /// 32-bit size is `0xFFFFFFFF` is looked up by id in `table`.
 struct Ds64 {
+    riff_size: u64,
     data_size: u64,
     sample_count: u64,
     table: Vec<([u8; 4], u64)>,
@@ -364,7 +365,12 @@ impl Ds64 {
     /// Parse a `ds64` chunk body. Missing or short bodies yield zeroed sizes
     /// rather than erroring, matching the lenient handling elsewhere in the parser.
     fn parse(body: &[u8]) -> Self {
-        // riffSize (0..8) is recomputed from the file, so it is not retained.
+        // riffSize only bounds the chunk walk; it is not surfaced.
+        let riff_size = if body.len() >= 8 {
+            read_u64(body, 0)
+        } else {
+            0
+        };
         let data_size = if body.len() >= 16 {
             read_u64(body, 8)
         } else {
@@ -394,6 +400,7 @@ impl Ds64 {
             offset += 12;
         }
         Ds64 {
+            riff_size,
             data_size,
             sample_count,
             table,
@@ -420,6 +427,12 @@ impl Ds64 {
 
 fn compare_4cc(buffer: &[u8], bytes: &[u8]) -> bool {
     buffer.iter().take(4).zip(bytes).all(|(a, b)| *a == *b)
+}
+
+/// Whether four bytes can be a chunk id. A FOURCC is printable ASCII, so
+/// anything else means the chunk walk has run off the chunks and into audio.
+fn is_chunk_id(id: &[u8]) -> bool {
+    id.iter().take(4).all(|b| (0x20..=0x7e).contains(b))
 }
 
 /// Write a chunk header: a four-character code followed by the little-endian
@@ -889,6 +902,7 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     // The 64-bit sizes for an RF64/BW64 file, filled in when the `ds64` chunk is
     // reached (it is required to come first). Stays zeroed for plain RIFF.
     let mut ds64 = Ds64 {
+        riff_size: 0,
         data_size: 0,
         sample_count: 0,
         table: Vec::new(),
@@ -902,8 +916,8 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     let mut chunks_before: Vec<Chunk> = Vec::new();
     let mut chunks_after: Vec<Chunk> = Vec::new();
 
-    // Walk every chunk to the end of the file, so that metadata chunks placed
-    // after the data chunk are captured too. A chunk is padded to an even length
+    // Walk every chunk to the end of the RIFF chunk, so that metadata chunks
+    // placed after the data chunk are captured too. A chunk is padded to an even length
     // with a trailing byte that is not counted in its declared size.
     //
     // Every offset computed from a declared length uses saturating arithmetic.
@@ -911,9 +925,24 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
     // value, so a hostile or corrupt file can name a size near `u64::MAX`.
     // Saturating turns that into an offset past `filesize`, which the existing
     // overrun checks already treat as "stop scanning".
-    while next_chunk_location.saturating_add(8) <= filesize {
+    //
+    // Up to the audio the walk is bounded by the file alone, since it has to
+    // reach `data` whatever the RIFF size says. Past the audio it is bounded by
+    // the declared RIFF size too (see the `data` branch), because a `data`
+    // length that under-reports the audio, typically zero in a recording killed
+    // before its header was patched, would otherwise send the walk through the
+    // audio reading every few bytes as a chunk to capture.
+    let mut scan_end = filesize;
+    while next_chunk_location.saturating_add(8) <= scan_end {
         file.seek(SeekFrom::Start(next_chunk_location))?;
         file.read_exact(&mut buffer)?;
+        if found_data && !is_chunk_id(&buffer) {
+            // The second guard for an under-reported `data` length, for a file
+            // whose RIFF size does not bound the walk either: an id that is not
+            // a FOURCC means the walk has run into audio. Stopping here bounds
+            // the cost of a file of silence to its first eight bytes.
+            break;
+        }
         let chunk_length = read_u32(&buffer, 4);
         let is_data = compare_4cc(&buffer, DATA);
         let is_fmt = compare_4cc(&buffer, FMT);
@@ -1023,6 +1052,22 @@ pub fn read_wav_header(mut stream: impl Read + Seek) -> Result<WavParams> {
                 // already resolved through ds64 into a real length.
                 if !is_rf64 && chunk_length == u32::MAX {
                     break;
+                }
+                // Only trailing chunks are left, and they sit inside the RIFF
+                // chunk, so its declared end bounds the rest of the walk. Not
+                // when that is the plain RIFF streaming placeholder, or points
+                // past the end of a truncated file, where the file is the
+                // better bound. For RF64 the real size is in ds64, where a zero
+                // (an interrupted RF64 recording) stops the walk right here.
+                let declared = read_u32(&header, 4);
+                let riff_size = if is_rf64 && declared == SIZE_IN_DS64 {
+                    ds64.riff_size
+                } else {
+                    declared as u64
+                };
+                let riff_end = riff_size.saturating_add(8);
+                if (is_rf64 || declared != UNKNOWN_SIZE) && riff_end <= filesize {
+                    scan_end = riff_end;
                 }
             }
         } else {

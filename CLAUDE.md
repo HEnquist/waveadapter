@@ -75,7 +75,7 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   macro, so they stay in sync automatically.
 
 - **`header.rs`** parses and writes the RIFF/WAVE container. The parser walks *all* chunks to the
-  end of the file, consuming the first `fmt `, `data`, `fact` and `ds64`, and capturing
+  end of the RIFF chunk, consuming the first `fmt `, `data`, `fact` and `ds64`, and capturing
   every other chunk verbatim into `WavParams::chunks_before` / `chunks_after` as raw
   `Chunk { id, data }` blobs, split by which side of the audio they sat on. That split matters
   because it maps onto the writer's two mechanisms, so a rewrite does not move a trailing `cue `
@@ -91,6 +91,13 @@ The data flow is: WAV bytes <-> `header.rs` (container) <-> `reader.rs`/`writer.
   passing a stray chunk through: its sizes frame every chunk after it, so honoring a duplicate would
   let it re-point the audio and restate the frame count
   (`a_second_ds64_chunk_is_ignored`).
+
+  The walk is bounded by the file only up to `data`. Past the audio it also stops at the declared
+  RIFF end (the `ds64` `riffSize` for RF64), unless that is the plain-RIFF `u32::MAX` placeholder
+  or points past the end of the file, and at any id that is not printable ASCII. Both guard a
+  `data` length that under-reports the audio, typically zero in a recording killed before its
+  header was patched: the walk would otherwise read the audio as chunk headers, and over silence
+  capture a zero-length chunk every eight bytes, so memory grew with the file (issue #14).
 
   **`FmtChunk` is public and is the write-side input as well as the read-side output.** It is the
   typed view of the chunk in the same shape as the `metadata.rs` types (`from_bytes`/`to_bytes`/

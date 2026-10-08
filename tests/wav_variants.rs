@@ -977,3 +977,101 @@ fn a_ds64_chunk_in_a_plain_riff_file_is_dropped() {
     writer.write_raw_interleaved(&[0u8; 40]).unwrap();
     writer.finalize().unwrap();
 }
+
+/// A 16-bit stereo RIFF header with the given RIFF and `data` sizes, followed
+/// by `audio`: the shape of a recording killed before its header was patched.
+fn riff_with_sizes(riff_size: u32, data_size: u32, audio: &[u8]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&riff_size.to_le_bytes());
+    file.extend_from_slice(b"WAVE");
+    file.extend_from_slice(b"fmt ");
+    file.extend_from_slice(&16u32.to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    file.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    file.extend_from_slice(&44100u32.to_le_bytes());
+    file.extend_from_slice(&176400u32.to_le_bytes());
+    file.extend_from_slice(&4u16.to_le_bytes());
+    file.extend_from_slice(&16u16.to_le_bytes());
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&data_size.to_le_bytes());
+    file.extend_from_slice(audio);
+    file
+}
+
+/// Audio that reads as a run of valid zero-length chunk headers, so that only
+/// the RIFF size can stop a walk through it, not the FOURCC check.
+fn chunk_shaped_audio() -> Vec<u8> {
+    b"abcd\0\0\0\0".repeat(8 * 1024)
+}
+
+#[test]
+fn an_under_reported_data_length_stops_at_the_riff_end() {
+    // Issue #14. A `data` length of zero used to send the walk through the
+    // audio, capturing a chunk every eight bytes where it looked like one (as
+    // silence does), so memory grew with the file. The RIFF size says the file
+    // ends right after the `data` header, and past the audio that is what
+    // bounds the walk.
+    let file = riff_with_sizes(36, 0, &chunk_shaped_audio());
+    let params = waveadapter::header::read_wav_header(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(params.data_offset, 44);
+    assert_eq!(params.data_length, 0);
+    assert_eq!(
+        params.chunks().count(),
+        0,
+        "the audio is not read as chunks"
+    );
+}
+
+#[test]
+fn an_under_reported_data_length_stops_at_a_non_fourcc_id() {
+    // The second guard, for a file whose RIFF size is no help: the streaming
+    // placeholder. The silence after the `data` header is not a chunk id, so
+    // the walk stops there instead of capturing it.
+    let file = riff_with_sizes(u32::MAX, 0, &[0; 64 * 1024]);
+    let params = waveadapter::header::read_wav_header(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(params.data_length, 0);
+    assert_eq!(
+        params.chunks().count(),
+        0,
+        "the audio is not read as chunks"
+    );
+}
+
+#[test]
+fn a_riff_size_past_the_end_of_the_file_does_not_stop_the_walk() {
+    // A truncated file declares more than it holds, so its RIFF end says
+    // nothing about where the chunks stop. A trailing chunk that is in the file
+    // is still found.
+    let mut file = riff_with_sizes(1_000_000, 8, &[0; 8]);
+    file.extend_from_slice(b"LIST");
+    file.extend_from_slice(&8u32.to_le_bytes());
+    file.extend_from_slice(b"INFOhell");
+    let params = waveadapter::header::read_wav_header(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(params.data_length, 8);
+    assert_eq!(params.chunks_after.len(), 1);
+    assert_eq!(&params.chunks_after[0].id, b"LIST");
+}
+
+#[test]
+fn an_interrupted_rf64_file_does_not_scan_the_audio() {
+    // The RF64 writer leaves its ds64 sizes at zero until finalize or
+    // update_header patches them, so a recording killed before that has the
+    // same under-reported `data` length. The zero riffSize bounds the walk.
+    let mut file = Vec::new();
+    file.extend_from_slice(b"RF64");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+    file.extend_from_slice(b"WAVE");
+    file.extend_from_slice(b"ds64");
+    file.extend_from_slice(&28u32.to_le_bytes());
+    file.extend_from_slice(&[0u8; 28]); // all sizes still zero
+    let riff = riff_with_sizes(0, u32::MAX, &chunk_shaped_audio());
+    file.extend_from_slice(&riff[12..]); // fmt, data and the audio
+    let params = waveadapter::header::read_wav_header(std::io::Cursor::new(file)).unwrap();
+    assert_eq!(params.data_length, 0);
+    assert_eq!(
+        params.chunks().count(),
+        0,
+        "the audio is not read as chunks"
+    );
+}
